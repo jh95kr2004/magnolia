@@ -85,11 +85,21 @@ def test_agent_wrapper_fallback():
     agent = PortfolioRLAgent(model_path="nonexistent_path.zip", n_stack=15)
     assert agent.model is None
     
-    mock_obs = np.ones((1, 22 * 15), dtype=np.float32)
+    # Build a realistic decimal spread frame (3% spread = 0.03, predicted = 0.03 -> Strategy C transfer edge = 0.03)
+    frame = np.zeros(22, dtype=np.float32)
+    frame[0] = 0.03     # current_spread (3%)
+    frame[4] = 0.03     # mean_pred (3% persistent premium)
+    frame[14] = 0.0005  # base_fee
+    frame[15] = 0.002   # foreign_fee
+    frame[16] = 0.0005  # slippage
+    frame[18] = 1.0     # state_neutral = 1.0
+    mock_obs = np.tile(frame, (1, 15))
     action_score, target_weight, action_type = agent.predict(mock_obs)
     
     assert isinstance(action_score, float)
     assert isinstance(target_weight, float)
+    assert action_score == 2.0
+    assert 0.10 <= target_weight <= 0.50
     assert action_type == 0 # TRADE
 
 if __name__ == "__main__":
