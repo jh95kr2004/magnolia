@@ -2,21 +2,20 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
-
-	"github.com/magnolia/backend/internal/db/postgres"
 )
 
-// handleActivePositions lists all currently open positions (REST fallback)
+// handleActivePositions lists all currently open positions for the authenticated user
 func (s *Server) handleActivePositions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// This is node-agnostic for user UI viewing (can view US and KR positions)
-	positions, err := s.DB.GetActivePositions("")
+	userID := getUserIDFromContext(r)
+	positions, err := s.DB.GetActivePositionsByUser(userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -26,36 +25,35 @@ func (s *Server) handleActivePositions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(positions)
 }
 
-// handlePositionHistory queries old closed positions
+// handlePositionHistory queries closed positions for the authenticated user
 func (s *Server) handlePositionHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
-	userID := uint(1) // Mock UI Auth
+
+	userID := getUserIDFromContext(r)
 	positions, err := s.DB.GetClosedPositionsByUser(userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(positions)
 }
 
-// handleForceClose allows manual termination of an active position
+// handleForceClose dispatches a FORCE_CLOSE command over Redis to the user's Engine goroutine
+// so real exchange exit orders and loan repayments are executed safely.
 func (s *Server) handleForceClose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Clean position ID from path e.g. /api/positions/force_close/POS-123
-	// Or from query if passed.
+	userID := getUserIDFromContext(r)
 	posID := r.URL.Query().Get("id")
 	if posID == "" {
-		// Try to extract from Path
 		parts := strings.Split(r.URL.Path, "/")
 		posID = parts[len(parts)-1]
 	}
@@ -65,36 +63,47 @@ func (s *Server) handleForceClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Attempt to close natively via Engine (If the strategy resides on this node)
-	// For production: The node would check if the position belongs to it. Wait, the load balancer
-	// routes randomly. Need a Targeted Pub/Sub to trigger the specific node holding the position context!
-	// Here, we just mark it CLOSED in the DB as a mock.
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"action":      "FORCE_CLOSE",
+		"position_id": posID,
+	})
 
-	err := s.DB.UpdatePositionStatus(posID, "CLOSED")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if s.Redis != nil {
+		if err := s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), cmdPayload); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "Failed to dispatch close command: %v"}`, err), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if err := s.DB.UpdatePositionStatus(posID, "CLOSED"); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
-	// Fire completion notification for SSE streams
-	s.DB.PublishUserEvent("1", `{"action": "POSITION_CLOSED", "position_id": "`+posID+`"}`)
-
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message": "Position force closed"}`))
+	w.Write([]byte(`{"message": "Force close command dispatched to Strategy Engine"}`))
 }
 
-// handleForceEnter manually forces an entry into the Ranker's latest opportunity
+// handleForceEnter dispatches a FORCE_ENTER command over Redis to the user's Engine goroutine
+// to execute real atomic dual-leg orders.
 func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	userID := getUserIDFromContext(r)
 	var req struct {
-		BaseExchange   string `json:"base_exchange"`
-		ForeignExchange string `json:"foreign_exchange"`
-		StrategyType   string `json:"strategy_type"`
-		Symbol         string `json:"symbol"`
+		BaseExchange    string  `json:"base_exchange"`
+		ForeignExchange string  `json:"foreign_exchange"`
+		BaseSymbol      string  `json:"base_symbol"`
+		ForeignSymbol   string  `json:"foreign_symbol"`
+		Strategy        string  `json:"strategy"`
+		StrategyType    string  `json:"strategy_type"`
+		Symbol          string  `json:"symbol"`
+		ExpectedRoi     float64 `json:"expected_roi"`
+		InvestmentUsd   float64 `json:"investment_usd"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -102,22 +111,34 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// This would invoke the strategy.ArbitrageStrategy ExecuteEntry directly through the Engine.
-	// For demo, we just create a mock active position row
-	pos := &postgres.ActivePosition{
-		PositionID:      "POS-MANUAL-1",
-		MonitorNodeID:   "test-node",
-		Status:          "OPEN",
-		Type:            req.StrategyType,
-		BaseExchange:    req.BaseExchange,
-		ForeignExchange: req.ForeignExchange,
-		BaseSymbol:      req.Symbol,
-		ForeignSymbol:   req.Symbol,
-		InvestmentUSD:   1000.0,
+	baseSym := req.BaseSymbol
+	if baseSym == "" {
+		baseSym = req.Symbol
+	}
+	strat := req.Strategy
+	if strat == "" {
+		strat = req.StrategyType
 	}
 
-	s.DB.SavePosition(pos)
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"action":           "FORCE_ENTER",
+		"base_exchange":    req.BaseExchange,
+		"foreign_exchange": req.ForeignExchange,
+		"base_symbol":      baseSym,
+		"foreign_symbol":   req.ForeignSymbol,
+		"strategy":         strat,
+		"expected_roi":     req.ExpectedRoi,
+		"investment_usd":   req.InvestmentUsd,
+	})
 
+	if s.Redis != nil {
+		if err := s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), cmdPayload); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "Failed to dispatch entry command: %v"}`, err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"message": "Manual Entry Triggered Successfully"}`))
+	w.Write([]byte(`{"message": "Manual entry command dispatched to Strategy Engine"}`))
 }
