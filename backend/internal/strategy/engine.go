@@ -57,6 +57,17 @@ type Engine struct {
 	// Redis PubSub client for subscribing to global opportunities
 	redisClient *redis.PubSubClient
 
+	// Mode & Bot Lifecycle State
+	isPaper   bool
+	botStatus string // "RUNNING", "DRAINING", "STOPPED"
+
+	// Gradual Price Offset Simulator State (Paper Mode only)
+	simExchange        string
+	simStartOffsetPct  float64
+	simTargetOffsetPct float64
+	simRampMinutes     float64
+	simStartedAt       int64
+
 	// Draining State
 	isDraining bool
 
@@ -146,6 +157,46 @@ func NewEngine(
 		&FutureFutureStrategy{},
 	}
 
+	isPaper := false
+	for _, c := range clients {
+		if _, ok := c.(*exchange.PaperClient); ok {
+			isPaper = true
+			break
+		}
+	}
+
+	botStatus := "STOPPED"
+	if isPaper {
+		botStatus = "RUNNING"
+	}
+	simEx := "UPBIT"
+	var simStart, simTarget, simRamp float64
+	var simStartedAt int64
+
+	if db != nil {
+		if settings, sErr := db.GetUserSettings(userID); sErr == nil && settings != nil {
+			if isPaper {
+				if settings.PaperBotStatus != "" {
+					botStatus = settings.PaperBotStatus
+				}
+				if settings.SimExchange != "" {
+					simEx = settings.SimExchange
+				}
+				simStart = settings.SimStartOffsetPct
+				simTarget = settings.SimTargetOffsetPct
+				simRamp = settings.SimRampMinutes
+				simStartedAt = settings.SimStartedAt
+				if settings.PaperBalancesJSON != "" {
+					exchange.ImportAllUserPaperState(userID, settings.PaperBalancesJSON)
+				}
+			} else {
+				if settings.LiveBotStatus != "" {
+					botStatus = settings.LiveBotStatus
+				}
+			}
+		}
+	}
+
 	e := &Engine{
 		nodeID:             nodeID,
 		userID:             userID,
@@ -155,6 +206,14 @@ func NewEngine(
 		executor:           execution.NewExecutor(cfg.RetryOnFailure),
 		clients:            clients,
 		redisClient:        rClient,
+		isPaper:            isPaper,
+		botStatus:          botStatus,
+		simExchange:        simEx,
+		simStartOffsetPct:  simStart,
+		simTargetOffsetPct: simTarget,
+		simRampMinutes:     simRamp,
+		simStartedAt:       simStartedAt,
+		isDraining:         botStatus != "RUNNING",
 		walletProxy:        walletProxy,
 		liveUnrealizedPnLs: make(map[string]float64),
 		lastErrorLogTime:   make(map[string]time.Time),
@@ -185,9 +244,96 @@ func NewEngine(
 	return e
 }
 
+func (e *Engine) ModeString() string {
+	if e.isPaper {
+		return "PAPER"
+	}
+	return "LIVE"
+}
+
+// GetSimStatus computes the current S-curve interpolated price offset (%) for Paper Mode scenario simulation.
+func (e *Engine) GetSimStatus() (exchangeName string, currentOffsetPct, targetOffsetPct, rampMinutes, progressPct float64, remainingSec int64) {
+	ex := e.simExchange
+	if ex == "" {
+		ex = "UPBIT"
+	}
+	if !e.isPaper || e.simStartedAt <= 0 {
+		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, e.simRampMinutes, 100.0, 0
+	}
+	if e.simRampMinutes <= 0 {
+		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, 0, 100.0, 0
+	}
+	totalSec := e.simRampMinutes * 60.0
+	elapsed := float64(time.Now().Unix() - e.simStartedAt)
+	if elapsed >= totalSec {
+		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, e.simRampMinutes, 100.0, 0
+	}
+	alpha := math.Max(0.0, math.Min(1.0, elapsed/totalSec))
+	// Smooth cosine S-curve interpolation
+	weight := (1.0 - math.Cos(math.Pi*alpha)) / 2.0
+	curr := e.simStartOffsetPct + (e.simTargetOffsetPct-e.simStartOffsetPct)*weight
+	rem := int64(math.Ceil(totalSec - elapsed))
+	return ex, curr, e.simTargetOffsetPct, e.simRampMinutes, alpha * 100.0, rem
+}
+
+func (e *Engine) applySimOffsetToQuote(q exchange.PriceUpdate) exchange.PriceUpdate {
+	if !e.isPaper {
+		return q
+	}
+	simEx, currPct, _, _, _, _ := e.GetSimStatus()
+	if strings.EqualFold(q.Exchange, simEx) && math.Abs(currPct) > 1e-6 {
+		mult := 1.0 + (currPct / 100.0)
+		q.RawBid *= mult
+		q.RawAsk *= mult
+		q.BidUSD *= mult
+		q.AskUSD *= mult
+		q.RawFutureBid *= mult
+		q.RawFutureAsk *= mult
+		q.BidFutureUSD *= mult
+		q.AskFutureUSD *= mult
+	}
+
+	// Inject the latest price into the corresponding PaperClient so virtual market orders fill accurately
+	for _, c := range e.clients {
+		if pc, ok := c.(*exchange.PaperClient); ok && strings.EqualFold(pc.GetName(), q.Exchange) {
+			spotPrice := q.RawAsk
+			if spotPrice <= 0 {
+				if q.QuoteCurrency == "KRW" || strings.HasSuffix(string(q.Symbol), "-KRW") {
+					spotPrice = q.AskUSD * GetFXRate("KRW")
+				} else {
+					spotPrice = q.AskUSD
+				}
+			}
+			futPrice := q.RawFutureAsk
+			if futPrice <= 0 {
+				futPrice = spotPrice
+			}
+			pc.SetPriceHint(q.Symbol, spotPrice, futPrice)
+		}
+	}
+	return q
+}
+
+func (e *Engine) persistPaperState() {
+	if !e.isPaper || e.db == nil {
+		return
+	}
+	snapJSON := exchange.ExportAllUserPaperState(e.userID)
+	if snapJSON == "" {
+		return
+	}
+	if settings, err := e.db.GetUserSettings(e.userID); err == nil && settings != nil {
+		settings.PaperBalancesJSON = snapJSON
+		_ = e.db.SaveUserSettings(settings)
+	}
+}
+
 // StartWebLendingWatchdogs spawns child goroutines bound to the per-user context (runUserEngine)
 // for any exchange client that uses browser-based coin lending (e.g., Upbit, Bithumb).
 func (e *Engine) StartWebLendingWatchdogs(ctx context.Context) {
+	if e.isPaper {
+		return // Paper trading simulates coin borrowing without requiring a live noVNC browser session
+	}
 	for _, client := range e.clients {
 		wc, ok := client.(exchange.WebLendingCapable)
 		if !ok || wc.LendingManager() == nil {
@@ -316,6 +462,7 @@ func (e *Engine) ExecuteStrategy(
 	// Augment the returned position with overarching tracking data
 	pos.PositionID = string(posID)
 	pos.UserID = e.userID
+	pos.IsPaper = e.isPaper
 	pos.MonitorNodeID = e.nodeID
 	pos.Status = "OPEN"
 	pos.BaseExchange = pair.BaseClient.GetName()
@@ -331,6 +478,7 @@ func (e *Engine) ExecuteStrategy(
 	if err := e.db.SavePosition(pos); err != nil {
 		return nil, err
 	}
+	e.persistPaperState()
 
 	// 3. Dispatch WebSocket event and send external notification
 	e.notifyPositionOpened(ctx, pos)
@@ -396,19 +544,26 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 			if quote.FXRate > 0 && quote.QuoteCurrency != "" {
 				SetFXRate(string(quote.QuoteCurrency), quote.FXRate)
 			}
-			latestQuotes[string(quote.Symbol)] = quote
+			adjQuote := e.applySimOffsetToQuote(quote)
+			latestQuotes[string(adjQuote.Symbol)] = adjQuote
 
 			e.mu.Lock()
 			e.evaluateAllOpenPositions(ctx, latestQuotes)
-			if !e.isDraining {
+			if !e.isDraining && e.botStatus == "RUNNING" {
 				e.evaluateRebalancing(ctx, latestQuotes)
 			}
 			e.publishAccountState(ctx)
 			e.mu.Unlock()
 		case <-ticker.C:
 			e.mu.Lock()
+			// Re-apply gradual offset interpolation on cached quotes as ramp time progresses
+			if e.isPaper {
+				for sym, q := range latestQuotes {
+					latestQuotes[sym] = e.applySimOffsetToQuote(q)
+				}
+			}
 			e.evaluateAllOpenPositions(ctx, latestQuotes)
-			if !e.isDraining {
+			if !e.isDraining && e.botStatus == "RUNNING" {
 				e.evaluateRebalancing(ctx, latestQuotes)
 			}
 			e.publishAccountState(ctx)
@@ -417,12 +572,30 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 	}
 }
 
-// evaluateAllOpenPositions fetches the active DB positions assigned to this user.
+// evaluateAllOpenPositions fetches the active DB positions assigned to this user and mode.
 func (e *Engine) evaluateAllOpenPositions(
 	ctx context.Context, quotes map[string]exchange.PriceUpdate) {
-	positions, err := e.db.GetActivePositionsByUser(e.userID)
+	positions, err := e.db.GetActivePositionsByUserAndMode(e.userID, e.isPaper)
 	if err != nil {
-		log.Printf("[Monitor Error] Could not fetch positions for User %d: %v", e.userID, err)
+		log.Printf("[Monitor Error] Could not fetch positions for User %d (%s): %v", e.userID, e.ModeString(), err)
+		return
+	}
+
+	if e.botStatus == "DRAINING" && len(positions) == 0 {
+		e.botStatus = "STOPPED"
+		e.isDraining = true
+		if settings, sErr := e.db.GetUserSettings(e.userID); sErr == nil && settings != nil {
+			if e.isPaper {
+				settings.PaperBotStatus = "STOPPED"
+			} else {
+				settings.LiveBotStatus = "STOPPED"
+			}
+			_ = e.db.SaveUserSettings(settings)
+		}
+		e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+			`{"action":"BOT_DRAIN_COMPLETED","mode":"%s","message":"All open %s positions have been safely closed. Bot is now STOPPED."}`,
+			e.ModeString(), e.ModeString(),
+		)))
 		return
 	}
 
@@ -685,6 +858,7 @@ func (e *Engine) evaluateRebalancing(ctx context.Context, quotes map[string]exch
 			} else {
 				log.Printf("✅ [Rebalancing Complete] Restored $%.2f to %s via 100%% delta-neutral transfer.",
 					rebalanceChunkUSD, pair.ForeignClient.GetName())
+				e.persistPaperState()
 				e.sendNotification(ctx, notification.AlertPositionClosed, fmt.Sprintf(
 					"⚖️ **자본 자동 리밸런싱 완료 (100%% 델타 중립)**\n- **경로**: `%s` (KRW) -> `%s` (USD)\n- **코인**: `%s`\n- **환류 규모**: `$%.2f`",
 					pair.BaseClient.GetName(), pair.ForeignClient.GetName(), pair.BaseCurrency, rebalanceChunkUSD,
@@ -722,10 +896,6 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case payload := <-aiCh:
-			if e.isDraining {
-				continue // Do not enter new trades during graceful shutdown
-			}
-
 			var aiOps []AIPredictedOpportunity
 			if err := json.Unmarshal(payload, &aiOps); err != nil {
 				log.Printf("[Engine-%d] Failed to parse AI opportunities: %v", e.userID, err)
@@ -743,7 +913,8 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 			logDetails := time.Since(lastLogTime) > 10*time.Second
 			if logDetails {
-				log.Printf("[PaperEngine] Received %d AI predictions from Redis. Filtered for user %d: %d.", len(aiOps), e.userID, len(filteredOps))
+				log.Printf("[%sEngine] Received %d AI predictions from Redis. Filtered for user %d: %d.",
+					e.ModeString(), len(aiOps), e.userID, len(filteredOps))
 				lastLogTime = time.Now()
 			}
 
@@ -753,8 +924,40 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 			e.mu.Lock()
 
+			activePos, _ := e.db.GetActivePositionsByUserAndMode(e.userID, e.isPaper)
+
+			// Apply Paper Mode gradual price offset scenario (±N% over X minutes) to opportunities
+			if e.isPaper {
+				simEx, currPct, _, _, _, _ := e.GetSimStatus()
+				if math.Abs(currPct) > 1e-6 {
+					offsetDec := currPct / 100.0
+					for i := range filteredOps {
+						if strings.EqualFold(filteredOps[i].BaseExchange, simEx) {
+							filteredOps[i].PremiumPct = (1.0+filteredOps[i].PremiumPct)*(1.0+offsetDec) - 1.0
+							filteredOps[i].PredictedPremiumPct = (1.0+filteredOps[i].PredictedPremiumPct)*(1.0+offsetDec*0.5) - 1.0
+						} else if strings.EqualFold(filteredOps[i].ForeignExchange, simEx) {
+							filteredOps[i].PremiumPct = (1.0+filteredOps[i].PremiumPct)/(1.0+offsetDec) - 1.0
+							filteredOps[i].PredictedPremiumPct = (1.0+filteredOps[i].PredictedPremiumPct)/(1.0+offsetDec*0.5) - 1.0
+						}
+
+						// Reflect offset-driven arbitrage edge in target weight & action type for realistic simulation
+						minTargetDec := e.config.MinTargetProfit / 100.0
+						if minTargetDec <= 0 {
+							minTargetDec = 0.01
+						}
+						if filteredOps[i].PremiumPct >= minTargetDec && filteredOps[i].TargetWeight < 0.20 {
+							filteredOps[i].TargetWeight = 0.25
+							filteredOps[i].ActionType = 0
+						} else if filteredOps[i].PremiumPct <= 0.0015 && len(activePos) > 0 {
+							// Spread converged back near 0%: trigger profit-taking exit
+							filteredOps[i].ActionType = 2
+							filteredOps[i].TargetWeight = 0.0
+						}
+					}
+				}
+			}
+
 			// 2. Clamp individual weights and only renormalize (scale down) when totalWeight > 1.0
-			// so a single partial recommendation (e.g. 0.20) is never forced into a 100% full-in allocation.
 			const maxSinglePairWeight = 0.50
 			totalWeight := 0.0
 			for i := range filteredOps {
@@ -772,263 +975,225 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 				}
 			}
 
-			// 3. Execution Pipeline and ActionType Handling
-			activePos, _ := e.db.GetActivePositionsByUser(e.userID)
+			// 3. Execution Pipeline and ActionType Handling (Only execute when BotStatus is RUNNING or DRAINING)
+			if e.botStatus != "STOPPED" {
+				for _, opp := range filteredOps {
+					targetDollarVolume := e.config.CapitalLimitUsd * opp.TargetWeight
 
-			for _, opp := range filteredOps {
-				targetDollarVolume := e.config.CapitalLimitUsd * opp.TargetWeight
-
-				// Find current exposure (matching either canonical direction or reverse direction)
-				var matchingPos *postgres.ActivePosition
-				currentExposure := 0.0
-				for i, pos := range activePos {
-					if pos.Status == "CLOSED" {
-						continue
-					}
-					isCanonicalMatch := pos.BaseExchange == opp.BaseExchange &&
-						pos.ForeignExchange == opp.ForeignExchange &&
-						pos.BaseSymbol == opp.BaseSymbol
-					isReverseMatch := pos.BaseExchange == opp.ForeignExchange &&
-						pos.ForeignExchange == opp.BaseExchange &&
-						pos.BaseSymbol == opp.ForeignSymbol
-					if isCanonicalMatch || isReverseMatch {
-						currentExposure += pos.InvestmentUSD
-						matchingPos = &activePos[i]
-						break
-					}
-				}
-
-				// --- ActionType = 2 (REPAY / 청산) ---
-				if opp.ActionType == 2 {
-					if matchingPos != nil && matchingPos.Status != "CLOSED" {
-						log.Printf("🚨 [AI REPAY TRIGGERED] User %d %s, closing position %s", e.userID, opp.BaseSymbol, matchingPos.PositionID)
-						
-						var targetStrategy ArbitrageStrategy
-						for _, strat := range e.strategies {
-							if string(strat.ID()) == matchingPos.Type {
-								targetStrategy = strat
-								break
-							}
-						}
-						
-						if targetStrategy != nil {
-							targetPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
-							if targetPair == nil {
-								log.Printf("CRITICAL [AI REPAY] Could not find cross market pair for exit: %s/%s %s", matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
-								continue
-							}
-							exitRatio := 1.0
-							err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, *matchingPos, exitRatio, e.walletProxy)
-							if err == nil {
-								e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
-								e.notifyPositionClosed(ctx, matchingPos.PositionID)
-							} else {
-								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
-									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
-								}
-								e.sendNotification(ctx, notification.AlertSystemError, fmt.Sprintf(
-									"⚠️ **AI REPAY Error: Failed to execute Exit Trades for Position %s**\n- **Error**: %v",
-									matchingPos.PositionID, err,
-								))
-							}
-						}
-					} else {
-						if logDetails {
-							log.Printf("[PaperEngine] AI suggested REPAY for %s but no matching open position was found.", opp.BaseSymbol)
-						}
-					}
-					continue
-				}
-
-				// --- ActionType = 1 (TRANSFER / 전송 및 상환) ---
-				if opp.ActionType == 1 {
-					if matchingPos != nil && matchingPos.Status == "OPEN" {
-						// For pure futures strategies (D/E), on-chain transfer does not apply; treat ActionType=1 as Hold.
-						if matchingPos.Type == string(StrategyFutureSpot) || matchingPos.Type == string(StrategyFutureFuture) {
+					var matchingPos *postgres.ActivePosition
+					currentExposure := 0.0
+					for i, pos := range activePos {
+						if pos.Status == "CLOSED" {
 							continue
 						}
-
-						posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
-						var transferStrat *ForeignTransferStrategy
-						for _, s := range e.strategies {
-							if ft, ok := s.(*ForeignTransferStrategy); ok {
-								transferStrat = ft
-								break
-							}
-						}
-
-						if posPair != nil && posPair.IsValidForTransfer && transferStrat != nil {
-							log.Printf("🔄 [AI TRANSFER TRIGGERED] User %d %s, executing on-chain transfer and auto-repay for %s",
-								e.userID, matchingPos.BaseSymbol, matchingPos.PositionID)
-							_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "TRANSFERRING")
-							e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
-								`{"action":"POSITION_TRANSFERRING", "position_id":"%s"}`, matchingPos.PositionID,
-							)))
-							e.publishAccountState(ctx)
-							e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
-								"📦 **Coin Transfer Started (AI Triggered)**\n- **ID**: `%s`\n- **From**: `%s` to `%s`\n- **Symbol**: `%s`",
-								matchingPos.PositionID, matchingPos.ForeignExchange, matchingPos.BaseExchange, matchingPos.BaseSymbol,
-							))
-
-							if err := transferStrat.ExecuteTransferAndRepay(ctx, e.executor, *posPair, *matchingPos, e.walletProxy); err == nil {
-								_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
-								e.notifyPositionClosed(ctx, matchingPos.PositionID)
-							} else {
-								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
-									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
-								} else {
-									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "OPEN")
-								}
-								log.Printf("❌ [AI TRANSFER ERROR] Failed transfer-and-repay for %s: %v", matchingPos.PositionID, err)
-							}
-						}
-					} else {
-						if logDetails {
-							log.Printf("[PaperEngine] AI suggested TRANSFER for %s but no matching open position was found.", opp.BaseSymbol)
+						isCanonicalMatch := pos.BaseExchange == opp.BaseExchange &&
+							pos.ForeignExchange == opp.ForeignExchange &&
+							pos.BaseSymbol == opp.BaseSymbol
+						isReverseMatch := pos.BaseExchange == opp.ForeignExchange &&
+							pos.ForeignExchange == opp.BaseExchange &&
+							pos.BaseSymbol == opp.ForeignSymbol
+						if isCanonicalMatch || isReverseMatch {
+							currentExposure += pos.InvestmentUSD
+							matchingPos = &activePos[i]
+							break
 						}
 					}
-					continue
-				}
 
-				// --- ActionType = 0 (TRADE / 진입 및 리밸런싱) ---
-				// Resolve directional exchange pair based on AI ActionScore:
-				// ActionScore <= 5.0: Short BaseExchange / Long ForeignExchange
-				// ActionScore > 5.0:  Long BaseExchange / Short ForeignExchange (flip Base <-> Foreign)
-				entryBaseEx := opp.BaseExchange
-				entryForeignEx := opp.ForeignExchange
-				entryBaseSym := opp.BaseSymbol
-				entrySpread := opp.PremiumPct
-				entryPredictedSpread := opp.PredictedPremiumPct
-				if opp.ActionScore > 5.0 {
-					entryBaseEx = opp.ForeignExchange
-					entryForeignEx = opp.BaseExchange
-					entryBaseSym = opp.ForeignSymbol
-					entrySpread = -opp.PremiumPct
-					entryPredictedSpread = -opp.PredictedPremiumPct
-				}
+					// --- ActionType = 2 (REPAY / 청산) ---
+					if opp.ActionType == 2 {
+						if matchingPos != nil && matchingPos.Status != "CLOSED" {
+							log.Printf("🚨 [AI REPAY TRIGGERED] (%s) User %d %s, closing position %s",
+								e.ModeString(), e.userID, opp.BaseSymbol, matchingPos.PositionID)
 
-				delta := targetDollarVolume - currentExposure
-				toleranceAmount := e.config.CapitalLimitUsd * 0.02
-
-				if delta > toleranceAmount {
-					targetPair := e.findPair(entryBaseEx, entryForeignEx, entryBaseSym)
-					if targetPair == nil {
-						targetPair = e.findPair(opp.BaseExchange, opp.ForeignExchange, opp.BaseSymbol)
-					}
-
-					if matchingPos == nil {
-						if targetPair != nil {
-							// Dynamic Strategy Router: compare expected Net ROI across eligible strategies (A ~ E)
-							var selectedStrategy StrategyType = StrategyMarginSpot
-							isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
-							isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
-							if isBaseFuture && isForeignFuture {
-								selectedStrategy = StrategyFutureFuture
-							} else if isBaseFuture {
-								selectedStrategy = StrategyFutureSpot
-							} else {
-								// Base is Spot (Margin): compare convergence ROI (A/B) vs instant transfer ROI (C)
-								reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
-								transferNetROI := entrySpread - 0.0022
-
-								if targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
-									selectedStrategy = StrategyForeignTransfer
-								} else if isForeignFuture {
-									selectedStrategy = StrategyMarginFuture
-								} else {
-									selectedStrategy = StrategyMarginSpot
+							var targetStrategy ArbitrageStrategy
+							for _, strat := range e.strategies {
+								if string(strat.ID()) == matchingPos.Type {
+									targetStrategy = strat
+									break
 								}
 							}
 
-							targetStrategy := e.findStrategy(selectedStrategy)
 							if targetStrategy != nil {
-								eval := targetStrategy.GetLastEvaluation()
-								eval.Type = selectedStrategy
-								eval.EntryPremium = entrySpread
-								eval.BasisReturn = entrySpread - entryPredictedSpread
-								eval.InvestmentUSD = targetDollarVolume
-								eval.HedgeMarket = "SPOT"
-								if isForeignFuture {
-									eval.HedgeMarket = "FUTURE"
+								targetPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+								if targetPair == nil {
+									continue
 								}
-								targetStrategy.SetEvaluation(eval)
-								_, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair)
-								if err != nil {
-									errMsg := err.Error()
-									isInsuff := strings.Contains(strings.ToLower(errMsg), "insufficient balance") ||
-										strings.Contains(strings.ToLower(errMsg), "insufficient paper funds") ||
-										strings.Contains(strings.ToLower(errMsg), "insufficient funds") ||
-										strings.Contains(strings.ToLower(errMsg), "foreign balance too low") ||
-										strings.Contains(strings.ToLower(errMsg), "skew protection active")
-
-									shouldLog := true
-									if isInsuff {
-										e.lastErrorLogTimeMu.Lock()
-										key := fmt.Sprintf("%s-%s", entryBaseSym, selectedStrategy)
-										lastLog, exists := e.lastErrorLogTime[key]
-										if exists && time.Since(lastLog) < 1*time.Minute {
-											shouldLog = false
-										} else {
-											e.lastErrorLogTime[key] = time.Now()
-										}
-										e.lastErrorLogTimeMu.Unlock()
-									}
-
-									if shouldLog {
-										log.Printf("❌ [AI ENTRY FAILED] (Throttled) User %d %s via %s: %v", e.userID, entryBaseSym, selectedStrategy, err)
-									}
-								} else {
-									log.Printf("🚀 [AI ENTRY TRIGGERED] User %d %s via %s, Target Vol: $%.2f", e.userID, entryBaseSym, selectedStrategy, targetDollarVolume)
-								}
-							}
-						}
-					} else {
-						// SCALE IN: Execute pyramiding on the existing position
-						log.Printf("📈 [AI SCALE-IN TRIGGERED] User %d %s, adding $%.2f", e.userID, matchingPos.BaseSymbol, delta)
-						targetStrategy := e.findStrategy(StrategyType(matchingPos.Type))
-						posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
-						if targetStrategy != nil && posPair != nil {
-							prevBase := matchingPos.BaseAmount
-							prevForeign := matchingPos.ForeignAmount
-							if err := targetStrategy.ExecuteScale(ctx, e.executor, *posPair, matchingPos, delta, e.walletProxy); err == nil {
-								addedBase := matchingPos.BaseAmount - prevBase
-								addedForeign := matchingPos.ForeignAmount - prevForeign
-								_ = e.db.AddPositionAmount(matchingPos.PositionID, delta, addedBase, addedForeign)
-							} else {
-								log.Printf("⚠️ [AI SCALE-IN ERROR] Failed for %s: %v", matchingPos.PositionID, err)
-							}
-						}
-					}
-
-				} else if delta < -toleranceAmount {
-					// SCALE OUT: Partial or full position reduction
-					if matchingPos != nil && currentExposure > 0 {
-						log.Printf("📉 [AI SCALE-OUT TRIGGERED] User %d %s, removing $%.2f", e.userID, matchingPos.BaseSymbol, -delta)
-						exitRatio := math.Min(1.0, (-delta)/currentExposure)
-						targetStrategy := e.findStrategy(StrategyType(matchingPos.Type))
-						posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
-						if targetStrategy != nil && posPair != nil {
-							if err := targetStrategy.ExecuteExit(ctx, e.executor, *posPair, *matchingPos, exitRatio, e.walletProxy); err == nil {
-								if exitRatio >= 0.99 {
-									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+								exitRatio := 1.0
+								err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, *matchingPos, exitRatio, e.walletProxy)
+								if err == nil {
+									e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+									e.persistPaperState()
 									e.notifyPositionClosed(ctx, matchingPos.PositionID)
 								} else {
-									reducedUsd := matchingPos.InvestmentUSD * exitRatio
-									reducedBase := matchingPos.BaseAmount * exitRatio
-									reducedForeign := matchingPos.ForeignAmount * exitRatio
-									_ = e.db.ReducePositionAmount(matchingPos.PositionID, reducedUsd, reducedBase, reducedForeign)
+									if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+										_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
+									}
 								}
-							} else {
-								log.Printf("⚠️ [AI SCALE-OUT ERROR] Failed for %s: %v", matchingPos.PositionID, err)
 							}
 						}
-					} else if logDetails {
-						log.Printf("[PaperEngine] AI suggested SCALE-OUT for %s but no matching active position exists.", opp.BaseSymbol)
+						continue
 					}
-				} else {
-					if logDetails {
-						log.Printf("[PaperEngine] AI suggested TRADE for %s with target weight %.4f ($%.2f exposure), but current exposure is $%.2f. Delta ($%.2f) is within tolerance ($%.2f). No trade executed.",
-							opp.BaseSymbol, opp.TargetWeight, targetDollarVolume, currentExposure, delta, toleranceAmount)
+
+					// --- ActionType = 1 (TRANSFER / 전송 및 상환) ---
+					if opp.ActionType == 1 {
+						if matchingPos != nil && matchingPos.Status == "OPEN" {
+							if matchingPos.Type == string(StrategyFutureSpot) || matchingPos.Type == string(StrategyFutureFuture) {
+								continue
+							}
+
+							posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+							var transferStrat *ForeignTransferStrategy
+							for _, s := range e.strategies {
+								if ft, ok := s.(*ForeignTransferStrategy); ok {
+									transferStrat = ft
+									break
+								}
+							}
+
+							if posPair != nil && posPair.IsValidForTransfer && transferStrat != nil {
+								_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "TRANSFERRING")
+								e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+									`{"action":"POSITION_TRANSFERRING", "position_id":"%s", "mode":"%s"}`, matchingPos.PositionID, e.ModeString(),
+								)))
+								e.publishAccountState(ctx)
+
+								if err := transferStrat.ExecuteTransferAndRepay(ctx, e.executor, *posPair, *matchingPos, e.walletProxy); err == nil {
+									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+									e.persistPaperState()
+									e.notifyPositionClosed(ctx, matchingPos.PositionID)
+								} else {
+									if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+										_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
+									} else {
+										_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "OPEN")
+									}
+								}
+							}
+						}
+						continue
+					}
+
+					// Do not open or scale-in new positions if in DRAINING mode
+					if e.isDraining || e.botStatus != "RUNNING" {
+						continue
+					}
+
+					// --- ActionType = 0 (TRADE / 진입 및 리밸런싱) ---
+					entryBaseEx := opp.BaseExchange
+					entryForeignEx := opp.ForeignExchange
+					entryBaseSym := opp.BaseSymbol
+					entrySpread := opp.PremiumPct
+					entryPredictedSpread := opp.PredictedPremiumPct
+					if opp.ActionScore > 5.0 {
+						entryBaseEx = opp.ForeignExchange
+						entryForeignEx = opp.BaseExchange
+						entryBaseSym = opp.ForeignSymbol
+						entrySpread = -opp.PremiumPct
+						entryPredictedSpread = -opp.PredictedPremiumPct
+					}
+
+					delta := targetDollarVolume - currentExposure
+					toleranceAmount := e.config.CapitalLimitUsd * 0.02
+
+					if delta > toleranceAmount {
+						targetPair := e.findPair(entryBaseEx, entryForeignEx, entryBaseSym)
+						if targetPair == nil {
+							targetPair = e.findPair(opp.BaseExchange, opp.ForeignExchange, opp.BaseSymbol)
+						}
+
+						if matchingPos == nil {
+							if targetPair != nil {
+								var selectedStrategy StrategyType = StrategyMarginSpot
+								isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
+								isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
+								if isBaseFuture && isForeignFuture {
+									selectedStrategy = StrategyFutureFuture
+								} else if isBaseFuture {
+									selectedStrategy = StrategyFutureSpot
+								} else {
+									reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
+									transferNetROI := entrySpread - 0.0022
+
+									if targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
+										selectedStrategy = StrategyForeignTransfer
+									} else if isForeignFuture {
+										selectedStrategy = StrategyMarginFuture
+									} else {
+										selectedStrategy = StrategyMarginSpot
+									}
+								}
+
+								targetStrategy := e.findStrategy(selectedStrategy)
+								if targetStrategy != nil {
+									eval := targetStrategy.GetLastEvaluation()
+									eval.Type = selectedStrategy
+									eval.EntryPremium = entrySpread
+									eval.BasisReturn = entrySpread - entryPredictedSpread
+									eval.InvestmentUSD = targetDollarVolume
+									eval.HedgeMarket = "SPOT"
+									if isForeignFuture {
+										eval.HedgeMarket = "FUTURE"
+									}
+									targetStrategy.SetEvaluation(eval)
+									_, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair)
+									if err != nil {
+										errMsg := err.Error()
+										isInsuff := strings.Contains(strings.ToLower(errMsg), "insufficient") ||
+											strings.Contains(strings.ToLower(errMsg), "skew protection")
+										shouldLog := true
+										if isInsuff {
+											e.lastErrorLogTimeMu.Lock()
+											key := fmt.Sprintf("%s-%s", entryBaseSym, selectedStrategy)
+											lastLog, exists := e.lastErrorLogTime[key]
+											if exists && time.Since(lastLog) < 1*time.Minute {
+												shouldLog = false
+											} else {
+												e.lastErrorLogTime[key] = time.Now()
+											}
+											e.lastErrorLogTimeMu.Unlock()
+										}
+										if shouldLog {
+											log.Printf("❌ [AI ENTRY FAILED] (%s) User %d %s via %s: %v", e.ModeString(), e.userID, entryBaseSym, selectedStrategy, err)
+										}
+									} else {
+										log.Printf("🚀 [AI ENTRY TRIGGERED] (%s) User %d %s via %s, Target Vol: $%.2f", e.ModeString(), e.userID, entryBaseSym, selectedStrategy, targetDollarVolume)
+									}
+								}
+							}
+						} else {
+							targetStrategy := e.findStrategy(StrategyType(matchingPos.Type))
+							posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+							if targetStrategy != nil && posPair != nil {
+								prevBase := matchingPos.BaseAmount
+								prevForeign := matchingPos.ForeignAmount
+								if err := targetStrategy.ExecuteScale(ctx, e.executor, *posPair, matchingPos, delta, e.walletProxy); err == nil {
+									addedBase := matchingPos.BaseAmount - prevBase
+									addedForeign := matchingPos.ForeignAmount - prevForeign
+									_ = e.db.AddPositionAmount(matchingPos.PositionID, delta, addedBase, addedForeign)
+									e.persistPaperState()
+								}
+							}
+						}
+					} else if delta < -toleranceAmount {
+						if matchingPos != nil && currentExposure > 0 {
+							exitRatio := math.Min(1.0, (-delta)/currentExposure)
+							targetStrategy := e.findStrategy(StrategyType(matchingPos.Type))
+							posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+							if targetStrategy != nil && posPair != nil {
+								if err := targetStrategy.ExecuteExit(ctx, e.executor, *posPair, *matchingPos, exitRatio, e.walletProxy); err == nil {
+									if exitRatio >= 0.99 {
+										_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+										e.notifyPositionClosed(ctx, matchingPos.PositionID)
+									} else {
+										reducedUsd := matchingPos.InvestmentUSD * exitRatio
+										reducedBase := matchingPos.BaseAmount * exitRatio
+										reducedForeign := matchingPos.ForeignAmount * exitRatio
+										_ = e.db.ReducePositionAmount(matchingPos.PositionID, reducedUsd, reducedBase, reducedForeign)
+									}
+									e.persistPaperState()
+								}
+							}
+						}
 					}
 				}
 			}
@@ -1157,7 +1322,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 			filteredPayload, err := json.Marshal(dtoList)
 			if err == nil {
-				e.redisClient.PublishUserOpportunities(ctx, fmt.Sprint(e.userID), filteredPayload)
+				e.redisClient.PublishUserOpportunitiesByMode(ctx, fmt.Sprint(e.userID), e.ModeString(), filteredPayload)
 			}
 			e.mu.Unlock()
 		}
@@ -1176,19 +1341,26 @@ type ExchangeBalanceSnapshot struct {
 
 // UserCommand represents a manual action sent from the frontend via the Node API server over Redis.
 type UserCommand struct {
-	Action          string  `json:"action"` // "FORCE_ENTER" | "FORCE_CLOSE"
-	PositionID      string  `json:"position_id,omitempty"`
-	BaseExchange    string  `json:"base_exchange,omitempty"`
-	ForeignExchange string  `json:"foreign_exchange,omitempty"`
-	BaseSymbol      string  `json:"base_symbol,omitempty"`
-	ForeignSymbol   string  `json:"foreign_symbol,omitempty"`
-	Strategy        string  `json:"strategy,omitempty"`
-	ExpectedRoi     float64 `json:"expected_roi,omitempty"`
-	InvestmentUsd   float64 `json:"investment_usd,omitempty"`
+	Action             string  `json:"action"`     // "FORCE_ENTER" | "FORCE_CLOSE" | "SET_BOT_STATUS" | "SET_SIM_OFFSET" | "RESET_PAPER_ACCOUNT"
+	Mode               string  `json:"mode,omitempty"`       // "PAPER" | "LIVE"
+	SubAction          string  `json:"sub_action,omitempty"` // "RUN" | "DRAIN" | "STOP_AND_CLOSE"
+	PositionID         string  `json:"position_id,omitempty"`
+	BaseExchange       string  `json:"base_exchange,omitempty"`
+	ForeignExchange    string  `json:"foreign_exchange,omitempty"`
+	BaseSymbol         string  `json:"base_symbol,omitempty"`
+	ForeignSymbol      string  `json:"foreign_symbol,omitempty"`
+	Strategy           string  `json:"strategy,omitempty"`
+	ExpectedRoi        float64 `json:"expected_roi,omitempty"`
+	InvestmentUsd      float64 `json:"investment_usd,omitempty"`
+	SimExchange        string  `json:"sim_exchange,omitempty"`
+	SimTargetOffsetPct float64 `json:"sim_target_offset_pct,omitempty"`
+	SimRampMinutes     float64 `json:"sim_ramp_minutes,omitempty"`
+	PaperUpbitKRW      float64 `json:"paper_upbit_krw,omitempty"`
+	PaperCoinbaseUSD   float64 `json:"paper_coinbase_usd,omitempty"`
 }
 
-// ListenUserCommands subscribes to user:{id}:cmd so manual UI commands ("Force Enter", "Force Close")
-// execute real exchange orders and loan repayments directly inside the user's Engine goroutine.
+// ListenUserCommands subscribes to user:{id}:cmd so manual UI commands ("Force Enter", "Force Close", "Set Bot Status", "Set Sim Offset", "Reset Paper")
+// execute directly inside the user's targeted Engine goroutine (Paper or Live).
 func (e *Engine) ListenUserCommands(ctx context.Context) {
 	if e.redisClient == nil {
 		return
@@ -1207,17 +1379,108 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 				continue
 			}
 
+			// Route command only to the matching engine mode ("PAPER" vs "LIVE") if specified
+			if cmd.Mode != "" && !strings.EqualFold(cmd.Mode, e.ModeString()) {
+				continue
+			}
+
 			e.mu.Lock()
 			switch cmd.Action {
+			case "SET_BOT_STATUS":
+				switch strings.ToUpper(cmd.SubAction) {
+				case "RUN":
+					e.botStatus = "RUNNING"
+					e.isDraining = false
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"BOT_STATUS_CHANGED","mode":"%s","status":"RUNNING","message":"%s Auto-Trading is now RUNNING."}`,
+						e.ModeString(), e.ModeString(),
+					)))
+				case "DRAIN":
+					e.botStatus = "DRAINING"
+					e.isDraining = true
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"BOT_STATUS_CHANGED","mode":"%s","status":"DRAINING","message":"%s Bot entered DRAIN mode: existing positions will be monitored until exit, no new entries."}`,
+						e.ModeString(), e.ModeString(),
+					)))
+				case "STOP_AND_CLOSE":
+					e.botStatus = "STOPPED"
+					e.isDraining = true
+					positions, _ := e.db.GetActivePositionsByUserAndMode(e.userID, e.isPaper)
+					for _, pos := range positions {
+						if pos.Status == "CLOSED" {
+							continue
+						}
+						targetStrategy := e.findStrategy(StrategyType(pos.Type))
+						targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
+						if targetStrategy != nil && targetPair != nil {
+							_ = targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy)
+						}
+						_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+						e.notifyPositionClosed(ctx, pos.PositionID)
+					}
+					e.persistPaperState()
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"BOT_STATUS_CHANGED","mode":"%s","status":"STOPPED","message":"%s Bot STOPPED and all open positions were closed."}`,
+						e.ModeString(), e.ModeString(),
+					)))
+				default:
+					e.botStatus = "STOPPED"
+					e.isDraining = true
+				}
+
+			case "SET_SIM_OFFSET":
+				if e.isPaper {
+					_, currPct, _, _, _, _ := e.GetSimStatus()
+					if cmd.SimExchange != "" {
+						e.simExchange = strings.ToUpper(cmd.SimExchange)
+					}
+					e.simStartOffsetPct = currPct
+					e.simTargetOffsetPct = cmd.SimTargetOffsetPct
+					e.simRampMinutes = cmd.SimRampMinutes
+					e.simStartedAt = time.Now().Unix()
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"SIM_OFFSET_UPDATED","mode":"PAPER","message":"Paper Simulator: %s price ramping from %.2f%% to %.2f%% over %.1f min."}`,
+						e.simExchange, e.simStartOffsetPct, e.simTargetOffsetPct, e.simRampMinutes,
+					)))
+				}
+
+			case "RESET_PAPER_ACCOUNT":
+				if e.isPaper {
+					_ = e.db.CloseAllActivePositionsByUserAndMode(e.userID, true)
+					upbitKRW := cmd.PaperUpbitKRW
+					if upbitKRW <= 0 {
+						upbitKRW = 50000000.0
+					}
+					cbUSD := cmd.PaperCoinbaseUSD
+					if cbUSD <= 0 {
+						cbUSD = 35000.0
+					}
+					for _, c := range e.clients {
+						if pc, ok := c.(*exchange.PaperClient); ok {
+							if strings.EqualFold(pc.GetName(), "UPBIT") {
+								pc.ResetBalances(map[string]float64{"KRW": upbitKRW, "BTC": 0.0, "ETH": 0.0})
+							} else {
+								pc.ResetBalances(map[string]float64{"USD": cbUSD, "BTC": 0.0, "ETH": 0.0})
+							}
+						}
+					}
+					e.liveUnrealizedPnLs = make(map[string]float64)
+					e.persistPaperState()
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"PAPER_ACCOUNT_RESET","mode":"PAPER","message":"Paper account reset to ₩%.0f KRW & $%.0f USD. All virtual positions cleared."}`,
+						upbitKRW, cbUSD,
+					)))
+				}
+
 			case "FORCE_CLOSE":
-				positions, _ := e.db.GetActivePositionsByUser(e.userID)
+				positions, _ := e.db.GetActivePositionsByUserAndMode(e.userID, e.isPaper)
 				for _, pos := range positions {
 					if pos.PositionID == cmd.PositionID && pos.Status != "CLOSED" {
 						targetStrategy := e.findStrategy(StrategyType(pos.Type))
 						targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
 						if targetStrategy != nil && targetPair != nil {
-							log.Printf("⚡ [Manual Force Close] User %d closing Position %s on %s/%s...",
-								e.userID, pos.PositionID, pos.BaseExchange, pos.ForeignExchange)
+							log.Printf("⚡ [Manual Force Close] (%s) User %d closing Position %s on %s/%s...",
+								e.ModeString(), e.userID, pos.PositionID, pos.BaseExchange, pos.ForeignExchange)
 							if err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy); err != nil {
 								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
 									_ = e.db.UpdatePositionStatus(pos.PositionID, "AWAITING_REPAY")
@@ -1228,6 +1491,7 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 								)))
 							} else {
 								_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+								e.persistPaperState()
 								e.notifyPositionClosed(ctx, pos.PositionID)
 							}
 						}
@@ -1276,7 +1540,7 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					}
 					targetStrategy.SetEvaluation(eval)
 					if _, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair); err != nil {
-						log.Printf("❌ [Manual Force Enter Error] %v", err)
+						log.Printf("❌ [Manual Force Enter Error] (%s) %v", e.ModeString(), err)
 						e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 							`{"action":"COMMAND_ERROR","message":"Manual entry failed: %s"}`, err.Error(),
 						)))
@@ -1289,9 +1553,11 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 	}
 }
 
-// AIAccountState maps the user's balance, exchange skew, web session status, and positions for python DRL & UI SSE
+// AIAccountState maps the user's balance, exchange skew, web session status, simulator telemetry, and positions for python DRL & UI SSE
 type AIAccountState struct {
 	UserID               uint                      `json:"user_id"`
+	Mode                 string                    `json:"mode"`
+	BotStatus            string                    `json:"bot_status"`
 	AvailableBalance     float64                   `json:"available_balance"`
 	TotalEquityUSD       float64                   `json:"total_equity_usd"`
 	ExchangeBalances     []ExchangeBalanceSnapshot `json:"exchange_balances"`
@@ -1304,10 +1570,16 @@ type AIAccountState struct {
 	UnrealizedPnLs       map[string]float64        `json:"unrealized_pnls"`
 	PairStates           map[string]int            `json:"pair_states"`
 	State                int                       `json:"state"`
+	SimExchange          string                    `json:"sim_exchange"`
+	SimCurrentOffsetPct  float64                   `json:"sim_current_offset_pct"`
+	SimTargetOffsetPct   float64                   `json:"sim_target_offset_pct"`
+	SimRampMinutes       float64                   `json:"sim_ramp_minutes"`
+	SimProgressPct       float64                   `json:"sim_progress_pct"`
+	SimRemainingSec      int64                     `json:"sim_remaining_sec"`
 }
 
 func (e *Engine) publishAccountState(ctx context.Context) {
-	positions, err := e.db.GetActivePositionsByUser(e.userID)
+	positions, err := e.db.GetActivePositionsByUserAndMode(e.userID, e.isPaper)
 	if err != nil {
 		log.Printf("[Engine-%d] Failed to load user active positions: %v", e.userID, err)
 		return
@@ -1334,7 +1606,6 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		if e.config.CapitalLimitUsd > 0 {
 			normExposure = math.Min(1.0, pos.InvestmentUSD/e.config.CapitalLimitUsd)
 		}
-		// Strategies A~E short BaseExchange (-normExposure) and long ForeignExchange (+normExposure)
 		exposures[key] = -normExposure
 		exposures[reverseKey] = normExposure
 
@@ -1362,7 +1633,6 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		}
 	}
 
-	// Query real-time fiat/quote balances across all connected exchanges (supports both live and PaperClient)
 	var exSnapshots []ExchangeBalanceSnapshot
 	webSessions := make(map[string]bool)
 	totalLiquidUSD := 0.0
@@ -1371,7 +1641,12 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 	for _, client := range e.clients {
 		exName := client.GetName()
 		lendingOK := client.SupportsMargin()
-		if wc, ok := client.(exchange.WebLendingCapable); ok && wc.LendingManager() != nil {
+		if e.isPaper {
+			lendingOK = true
+			if exName == "UPBIT" || exName == "BITHUMB" {
+				webSessions[exName] = true
+			}
+		} else if wc, ok := client.(exchange.WebLendingCapable); ok && wc.LendingManager() != nil {
 			lendingOK = wc.LendingManager().IsSessionValid()
 			webSessions[exName] = lendingOK
 		}
@@ -1387,11 +1662,11 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 				if string(b.Currency) == "KRW" {
 					quoteCur = "KRW"
 					availNative += b.Available
-					availUSD += b.Available / GetFXRate("KRW")
+					availUSD += (b.Available + b.Locked) / GetFXRate("KRW")
 				} else if string(b.Currency) == "USD" || string(b.Currency) == "USDT" || string(b.Currency) == "USDC" {
 					quoteCur = string(b.Currency)
 					availNative += b.Available
-					availUSD += b.Available
+					availUSD += (b.Available + b.Locked)
 				}
 			}
 		}
@@ -1424,9 +1699,13 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		totalEquityUSD = balance + totalInvestedUSD + totalUnrealizedPnLUSD
 	}
 
+	simEx, simCurr, simTarget, simRamp, simProg, simRem := e.GetSimStatus()
+
 	payload, err := json.Marshal(AIAccountState{
 		UserID:               e.userID,
-		AvailableBalance:     balance,
+		Mode:                 e.ModeString(),
+		BotStatus:            e.botStatus,
+		AvailableBalance:     totalLiquidUSD,
 		TotalEquityUSD:       totalEquityUSD,
 		ExchangeBalances:     exSnapshots,
 		ForeignShare:         foreignShare,
@@ -1438,9 +1717,15 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		UnrealizedPnLs:       pnls,
 		PairStates:           pairStates,
 		State:                state,
+		SimExchange:          simEx,
+		SimCurrentOffsetPct:  simCurr,
+		SimTargetOffsetPct:   simTarget,
+		SimRampMinutes:       simRamp,
+		SimProgressPct:       simProg,
+		SimRemainingSec:      simRem,
 	})
 	if err == nil && e.redisClient != nil {
-		e.redisClient.PublishUserState(ctx, fmt.Sprint(e.userID), payload)
+		e.redisClient.PublishUserStateByMode(ctx, fmt.Sprint(e.userID), e.ModeString(), payload)
 	}
 }
 
