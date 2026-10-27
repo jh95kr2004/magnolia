@@ -76,17 +76,28 @@ class PortfolioRLAgent:
             if len(stacked_obs.flatten()) > 0:
                 flat_obs = stacked_obs.flatten()
                 feature_dim = len(flat_obs) // self.n_stack
-                spread = float(flat_obs[-feature_dim]) # Index 0 of the latest frame
-                pred_premium = float(flat_obs[-feature_dim + 4]) # Index 4 of the latest frame
+                latest = flat_obs[-feature_dim:]
+                spread = float(latest[0])        # Decimal (e.g. 0.03 = 3%)
+                pred_premium = float(latest[4])  # Decimal
+                base_fee = float(latest[14]) if len(latest) > 14 else 0.0005
+                foreign_fee = float(latest[15]) if len(latest) > 15 else 0.002
+                slippage = float(latest[16]) if len(latest) > 16 else 0.0005
             else:
                 spread, pred_premium = 0.0, 0.0
-            
-            # Simple heuristic: positive spread gives higher score
-            action_score = spread + max(0.0, pred_premium - spread) * 0.5
-            target_weight = min(1.0, max(0.0, spread / 5.0)) # Needs to be >0 to allocate. At 5% spread, allocate 100%
-            return action_score, target_weight, 0  # Default to TRADE action type for fallback
+                base_fee, foreign_fee, slippage = 0.0005, 0.002, 0.0005
 
+            friction_wall = base_fee + foreign_fee + slippage
+            reversion_edge = (spread - pred_premium) if spread >= 0 else (pred_premium - spread)
+            transfer_edge = max(0.0, spread)
+            best_edge = max(reversion_edge, transfer_edge)
 
+            if best_edge <= friction_wall * 1.2:
+                return 5.0, 0.0, 0
+
+            action_score = 2.0 if spread >= 0 else 8.0
+            # At 5% (0.05) net edge, allocate up to 50% (0.50); at 1% (0.01) edge, allocate 20% (0.20)
+            target_weight = min(0.50, max(0.0, best_edge / 0.05))
+            return action_score, target_weight, 0
 
         # Extract raw features from the latest frame before normalization
         latest_frame = stacked_obs[0, -22:]
@@ -126,34 +137,34 @@ class PortfolioRLAgent:
         else:
             action_type = 2  # REPAY
 
-        # Apply robust hybrid state machine rules to override action_type
+        # Apply non-destructive safety guardrails while respecting PPO decisions in holding state
         if state_neutral > 0.5:
-            # We are neutral. We should only trade if there is a profitable opportunity.
+            # In Neutral state, we cannot TRANSFER or REPAY a non-existent position.
+            # Evaluate both convergence profit (Strategies A/B/D/E) and instant transfer spread (Strategy C).
             friction_wall = base_fee + foreign_fee + slippage
-            if spread > 0:
-                expected_profit = spread - mean_pred
-            else:
-                expected_profit = mean_pred - spread
-                
-            if expected_profit > friction_wall * 1.5 and abs(spread) >= 0.01:
-                action_type = 0  # Force TRADE
-                # Ensure target weight is non-zero
+            reversion_profit = (spread - mean_pred) if spread >= 0 else (mean_pred - spread)
+            transfer_profit = max(0.0, spread)
+            expected_profit = max(reversion_profit, transfer_profit)
+
+            if expected_profit > friction_wall * 1.2 and abs(spread) >= 0.005:
+                action_type = 0  # Entry must be TRADE
                 if target_weight < 0.10:
-                    target_weight = 0.20
-                # Set direction correctly
-                if spread > 0:
+                    target_weight = min(0.50, max(0.15, expected_profit / 0.05))
+                if spread >= 0 and action_score >= 5.0:
                     action_score = 2.0  # Short Base / Long Foreign
-                else:
+                elif spread < 0 and action_score <= 5.0:
                     action_score = 8.0  # Long Base / Short Foreign
             else:
-                action_type = 1  # Stay Neutral / hold
+                # Veto unprofitable neutral entry
+                action_type = 0
                 target_weight = 0.0
                 action_score = 5.0
         elif state_holding > 0.5:
-            action_type = 1  # Force TRANSFER
+            # Respect PPO's learned choice among 0 (Hold / Scale-In / Scale-Out), 1 (Transfer), or 2 (Repay/Exit).
+            pass
         elif state_transferring > 0.5:
-            action_type = 1  # Keep TRANSFER
+            action_type = 1  # Position locked in on-chain transit
         elif state_repaying > 0.5:
-            action_type = 2  # Force REPAY
+            action_type = 2  # Complete repayment
 
         return action_score, target_weight, action_type
