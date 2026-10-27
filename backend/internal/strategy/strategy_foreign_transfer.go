@@ -715,3 +715,115 @@ func (s *ForeignTransferStrategy) ExecuteHedgedRebalance(
 
 	return nil
 }
+
+// ExecuteTransferAndRepay handles AI ActionType=1 (TRANSFER) for an existing open margin-borrowed position
+// (Strategy A MarginSpot, Strategy B MarginFuture, or Strategy C ForeignTransfer in FUTURE hold mode).
+// It converts Foreign Futures to Spot if necessary, withdraws Spot from Foreign to Base on-chain,
+// and immediately repays the borrowed debt on Base upon arrival.
+func (s *ForeignTransferStrategy) ExecuteTransferAndRepay(
+	ctx context.Context,
+	exec *execution.Executor,
+	pair CrossMarketPair,
+	pos postgres.ActivePosition,
+	walletProxy wallet.Client,
+) error {
+	if !pair.IsValidForTransfer {
+		return fmt.Errorf("pair %s/%s is not valid for on-chain transfer", pair.BaseClient.GetName(), pair.ForeignClient.GetName())
+	}
+
+	transferAmt := pos.ForeignAmount
+	repayAmt := pos.BaseAmount
+	if transferAmt <= 0 {
+		transferAmt = repayAmt
+	}
+
+	// 1. If holding Futures Long on Foreign (Strategy B or Strategy C FUTURE mode), atomically swap to Spot Long first
+	if pos.HedgeMarket == "FUTURE" || pos.Type == string(StrategyMarginFuture) {
+		closeFutureReq := exchange.OrderRequest{
+			Symbol: pair.ForeignMarketInfo.Symbol,
+			Side:   exchange.SellOrder,
+			Type:   exchange.FuturesLong,
+			Price:  0,
+			Amount: transferAmt,
+		}
+		buySpotReq := exchange.OrderRequest{
+			Symbol: pair.ForeignMarketInfo.Symbol,
+			Side:   exchange.BuyOrder,
+			Type:   exchange.MarketOrder,
+			Price:  0,
+			Amount: transferAmt,
+		}
+		if _, _, err := exec.ExecuteAtomicDualTrade(ctx, closeFutureReq, buySpotReq, pair.ForeignClient, pair.ForeignClient); err != nil {
+			return fmt.Errorf("transfer-and-repay: failed to swap foreign futures to spot: %w", err)
+		}
+	}
+
+	// 2. Withdraw Spot from Foreign -> Base (unless already transferred in Strategy C SPOT mode)
+	if !(pos.Type == string(StrategyForeignTransfer) && pos.HedgeMarket == "SPOT") {
+		baseDep, err := pair.BaseClient.GetDepositAddress(ctx, pair.BaseCurrency, exchange.Network(pair.BaseNetwork.Network))
+		if err != nil {
+			return fmt.Errorf("transfer-and-repay: failed to fetch base deposit address: %w", err)
+		}
+
+		var transferActions []*execution.TransferAction
+		if walletProxy != nil {
+			destAddr, _ := walletProxy.GetReceiveAddress(ctx, string(pair.BaseCurrency), string(pair.ForeignNetwork.Network))
+			transferActions = append(transferActions,
+				&execution.TransferAction{
+					Type:           execution.StepTypeWithdraw,
+					Description:    fmt.Sprintf("Withdraw Foreign Spot to Wallet Proxy %s", walletProxy.GetName()),
+					ExchangeClient: pair.ForeignClient,
+					WithdrawReq: &exchange.WithdrawRequest{
+						Currency: pair.BaseCurrency,
+						Network:  exchange.Network(pair.ForeignNetwork.Network),
+						Amount:   transferAmt,
+						Address:  destAddr,
+					},
+				},
+				&execution.TransferAction{
+					Type:         execution.StepTypeWalletTransfer,
+					Description:  "Hop Wallet Proxy -> Base Exchange",
+					WalletClient: walletProxy,
+					WalletReq: &wallet.TransferRequest{
+						Currency:  string(pair.BaseCurrency),
+						Amount:    repayAmt,
+						Network:   string(pair.BaseNetwork.Network),
+						ToAddress: baseDep.Address,
+						ToTag:     baseDep.Tag,
+					},
+				},
+			)
+		} else {
+			transferActions = append(transferActions, &execution.TransferAction{
+				Type:           execution.StepTypeWithdraw,
+				Description:    "Direct Withdraw Foreign -> Base",
+				ExchangeClient: pair.ForeignClient,
+				WithdrawReq: &exchange.WithdrawRequest{
+					Currency: pair.BaseCurrency,
+					Network:  exchange.Network(pair.ForeignNetwork.Network),
+					Amount:   transferAmt,
+					Address:  baseDep.Address,
+					Tag:      baseDep.Tag,
+				},
+			})
+		}
+
+		if err := exec.ExecutePipeline(ctx, transferActions); err != nil {
+			return fmt.Errorf("transfer-and-repay: on-chain transfer failed: %w", err)
+		}
+	}
+
+	// 3. Repay borrowed debt on Base
+	repayAction := &execution.TransferAction{
+		Type:           execution.StepTypeRepay,
+		Description:    "Repay Crypto Debt on Base after Transfer",
+		ExchangeClient: pair.BaseClient,
+		Currency:       pair.BaseCurrency,
+		Amount:         repayAmt,
+	}
+	if err := exec.ExecutePipeline(ctx, []*execution.TransferAction{repayAction}); err != nil {
+		return fmt.Errorf("transfer-and-repay: base debt repayment failed: %w", err)
+	}
+
+	return nil
+}
