@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	"github.com/magnolia/backend/internal/exchange"
 	redisclient "github.com/redis/go-redis/v9"
@@ -180,10 +181,43 @@ func (p *PubSubClient) SubscribeUserOpportunities(ctx context.Context, userID st
 	}
 }
 
-// PublishUserState broadcasts the customized account metrics to python daemon.
+// PublishUserState broadcasts the customized account metrics to python daemon and caches the latest snapshot for SSE.
 func (p *PubSubClient) PublishUserState(ctx context.Context, userID string, payload []byte) error {
 	channel := "user:" + userID + ":state"
+	_ = p.client.Set(ctx, channel+":latest", payload, 5*time.Minute).Err()
 	return p.client.Publish(ctx, channel, payload).Err()
+}
+
+// GetLatestUserState retrieves the latest cached account state snapshot for a user.
+func (p *PubSubClient) GetLatestUserState(ctx context.Context, userID string) ([]byte, error) {
+	key := "user:" + userID + ":state:latest"
+	val, err := p.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+// PublishUserCommand dispatches a manual execution command (e.g. FORCE_ENTER, FORCE_CLOSE) to the user's Engine goroutine.
+func (p *PubSubClient) PublishUserCommand(ctx context.Context, userID string, payload []byte) error {
+	channel := "user:" + userID + ":cmd"
+	return p.client.Publish(ctx, channel, payload).Err()
+}
+
+// SubscribeUserCommands listens for manual execution commands targeted at a specific user's Engine goroutine.
+func (p *PubSubClient) SubscribeUserCommands(ctx context.Context, userID string, outCh chan<- []byte) {
+	channel := "user:" + userID + ":cmd"
+	pubsub := p.client.Subscribe(ctx, channel)
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			outCh <- []byte(msg.Payload)
+		}
+	}
 }
 
 // PublishUserEvents sends notifications (e.g. position updates) to a specific user.
