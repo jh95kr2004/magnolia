@@ -8,9 +8,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -94,6 +95,21 @@ func main() {
 
 	priceCh := make(chan exchange.PriceUpdate, 1000)
 	priceCache := &sync.Map{}
+
+	var fxMu sync.RWMutex
+	liveKRWRate := 1385.0
+	getKRWRate := func() float64 {
+		fxMu.RLock()
+		defer fxMu.RUnlock()
+		return liveKRWRate
+	}
+	setKRWRate := func(r float64) {
+		if r > 500 && r < 3000 {
+			fxMu.Lock()
+			liveKRWRate = r
+			fxMu.Unlock()
+		}
+	}
 
 	ranker := strategy.NewGlobalRawRanker(redisClient)
 
@@ -232,6 +248,27 @@ func main() {
 				merged = update
 			}
 
+			// Apply latest live USD/KRW FX rate when QuoteCurrency is KRW
+			if merged.QuoteCurrency == "KRW" || strings.HasSuffix(string(merged.Symbol), "-KRW") {
+				krwRate := getKRWRate()
+				if krwRate > 0 {
+					merged.FXRate = krwRate
+					merged.FXCurrencyPair = "USD/KRW"
+					if merged.RawBid > 0 {
+						merged.BidUSD = merged.RawBid / krwRate
+					}
+					if merged.RawAsk > 0 {
+						merged.AskUSD = merged.RawAsk / krwRate
+					}
+					if merged.RawFutureBid > 0 {
+						merged.BidFutureUSD = merged.RawFutureBid / krwRate
+					}
+					if merged.RawFutureAsk > 0 {
+						merged.AskFutureUSD = merged.RawFutureAsk / krwRate
+					}
+				}
+			}
+
 			// Save back to sync.Map
 			priceCache.Store(cacheKey, &merged)
 
@@ -242,88 +279,48 @@ func main() {
 			if err := influxClient.WritePriceUpdate(ctx, merged); err != nil {
 				log.Printf("[Metrics] Failed to write %s to InfluxDB: %v", merged.Symbol, err)
 			}
-
-			// C. Generate simulated Coinbase ticks if Coinbase credentials are not provided or SIMULATE_PREMIUM is enabled
-			cbKeyName := os.Getenv("COINBASE_API_KEY_NAME")
-			simulatePremium := os.Getenv("SIMULATE_PREMIUM") == "true"
-			if cbKeyName == "" || cbKeyName == "public" || cbKeyName == "dummy" || simulatePremium {
-				if merged.Exchange == "UPBIT" && (strings.HasPrefix(string(merged.Symbol), "BTC") || strings.HasPrefix(string(merged.Symbol), "ETH")) {
-					baseCur, _ := exchange.ParseSymbol(merged.Symbol)
-					cbSymbol := exchange.FormatSymbol(baseCur, "USD")
-					
-					// Generate slightly varying premium around 8.0% (e.g. 7.5% to 8.5%)
-					decayEnabled := os.Getenv("DECAY_PREMIUM") == "true"
-					var premiumRatio float64
-					if decayEnabled {
-						// Oscillate between 8% premium and -2% discount every 60 seconds
-						seconds := time.Now().Unix() % 60
-						if seconds < 30 {
-							// Narrowing from 8% to -2%
-							premiumRatio = 1.08 - (float64(seconds)/30.0)*0.10
-						} else {
-							// Widening back from -2% to 8%
-							premiumRatio = 0.98 + (float64(seconds-30)/30.0)*0.10
-						}
-					} else {
-						premiumRatio = 1.08 + (rand.Float64()-0.5)*0.01
-					}
-					cbBidUSD := merged.BidUSD / premiumRatio
-					cbAskUSD := merged.AskUSD / premiumRatio
-					
-					cbUpdate := exchange.PriceUpdate{
-						Exchange:       "COINBASE",
-						Symbol:         cbSymbol,
-						QuoteCurrency:  "USD",
-						RawBid:         cbBidUSD,
-						RawAsk:         cbAskUSD,
-						BidUSD:         cbBidUSD,
-						AskUSD:         cbAskUSD,
-						FXRate:         1.0,
-						FXCurrencyPair: "USD/USD",
-					}
-					
-					cbCacheKey := "COINBASE|" + string(cbSymbol)
-					
-					// Store and publish mock Coinbase update
-					priceCache.Store(cbCacheKey, &cbUpdate)
-					redisClient.PublishTicker(ctx, cbUpdate)
-					
-					if err := influxClient.WritePriceUpdate(ctx, cbUpdate); err != nil {
-						// Don't spam logs if InfluxDB write has warnings or minor errors
-					}
-				}
-			}
 		}
 	}()
 
-	// 6. FX Rate Monitor Daemon
+	// 6. FX Rate Monitor Daemon (Supports Fixer API or unauthenticated public FX fallback)
 	fxAPIKey := os.Getenv("FIXER_API_KEY")
 	fxPollStr := os.Getenv("FX_POLL_INTERVAL")
 	fxPollInterval, err := time.ParseDuration(fxPollStr)
 	if err != nil || fxPollInterval == 0 {
-		fxPollInterval = 1 * time.Hour 
+		fxPollInterval = 30 * time.Minute
 	}
 	isFreeTier := true
 	if os.Getenv("FIXER_FREE_TIER") == "false" || os.Getenv("FIXER_FREE_TIER") == "0" {
 		isFreeTier = false
 	}
 
-	if fxAPIKey != "" {
-		fxClient := fx.NewFixerClient(fxAPIKey, isFreeTier)
-		go func() {
-			ticker := time.NewTicker(fxPollInterval)
-			defer ticker.Stop()
-			fetchFX(ctx, fxClient, redisClient, influxClient)
-			for {
-				select {
-				case <-ctx.Done():
+	go func() {
+		ticker := time.NewTicker(fxPollInterval)
+		defer ticker.Stop()
+
+		syncFX := func() {
+			if fxAPIKey != "" {
+				fxClient := fx.NewFixerClient(fxAPIKey, isFreeTier)
+				if rate := fetchFX(ctx, fxClient, redisClient, influxClient); rate > 0 {
+					setKRWRate(rate)
 					return
-				case <-ticker.C:
-					fetchFX(ctx, fxClient, redisClient, influxClient)
 				}
 			}
-		}()
-	}
+			if rate := fetchPublicUSDKRW(ctx, redisClient, influxClient); rate > 0 {
+				setKRWRate(rate)
+			}
+		}
+
+		syncFX()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				syncFX()
+			}
+		}
+	}()
 
 	// 7. High-Speed Background Ranker Daemon
 	go func() {
@@ -364,11 +361,11 @@ func main() {
 	log.Println("\n[SHUTDOWN] Shutting down Feed Handler...")
 }
 
-func fetchFX(ctx context.Context, fxClient fx.FXFetcher, rClient *redis.PubSubClient, iClient *influx.Client) {
+func fetchFX(ctx context.Context, fxClient fx.FXFetcher, rClient *redis.PubSubClient, iClient *influx.Client) float64 {
 	rates, err := fxClient.FetchRates(ctx, []exchange.Currency{"KRW"})
 	if err != nil {
 		log.Printf("[FXFetcher] Error fetching FX rates: %v", err)
-		return
+		return 0
 	}
 
 	krwRate, ok := rates["KRW"]
@@ -385,7 +382,46 @@ func fetchFX(ctx context.Context, fxClient fx.FXFetcher, rClient *redis.PubSubCl
 
 		iClient.WritePriceUpdate(ctx, update)
 		rClient.PublishFXRate(ctx, "USD", "KRW", krwRate)
+		return krwRate
 	}
+	return 0
+}
+
+func fetchPublicUSDKRW(ctx context.Context, rClient *redis.PubSubClient, iClient *influx.Client) float64 {
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://open.er-api.com/v6/latest/USD", nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0
+	}
+	var parsed struct {
+		Rates map[string]float64 `json:"rates"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return 0
+	}
+	krwRate := parsed.Rates["KRW"]
+	if krwRate > 500 {
+		log.Printf("[FXFetcher] Synced Public USD/KRW Exchange Rate: 1 USD = %.2f KRW", krwRate)
+		update := exchange.PriceUpdate{
+			Exchange:       "PUBLIC_FX",
+			Symbol:         "USD-KRW",
+			QuoteCurrency:  "KRW",
+			FXRate:         krwRate,
+			FXCurrencyPair: "USD/KRW",
+		}
+		iClient.WritePriceUpdate(ctx, update)
+		rClient.PublishFXRate(ctx, "USD", "KRW", krwRate)
+		return krwRate
+	}
+	return 0
 }
 
 // startRESTPseudoWebsocketFallback acts as a shim pushing REST responses continuously as if they were WS streams
