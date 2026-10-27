@@ -66,6 +66,9 @@ type Engine struct {
 	// Mutex to serialize position evaluations and opportunity processing
 	mu sync.Mutex
 
+	// Live unrealized PnL USD cache per "Exchange|Symbol" updated by RunPositionMonitor
+	liveUnrealizedPnLs map[string]float64
+
 	// Error logging throttle
 	lastErrorLogTime   map[string]time.Time
 	lastErrorLogTimeMu sync.Mutex
@@ -136,16 +139,17 @@ func NewEngine(
 	}
 
 	e := &Engine{
-		nodeID:           nodeID,
-		userID:           userID,
-		db:               db,
-		config:           cfg,
-		posManager:       pm,
-		executor:         execution.NewExecutor(cfg.RetryOnFailure),
-		clients:          clients,
-		redisClient:      rClient,
-		walletProxy:      walletProxy,
-		lastErrorLogTime: make(map[string]time.Time),
+		nodeID:             nodeID,
+		userID:             userID,
+		db:                 db,
+		config:             cfg,
+		posManager:         pm,
+		executor:           execution.NewExecutor(cfg.RetryOnFailure),
+		clients:            clients,
+		redisClient:        rClient,
+		walletProxy:        walletProxy,
+		liveUnrealizedPnLs: make(map[string]float64),
+		lastErrorLogTime:   make(map[string]time.Time),
 	}
 	e.strategies = strats
 
@@ -442,6 +446,15 @@ func (e *Engine) evaluateAllOpenPositions(
 
 		res := e.posManager.CheckExit(ctx, memPos, baseQuote, foreignQuote)
 
+		// Compute and cache real-time unrealized PnL (USD) for AI observation feedback
+		currentROI := calculateCurrentROI(memPos, baseQuote, foreignQuote)
+		livePnLUSD := currentROI * pos.InvestmentUSD
+		if e.liveUnrealizedPnLs == nil {
+			e.liveUnrealizedPnLs = make(map[string]float64)
+		}
+		e.liveUnrealizedPnLs[pos.BaseExchange+"|"+pos.BaseSymbol] = livePnLUSD
+		e.liveUnrealizedPnLs[pos.ForeignExchange+"|"+pos.ForeignSymbol] = livePnLUSD
+
 		// Update trailing peak ROI back to DB if it climbed higher
 		if memPos.MaxUnrealizedROI > pos.MaxUnrealizedROI {
 			_ = e.db.UpdatePositionMaxROI(pos.PositionID, memPos.MaxUnrealizedROI)
@@ -730,13 +743,20 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 			e.mu.Lock()
 
-			// 2. Renormalize Target Weights
+			// 2. Clamp individual weights and only renormalize (scale down) when totalWeight > 1.0
+			// so a single partial recommendation (e.g. 0.20) is never forced into a 100% full-in allocation.
+			const maxSinglePairWeight = 0.50
 			totalWeight := 0.0
-			for _, opp := range filteredOps {
-				totalWeight += opp.TargetWeight
+			for i := range filteredOps {
+				if filteredOps[i].TargetWeight < 0 {
+					filteredOps[i].TargetWeight = 0
+				} else if filteredOps[i].TargetWeight > maxSinglePairWeight {
+					filteredOps[i].TargetWeight = maxSinglePairWeight
+				}
+				totalWeight += filteredOps[i].TargetWeight
 			}
 
-			if totalWeight > 0 {
+			if totalWeight > 1.0 {
 				for i := range filteredOps {
 					filteredOps[i].TargetWeight = filteredOps[i].TargetWeight / totalWeight
 				}
@@ -748,12 +768,20 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 			for _, opp := range filteredOps {
 				targetDollarVolume := e.config.CapitalLimitUsd * opp.TargetWeight
 
-				// Find current exposure
+				// Find current exposure (matching either canonical direction or reverse direction)
 				var matchingPos *postgres.ActivePosition
 				currentExposure := 0.0
 				for i, pos := range activePos {
-					if pos.BaseExchange == opp.BaseExchange && pos.ForeignExchange == opp.ForeignExchange &&
-						pos.BaseSymbol == opp.BaseSymbol && pos.Status != "CLOSED" {
+					if pos.Status == "CLOSED" {
+						continue
+					}
+					isCanonicalMatch := pos.BaseExchange == opp.BaseExchange &&
+						pos.ForeignExchange == opp.ForeignExchange &&
+						pos.BaseSymbol == opp.BaseSymbol
+					isReverseMatch := pos.BaseExchange == opp.ForeignExchange &&
+						pos.ForeignExchange == opp.BaseExchange &&
+						pos.BaseSymbol == opp.ForeignSymbol
+					if isCanonicalMatch || isReverseMatch {
 						currentExposure += pos.InvestmentUSD
 						matchingPos = &activePos[i]
 						break
@@ -785,6 +813,9 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
 								e.notifyPositionClosed(ctx, matchingPos.PositionID)
 							} else {
+								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
+								}
 								e.sendNotification(ctx, notification.AlertSystemError, fmt.Sprintf(
 									"⚠️ **AI REPAY Error: Failed to execute Exit Trades for Position %s**\n- **Error**: %v",
 									matchingPos.PositionID, err,
@@ -799,19 +830,48 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 					continue
 				}
 
-				// --- ActionType = 1 (TRANSFER / 전송) ---
+				// --- ActionType = 1 (TRANSFER / 전송 및 상환) ---
 				if opp.ActionType == 1 {
 					if matchingPos != nil && matchingPos.Status == "OPEN" {
-						log.Printf("🔄 [AI TRANSFER TRIGGERED] User %d %s, transferring assets", e.userID, opp.BaseSymbol)
-						e.db.UpdatePositionStatus(matchingPos.PositionID, "TRANSFERRING")
-						e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
-							`{"action":"POSITION_TRANSFERRING", "position_id":"%s"}`, matchingPos.PositionID,
-						)))
-						e.publishAccountState(ctx)
-						e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
-							"📦 **Coin Transfer Started (AI Triggered)**\n- **ID**: `%s`\n- **From**: `%s` to `%s`\n- **Symbol**: `%s`",
-							matchingPos.PositionID, matchingPos.ForeignExchange, matchingPos.BaseExchange, matchingPos.BaseSymbol,
-						))
+						// For pure futures strategies (D/E), on-chain transfer does not apply; treat ActionType=1 as Hold.
+						if matchingPos.Type == string(StrategyFutureSpot) || matchingPos.Type == string(StrategyFutureFuture) {
+							continue
+						}
+
+						posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+						var transferStrat *ForeignTransferStrategy
+						for _, s := range e.strategies {
+							if ft, ok := s.(*ForeignTransferStrategy); ok {
+								transferStrat = ft
+								break
+							}
+						}
+
+						if posPair != nil && posPair.IsValidForTransfer && transferStrat != nil {
+							log.Printf("🔄 [AI TRANSFER TRIGGERED] User %d %s, executing on-chain transfer and auto-repay for %s",
+								e.userID, matchingPos.BaseSymbol, matchingPos.PositionID)
+							_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "TRANSFERRING")
+							e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+								`{"action":"POSITION_TRANSFERRING", "position_id":"%s"}`, matchingPos.PositionID,
+							)))
+							e.publishAccountState(ctx)
+							e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
+								"📦 **Coin Transfer Started (AI Triggered)**\n- **ID**: `%s`\n- **From**: `%s` to `%s`\n- **Symbol**: `%s`",
+								matchingPos.PositionID, matchingPos.ForeignExchange, matchingPos.BaseExchange, matchingPos.BaseSymbol,
+							))
+
+							if err := transferStrat.ExecuteTransferAndRepay(ctx, e.executor, *posPair, *matchingPos, e.walletProxy); err == nil {
+								_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+								e.notifyPositionClosed(ctx, matchingPos.PositionID)
+							} else {
+								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "AWAITING_REPAY")
+								} else {
+									_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "OPEN")
+								}
+								log.Printf("❌ [AI TRANSFER ERROR] Failed transfer-and-repay for %s: %v", matchingPos.PositionID, err)
+							}
+						}
 					} else {
 						if logDetails {
 							log.Printf("[PaperEngine] AI suggested TRANSFER for %s but no matching open position was found.", opp.BaseSymbol)
@@ -827,10 +887,14 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 				entryBaseEx := opp.BaseExchange
 				entryForeignEx := opp.ForeignExchange
 				entryBaseSym := opp.BaseSymbol
+				entrySpread := opp.PremiumPct
+				entryPredictedSpread := opp.PredictedPremiumPct
 				if opp.ActionScore > 5.0 {
 					entryBaseEx = opp.ForeignExchange
 					entryForeignEx = opp.BaseExchange
 					entryBaseSym = opp.ForeignSymbol
+					entrySpread = -opp.PremiumPct
+					entryPredictedSpread = -opp.PredictedPremiumPct
 				}
 
 				delta := targetDollarVolume - currentExposure
@@ -844,7 +908,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 					if matchingPos == nil {
 						if targetPair != nil {
-							// Dynamic Strategy Router
+							// Dynamic Strategy Router: compare expected Net ROI across eligible strategies (A ~ E)
 							var selectedStrategy StrategyType = StrategyMarginSpot
 							isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
 							isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
@@ -853,8 +917,11 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							} else if isBaseFuture {
 								selectedStrategy = StrategyFutureSpot
 							} else {
-								// Base is Spot (Margin)
-								if targetPair.IsValidForTransfer {
+								// Base is Spot (Margin): compare convergence ROI (A/B) vs instant transfer ROI (C)
+								reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
+								transferNetROI := entrySpread - 0.0022
+
+								if targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
 									selectedStrategy = StrategyForeignTransfer
 								} else if isForeignFuture {
 									selectedStrategy = StrategyMarginFuture
@@ -867,8 +934,8 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							if targetStrategy != nil {
 								eval := targetStrategy.GetLastEvaluation()
 								eval.Type = selectedStrategy
-								eval.EntryPremium = opp.PremiumPct
-								eval.BasisReturn = opp.PremiumPct - opp.PredictedPremiumPct
+								eval.EntryPremium = entrySpread
+								eval.BasisReturn = entrySpread - entryPredictedSpread
 								eval.InvestmentUSD = targetDollarVolume
 								eval.HedgeMarket = "SPOT"
 								if isForeignFuture {
@@ -1078,6 +1145,7 @@ type AIAccountState struct {
 	AvailableBalance float64            `json:"available_balance"`
 	CurrentExposures map[string]float64 `json:"current_exposures"`
 	UnrealizedPnLs   map[string]float64 `json:"unrealized_pnls"`
+	PairStates       map[string]int     `json:"pair_states"`
 	State            int                `json:"state"`
 }
 
@@ -1090,36 +1158,57 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 
 	exposures := make(map[string]float64)
 	pnls := make(map[string]float64)
-	state := 0 // 0: Neutral, 1: Holding, 2: Transferring, 3: Repaying
+	pairStates := make(map[string]int)
+	state := 0 // Global fallback: 0: Neutral, 1: Holding, 2: Transferring, 3: Repaying
 
-	if len(positions) > 0 {
-		state = 1
-	}
-
+	totalInvestedUSD := 0.0
 	for _, pos := range positions {
+		if pos.Status == "CLOSED" {
+			continue
+		}
+		totalInvestedUSD += pos.InvestmentUSD
+
 		key := pos.BaseExchange + "|" + pos.BaseSymbol
+		reverseKey := pos.ForeignExchange + "|" + pos.ForeignSymbol
+
 		normExposure := 0.0
 		if e.config.CapitalLimitUsd > 0 {
 			normExposure = math.Min(1.0, pos.InvestmentUSD/e.config.CapitalLimitUsd)
 		}
-		// Strategies A~E short BaseExchange and long ForeignExchange (-normExposure in ArbitrageEnv convention)
+		// Strategies A~E short BaseExchange (-normExposure) and long ForeignExchange (+normExposure)
 		exposures[key] = -normExposure
-		pnls[key] = pos.MaxUnrealizedROI * pos.InvestmentUSD
+		exposures[reverseKey] = normExposure
 
+		posPnL := pos.MaxUnrealizedROI * pos.InvestmentUSD
+		if e.liveUnrealizedPnLs != nil {
+			if liveVal, ok := e.liveUnrealizedPnLs[key]; ok {
+				posPnL = liveVal
+			}
+		}
+		pnls[key] = posPnL
+		pnls[reverseKey] = posPnL
+
+		posState := 1
 		if pos.Status == "TRANSFERRING" {
-			state = 2
+			posState = 2
 		} else if pos.Status == "REPAYING" || pos.Status == "AWAITING_REPAY" {
-			state = 3
+			posState = 3
+		}
+		pairStates[key] = posState
+		pairStates[reverseKey] = posState
+		if posState > state {
+			state = posState
 		}
 	}
 
-	balance := e.config.CapitalLimitUsd
+	balance := math.Max(0.0, e.config.CapitalLimitUsd-totalInvestedUSD)
 
 	payload, err := json.Marshal(AIAccountState{
 		UserID:           e.userID,
 		AvailableBalance: balance,
 		CurrentExposures: exposures,
 		UnrealizedPnLs:   pnls,
+		PairStates:       pairStates,
 		State:            state,
 	})
 	if err == nil {
