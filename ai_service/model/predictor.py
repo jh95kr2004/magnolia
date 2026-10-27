@@ -51,16 +51,30 @@ class PremiumForecaster(nn.Module):
 
     def forward(self, x):
         # x: [batch, seq_len, input_size]
-        out, _ = self.gru(x)
+        # 1. RevIN-style local 24h window centering to eliminate non-stationary macro level drift
+        window_mean = x.mean(dim=1, keepdim=True)
+        x_local = x - window_mean
 
-        # Attention context
+        out, _ = self.gru(x_local)
+
+        # Attention context over locally centered trajectory
         context, _ = self.attention(out)  # context: [batch, hidden_size]
 
-        # Fully connected output
+        # Fully connected residual delta output
         flat_pred = self.fc_out(context)  # [batch, pred_len * output_size]
+        delta_predictions = flat_pred.view(-1, self.pred_len, self.output_size)
 
-        # Reshape to [batch, pred_len, output_size]
-        predictions = flat_pred.view(-1, self.pred_len, self.output_size)
+        # 2. Anchor at current origin x_t and apply damped Ornstein-Uhlenbeck mean reversion + learned residual delta
+        origin_anchor = x[:, -1:, [0, 4, 5]]
+        target_window_mean = window_mean[:, :, [0, 4, 5]]
+        local_deviation = target_window_mean - origin_anchor  # >0 when spread is below 24h mean, <0 when above
+
+        t_grid = torch.linspace(1.0 / self.pred_len, 1.0, self.pred_len, device=x.device).view(1, self.pred_len, 1)
+        # Exponential OU reversion factor (1 - exp(-lambda * t/T)) + bounded neural trajectory refinement
+        ou_reversion = (1.0 - torch.exp(-0.35 * t_grid)) * local_deviation
+        neural_residual = 0.25 * torch.tanh(delta_predictions) * torch.sqrt(t_grid)
+
+        predictions = origin_anchor + ou_reversion + neural_residual
         return predictions
 
 
@@ -133,9 +147,10 @@ def predict_reversion(historical_df: pd.DataFrame, pred_len=480, device="cpu") -
     try:
         raw_data = historical_df[features].values
 
-        # Downscale asset prices and clamp standardized values to [-5.0, 5.0] so out-of-distribution
-        # coin price regimes (e.g., ETH/XRP or higher BTC prices) never explode GRU hidden states.
-        scaled_x = np.clip(feature_scaler.transform(raw_data), -5.0, 5.0)
+        # Downscale asset prices and clamp non-stationary level features [1, 2, 3] to [-3.0, 3.0]
+        # while keeping spread & funding [0, 4, 5] exact for residual anchoring.
+        scaled_x = feature_scaler.transform(raw_data)
+        scaled_x[:, [1, 2, 3]] = np.clip(scaled_x[:, [1, 2, 3]], -3.0, 3.0)
 
         # Create a batched tensor shape constraint validating properly (batch_size=1, seq_len=len(df), input_size=6)
         input_tensor = torch.tensor(np.array([scaled_x], dtype=np.float32), dtype=torch.float32).to(device)
@@ -203,7 +218,8 @@ def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=1440, devic
     features = ["exchange_premium_spread", "local_price", "foreign_price", "fx_rate", "base_funding_rate", "foreign_funding_rate"]
     targets = ["exchange_premium_spread", "base_funding_rate", "foreign_funding_rate"]
 
-    scaled_x = np.clip(feature_scaler.transform(df[features].values), -5.0, 5.0)
+    scaled_x = feature_scaler.transform(df[features].values)
+    scaled_x[:, [1, 2, 3]] = np.clip(scaled_x[:, [1, 2, 3]], -3.0, 3.0)
     dummy_y = np.zeros((len(df), len(targets))) # Bypassed internally during inference
     
     dataset = CryptoArbitrageDataset(scaled_x, dummy_y, seq_len, loaded_pred_len)

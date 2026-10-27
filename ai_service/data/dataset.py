@@ -90,6 +90,11 @@ def create_dataloaders(
     val_x_scaled = feature_scaler.transform(val_df[features].values)
     val_y_scaled = target_scaler.transform(val_df[targets].values)
 
+    # Clamp non-stationary price/FX level features [1, 2, 3] to prevent OOD hidden-state drift
+    # while keeping target-aligned features [0, 4, 5] exact for residual anchoring.
+    train_x_scaled[:, [1, 2, 3]] = np.clip(train_x_scaled[:, [1, 2, 3]], -3.0, 3.0)
+    val_x_scaled[:, [1, 2, 3]] = np.clip(val_x_scaled[:, [1, 2, 3]], -3.0, 3.0)
+
     # 4. Instantiate Custom Datasets bypassing original pandas raw ingestion
     train_dataset = CryptoArbitrageDataset(train_x_scaled, train_y_scaled, seq_len, pred_len)
     val_dataset = CryptoArbitrageDataset(val_x_scaled, val_y_scaled, seq_len, pred_len)

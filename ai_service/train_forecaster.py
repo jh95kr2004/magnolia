@@ -162,5 +162,11 @@ def train_forecaster(
 
 
 if __name__ == "__main__":
-    # Example execution entrypoint enforcing rigorous early stopping evaluation thresholds
-    train_forecaster("data/historical_dump.csv", epochs=50)
+    import argparse
+    parser = argparse.ArgumentParser(description="Train PremiumForecaster (8h Horizon)")
+    parser.add_argument("--data", type=str, default="data/historical_dump.csv")
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    args = parser.parse_args()
+    train_forecaster(args.data, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
