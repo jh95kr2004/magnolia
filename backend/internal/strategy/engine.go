@@ -107,6 +107,14 @@ func NewEngine(
 			RebalanceMaxPremium:    0.0,
 		}
 	} else {
+		triggerSkew := threshold.RebalanceTriggerSkew
+		if triggerSkew <= 0 {
+			triggerSkew = 0.20
+		}
+		targetSkew := threshold.RebalanceTargetSkew
+		if targetSkew <= 0 {
+			targetSkew = 0.50
+		}
 		cfg = Config{
 			MinTargetProfit:        threshold.MinTargetProfit,
 			MaxStopLoss:            threshold.MaxStopLoss,
@@ -116,9 +124,9 @@ func NewEngine(
 			RiskMultiplier:         threshold.RiskMultiplier,
 			RetryOnFailure:         threshold.RetryOnFailure,
 			DynamicSwitchThreshold: 0.001,
-			RebalanceTriggerSkew:   0.20,
-			RebalanceTargetSkew:    0.50,
-			RebalanceMaxPremium:    0.0,
+			RebalanceTriggerSkew:   triggerSkew,
+			RebalanceTargetSkew:    targetSkew,
+			RebalanceMaxPremium:    threshold.RebalanceMaxPremium,
 		}
 	}
 
@@ -367,8 +375,10 @@ func (e *Engine) ExecuteStrategy(
 func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange.PriceUpdate) {
 	log.Printf("[Node-%s] Starting Dual-Trigger Position Monitor...", e.nodeID)
 
-	// Start per-user web lending session watchdogs bound to this user's context
+	// Start per-user web lending session watchdogs and manual command bus listener bound to this user's context
 	e.StartWebLendingWatchdogs(ctx)
+	go e.ListenUserCommands(ctx)
+	e.publishAccountState(ctx)
 
 	// Cache to hold the latest seen prices per symbol, since positions need both Base and Foreign
 	// quotes
@@ -1025,15 +1035,18 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 
 			// 4. Publish Filtered Opportunities back to user's dashboard Tab
 			type FilteredOppDTO struct {
-				BaseExchange    string  `json:"base_exchange"`
-				ForeignExchange string  `json:"foreign_exchange"`
-				BaseSymbol      string  `json:"base_symbol"`
-				ForeignSymbol   string  `json:"foreign_symbol"`
-				Strategy        string  `json:"strategy"`
-				ExpectedRoi     float64 `json:"expected_roi"`
-				RiskScore       float64 `json:"risk_score"`
-				InvestmentUsd   float64 `json:"investment_usd"`
-				IsValid         bool    `json:"is_valid"`
+				BaseExchange        string  `json:"base_exchange"`
+				ForeignExchange     string  `json:"foreign_exchange"`
+				BaseSymbol          string  `json:"base_symbol"`
+				ForeignSymbol       string  `json:"foreign_symbol"`
+				Strategy            string  `json:"strategy"`
+				ExpectedRoi         float64 `json:"expected_roi"`
+				CurrentPremiumPct   float64 `json:"current_premium_pct"`
+				PredictedPremiumPct float64 `json:"predicted_premium_pct"`
+				TargetWeight        float64 `json:"target_weight"`
+				RiskScore           float64 `json:"risk_score"`
+				InvestmentUsd       float64 `json:"investment_usd"`
+				IsValid             bool    `json:"is_valid"`
 			}
 
 			var dtoList []FilteredOppDTO
@@ -1047,29 +1060,35 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						// Strategy E: Future-Future
 						roi := opp.PremiumPct - opp.PredictedPremiumPct
 						dtoList = append(dtoList, FilteredOppDTO{
-							BaseExchange:    opp.BaseExchange,
-							ForeignExchange: opp.ForeignExchange,
-							BaseSymbol:      opp.BaseSymbol,
-							ForeignSymbol:   opp.ForeignSymbol,
-							Strategy:        "Future-Future (E)",
-							ExpectedRoi:     roi - 0.0005, // minus estimated trading fee rate (0.05%)
-							RiskScore:       15.0,         // low risk, no transfer time exposure
-							InvestmentUsd:   e.config.CapitalLimitUsd * opp.TargetWeight,
-							IsValid:         true,
+							BaseExchange:        opp.BaseExchange,
+							ForeignExchange:     opp.ForeignExchange,
+							BaseSymbol:          opp.BaseSymbol,
+							ForeignSymbol:       opp.ForeignSymbol,
+							Strategy:            "Future-Future (E)",
+							ExpectedRoi:         roi - 0.0005, // minus estimated trading fee rate (0.05%)
+							CurrentPremiumPct:   opp.PremiumPct * 100.0,
+							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+							TargetWeight:        opp.TargetWeight,
+							RiskScore:           15.0,         // low risk, no transfer time exposure
+							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+							IsValid:             true,
 						})
 					} else if isBaseFuture {
 						// Strategy D: Future-Spot
 						roi := opp.PremiumPct - opp.PredictedPremiumPct
 						dtoList = append(dtoList, FilteredOppDTO{
-							BaseExchange:    opp.BaseExchange,
-							ForeignExchange: opp.ForeignExchange,
-							BaseSymbol:      opp.BaseSymbol,
-							ForeignSymbol:   opp.ForeignSymbol,
-							Strategy:        "Future-Spot (D)",
-							ExpectedRoi:     roi - 0.0006, // minus estimated fee rate (0.06%)
-							RiskScore:       18.0,
-							InvestmentUsd:   e.config.CapitalLimitUsd * opp.TargetWeight,
-							IsValid:         true,
+							BaseExchange:        opp.BaseExchange,
+							ForeignExchange:     opp.ForeignExchange,
+							BaseSymbol:          opp.BaseSymbol,
+							ForeignSymbol:       opp.ForeignSymbol,
+							Strategy:            "Future-Spot (D)",
+							ExpectedRoi:         roi - 0.0006, // minus estimated fee rate (0.06%)
+							CurrentPremiumPct:   opp.PremiumPct * 100.0,
+							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+							TargetWeight:        opp.TargetWeight,
+							RiskScore:           18.0,
+							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+							IsValid:             true,
 						})
 					} else {
 						// Base is Spot (Margin) - requires margin support on base exchange
@@ -1081,20 +1100,23 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								strategyHoldingName = "Margin-Future (B)"
 							}
 							dtoList = append(dtoList, FilteredOppDTO{
-								BaseExchange:    opp.BaseExchange,
-								ForeignExchange: opp.ForeignExchange,
-								BaseSymbol:      opp.BaseSymbol,
-								ForeignSymbol:   opp.ForeignSymbol,
-								Strategy:        strategyHoldingName,
-								ExpectedRoi:     roiHolding - 0.0013, // accounting for spot trading fees + estimated borrow interest over hold (0.13%)
-								RiskScore:       18.0,                // lower risk, no block confirmation delay
-								InvestmentUsd:   e.config.CapitalLimitUsd * opp.TargetWeight,
-								IsValid:         true,
+								BaseExchange:        opp.BaseExchange,
+								ForeignExchange:     opp.ForeignExchange,
+								BaseSymbol:          opp.BaseSymbol,
+								ForeignSymbol:       opp.ForeignSymbol,
+								Strategy:            strategyHoldingName,
+								ExpectedRoi:         roiHolding - 0.0013, // accounting for spot trading fees + estimated borrow interest over hold (0.13%)
+								CurrentPremiumPct:   opp.PremiumPct * 100.0,
+								PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+								TargetWeight:        opp.TargetWeight,
+								RiskScore:           18.0,                // lower risk, no block confirmation delay
+								InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+								IsValid:             true,
 							})
 
 							// 2. Transfer Loop Strategy: Transfer Loop (C)
 							if targetPair.IsValidForTransfer {
-								roiTransfer := opp.PremiumPct - opp.PredictedPremiumPct
+								roiTransfer := opp.PremiumPct
 								
 								// Compute realistic risk based on block confirmation time and congestion
 								networkRisk := 20.0 // Default baseline for fast confirmation chains (ETH, etc.)
@@ -1114,15 +1136,18 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								totalRisk := networkRisk + 15.0 // network risk + capital utilization margin liquidation risk
 
 								dtoList = append(dtoList, FilteredOppDTO{
-									BaseExchange:    opp.BaseExchange,
-									ForeignExchange: opp.ForeignExchange,
-									BaseSymbol:      opp.BaseSymbol,
-									ForeignSymbol:   opp.ForeignSymbol,
-									Strategy:        "Transfer Loop (C)",
-									ExpectedRoi:     roiTransfer - 0.0022, // accounting for trading fees + network gas/withdrawal fees (0.22%)
-									RiskScore:       totalRisk,
-									InvestmentUsd:   e.config.CapitalLimitUsd * opp.TargetWeight,
-									IsValid:         true,
+									BaseExchange:        opp.BaseExchange,
+									ForeignExchange:     opp.ForeignExchange,
+									BaseSymbol:          opp.BaseSymbol,
+									ForeignSymbol:       opp.ForeignSymbol,
+									Strategy:            "Transfer Loop (C)",
+									ExpectedRoi:         roiTransfer - 0.0022, // accounting for trading fees + network gas/withdrawal fees (0.22%)
+									CurrentPremiumPct:   opp.PremiumPct * 100.0,
+									PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+									TargetWeight:        opp.TargetWeight,
+									RiskScore:           totalRisk,
+									InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+									IsValid:             true,
 								})
 							}
 						}
@@ -1139,14 +1164,146 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 	}
 }
 
-// AIAccountState maps the user's balance and positions for python DRL observation feed
+// ExchangeBalanceSnapshot represents the real-time balance and skew share of a single connected exchange.
+type ExchangeBalanceSnapshot struct {
+	Name            string  `json:"name"`
+	QuoteCurrency   string  `json:"quote_currency"`
+	AvailableNative float64 `json:"available_native"`
+	AvailableUSD    float64 `json:"available_usd"`
+	Percent         float64 `json:"percent"`
+	WebLendingOK    bool    `json:"web_lending_ok"`
+}
+
+// UserCommand represents a manual action sent from the frontend via the Node API server over Redis.
+type UserCommand struct {
+	Action          string  `json:"action"` // "FORCE_ENTER" | "FORCE_CLOSE"
+	PositionID      string  `json:"position_id,omitempty"`
+	BaseExchange    string  `json:"base_exchange,omitempty"`
+	ForeignExchange string  `json:"foreign_exchange,omitempty"`
+	BaseSymbol      string  `json:"base_symbol,omitempty"`
+	ForeignSymbol   string  `json:"foreign_symbol,omitempty"`
+	Strategy        string  `json:"strategy,omitempty"`
+	ExpectedRoi     float64 `json:"expected_roi,omitempty"`
+	InvestmentUsd   float64 `json:"investment_usd,omitempty"`
+}
+
+// ListenUserCommands subscribes to user:{id}:cmd so manual UI commands ("Force Enter", "Force Close")
+// execute real exchange orders and loan repayments directly inside the user's Engine goroutine.
+func (e *Engine) ListenUserCommands(ctx context.Context) {
+	if e.redisClient == nil {
+		return
+	}
+	cmdCh := make(chan []byte, 16)
+	go e.redisClient.SubscribeUserCommands(ctx, fmt.Sprint(e.userID), cmdCh)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rawCmd := <-cmdCh:
+			var cmd UserCommand
+			if err := json.Unmarshal(rawCmd, &cmd); err != nil {
+				log.Printf("[Engine-%d] Invalid user command payload: %v", e.userID, err)
+				continue
+			}
+
+			e.mu.Lock()
+			switch cmd.Action {
+			case "FORCE_CLOSE":
+				positions, _ := e.db.GetActivePositionsByUser(e.userID)
+				for _, pos := range positions {
+					if pos.PositionID == cmd.PositionID && pos.Status != "CLOSED" {
+						targetStrategy := e.findStrategy(StrategyType(pos.Type))
+						targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
+						if targetStrategy != nil && targetPair != nil {
+							log.Printf("⚡ [Manual Force Close] User %d closing Position %s on %s/%s...",
+								e.userID, pos.PositionID, pos.BaseExchange, pos.ForeignExchange)
+							if err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy); err != nil {
+								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+									_ = e.db.UpdatePositionStatus(pos.PositionID, "AWAITING_REPAY")
+								}
+								log.Printf("❌ [Manual Force Close Error] %s: %v", pos.PositionID, err)
+								e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+									`{"action":"COMMAND_ERROR","message":"Failed to close position %s: %s"}`, pos.PositionID, err.Error(),
+								)))
+							} else {
+								_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+								e.notifyPositionClosed(ctx, pos.PositionID)
+							}
+						}
+						break
+					}
+				}
+
+			case "FORCE_ENTER":
+				targetPair := e.findPair(cmd.BaseExchange, cmd.ForeignExchange, cmd.BaseSymbol)
+				if targetPair == nil {
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(
+						`{"action":"COMMAND_ERROR","message":"Could not find matching exchange pair for manual entry."}`,
+					))
+					break
+				}
+
+				selectedType := StrategyMarginSpot
+				stratLabel := strings.ToUpper(cmd.Strategy)
+				switch {
+				case strings.Contains(stratLabel, "TRANSFER") || strings.Contains(stratLabel, "(C)"):
+					selectedType = StrategyForeignTransfer
+				case strings.Contains(stratLabel, "MARGIN-FUTURE") || strings.Contains(stratLabel, "(B)"):
+					selectedType = StrategyMarginFuture
+				case strings.Contains(stratLabel, "FUTURE-SPOT") || strings.Contains(stratLabel, "(D)"):
+					selectedType = StrategyFutureSpot
+				case strings.Contains(stratLabel, "FUTURE-FUTURE") || strings.Contains(stratLabel, "(E)"):
+					selectedType = StrategyFutureFuture
+				default:
+					selectedType = StrategyMarginSpot
+				}
+
+				targetStrategy := e.findStrategy(selectedType)
+				if targetStrategy != nil {
+					investUSD := cmd.InvestmentUsd
+					if investUSD <= 0 {
+						investUSD = math.Min(1000.0, e.config.CapitalLimitUsd*0.20)
+					}
+					eval := targetStrategy.GetLastEvaluation()
+					eval.Type = selectedType
+					eval.EntryPremium = cmd.ExpectedRoi
+					eval.BasisReturn = cmd.ExpectedRoi
+					eval.InvestmentUSD = investUSD
+					eval.HedgeMarket = "SPOT"
+					if targetPair.ForeignMarketInfo.MarketType == "FUTURE" {
+						eval.HedgeMarket = "FUTURE"
+					}
+					targetStrategy.SetEvaluation(eval)
+					if _, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair); err != nil {
+						log.Printf("❌ [Manual Force Enter Error] %v", err)
+						e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+							`{"action":"COMMAND_ERROR","message":"Manual entry failed: %s"}`, err.Error(),
+						)))
+					}
+				}
+			}
+			e.publishAccountState(ctx)
+			e.mu.Unlock()
+		}
+	}
+}
+
+// AIAccountState maps the user's balance, exchange skew, web session status, and positions for python DRL & UI SSE
 type AIAccountState struct {
-	UserID           uint               `json:"user_id"`
-	AvailableBalance float64            `json:"available_balance"`
-	CurrentExposures map[string]float64 `json:"current_exposures"`
-	UnrealizedPnLs   map[string]float64 `json:"unrealized_pnls"`
-	PairStates       map[string]int     `json:"pair_states"`
-	State            int                `json:"state"`
+	UserID               uint                      `json:"user_id"`
+	AvailableBalance     float64                   `json:"available_balance"`
+	TotalEquityUSD       float64                   `json:"total_equity_usd"`
+	ExchangeBalances     []ExchangeBalanceSnapshot `json:"exchange_balances"`
+	ForeignShare         float64                   `json:"foreign_share"`
+	RebalanceTriggerSkew float64                   `json:"rebalance_trigger_skew"`
+	RebalanceTargetSkew  float64                   `json:"rebalance_target_skew"`
+	WebLendingSessions   map[string]bool           `json:"web_lending_sessions"`
+	PositionPnLs         map[string]float64        `json:"position_pnls"`
+	CurrentExposures     map[string]float64        `json:"current_exposures"`
+	UnrealizedPnLs       map[string]float64        `json:"unrealized_pnls"`
+	PairStates           map[string]int            `json:"pair_states"`
+	State                int                       `json:"state"`
 }
 
 func (e *Engine) publishAccountState(ctx context.Context) {
@@ -1158,10 +1315,12 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 
 	exposures := make(map[string]float64)
 	pnls := make(map[string]float64)
+	positionPnLs := make(map[string]float64)
 	pairStates := make(map[string]int)
 	state := 0 // Global fallback: 0: Neutral, 1: Holding, 2: Transferring, 3: Repaying
 
 	totalInvestedUSD := 0.0
+	totalUnrealizedPnLUSD := 0.0
 	for _, pos := range positions {
 		if pos.Status == "CLOSED" {
 			continue
@@ -1187,6 +1346,8 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		}
 		pnls[key] = posPnL
 		pnls[reverseKey] = posPnL
+		positionPnLs[pos.PositionID] = posPnL
+		totalUnrealizedPnLUSD += posPnL
 
 		posState := 1
 		if pos.Status == "TRANSFERRING" {
@@ -1201,17 +1362,84 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		}
 	}
 
+	// Query real-time fiat/quote balances across all connected exchanges (supports both live and PaperClient)
+	var exSnapshots []ExchangeBalanceSnapshot
+	webSessions := make(map[string]bool)
+	totalLiquidUSD := 0.0
+	foreignUSD := 0.0
+
+	for _, client := range e.clients {
+		exName := client.GetName()
+		lendingOK := client.SupportsMargin()
+		if wc, ok := client.(exchange.WebLendingCapable); ok && wc.LendingManager() != nil {
+			lendingOK = wc.LendingManager().IsSessionValid()
+			webSessions[exName] = lendingOK
+		}
+
+		bals, bErr := client.GetBalances(ctx)
+		var availNative, availUSD float64
+		quoteCur := "USD"
+		if exName == "UPBIT" || exName == "BITHUMB" {
+			quoteCur = "KRW"
+		}
+		if bErr == nil {
+			for _, b := range bals {
+				if string(b.Currency) == "KRW" {
+					quoteCur = "KRW"
+					availNative += b.Available
+					availUSD += b.Available / GetFXRate("KRW")
+				} else if string(b.Currency) == "USD" || string(b.Currency) == "USDT" || string(b.Currency) == "USDC" {
+					quoteCur = string(b.Currency)
+					availNative += b.Available
+					availUSD += b.Available
+				}
+			}
+		}
+		totalLiquidUSD += availUSD
+		if quoteCur != "KRW" {
+			foreignUSD += availUSD
+		}
+		exSnapshots = append(exSnapshots, ExchangeBalanceSnapshot{
+			Name:            exName,
+			QuoteCurrency:   quoteCur,
+			AvailableNative: availNative,
+			AvailableUSD:    availUSD,
+			WebLendingOK:    lendingOK,
+		})
+	}
+
+	if totalLiquidUSD > 0 {
+		for i := range exSnapshots {
+			exSnapshots[i].Percent = (exSnapshots[i].AvailableUSD / totalLiquidUSD) * 100.0
+		}
+	}
+	foreignShare := 0.50
+	if totalLiquidUSD > 0 {
+		foreignShare = foreignUSD / totalLiquidUSD
+	}
+
 	balance := math.Max(0.0, e.config.CapitalLimitUsd-totalInvestedUSD)
+	totalEquityUSD := totalLiquidUSD + totalInvestedUSD + totalUnrealizedPnLUSD
+	if totalEquityUSD <= 0 {
+		totalEquityUSD = balance + totalInvestedUSD + totalUnrealizedPnLUSD
+	}
 
 	payload, err := json.Marshal(AIAccountState{
-		UserID:           e.userID,
-		AvailableBalance: balance,
-		CurrentExposures: exposures,
-		UnrealizedPnLs:   pnls,
-		PairStates:       pairStates,
-		State:            state,
+		UserID:               e.userID,
+		AvailableBalance:     balance,
+		TotalEquityUSD:       totalEquityUSD,
+		ExchangeBalances:     exSnapshots,
+		ForeignShare:         foreignShare,
+		RebalanceTriggerSkew: e.config.RebalanceTriggerSkew,
+		RebalanceTargetSkew:  e.config.RebalanceTargetSkew,
+		WebLendingSessions:   webSessions,
+		PositionPnLs:         positionPnLs,
+		CurrentExposures:     exposures,
+		UnrealizedPnLs:       pnls,
+		PairStates:           pairStates,
+		State:                state,
 	})
-	if err == nil {
+	if err == nil && e.redisClient != nil {
 		e.redisClient.PublishUserState(ctx, fmt.Sprint(e.userID), payload)
 	}
 }
