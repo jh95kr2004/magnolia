@@ -151,6 +151,44 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 
 func (c *CoinbaseClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 	if c.apiName == "" || c.apiName == "public" || c.apiName == "dummy" {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://api.exchange.coinbase.com/products", nil)
+		if err == nil {
+			req.Header.Add("User-Agent", "magnolia-feed")
+			resp, doErr := c.httpClient.Do(req)
+			if doErr == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == 200 {
+					var pubProducts []struct {
+						ID             string `json:"id"`
+						BaseCurrency   string `json:"base_currency"`
+						QuoteCurrency  string `json:"quote_currency"`
+						Status         string `json:"status"`
+						TradingDisabled bool  `json:"trading_disabled"`
+					}
+					if json.NewDecoder(resp.Body).Decode(&pubProducts) == nil && len(pubProducts) > 0 {
+						var pubMarkets []MarketInfo
+						for _, p := range pubProducts {
+							quoteCur := toUnifiedCurrencyFromCoinbase(p.QuoteCurrency)
+							if quoteCur != "USD" && quoteCur != "USDC" && quoteCur != "USDT" {
+								continue
+							}
+							pubMarkets = append(pubMarkets, MarketInfo{
+								Symbol:            toUnifiedSymbolFromCoinbase(p.ID),
+								BaseCurrency:      toUnifiedCurrencyFromCoinbase(p.BaseCurrency),
+								QuoteCurrency:     quoteCur,
+								MarketType:        "SPOT",
+								IsTradingEnabled:  p.Status == "online" && !p.TradingDisabled,
+								IsDepositEnabled:  true,
+								IsWithdrawEnabled: true,
+							})
+						}
+						if len(pubMarkets) > 0 {
+							return pubMarkets, nil
+						}
+					}
+				}
+			}
+		}
 		return []MarketInfo{
 			{
 				Symbol:            "BTC-USD",
@@ -164,6 +202,24 @@ func (c *CoinbaseClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 			{
 				Symbol:            "ETH-USD",
 				BaseCurrency:      "ETH",
+				QuoteCurrency:     "USD",
+				MarketType:        "SPOT",
+				IsTradingEnabled:  true,
+				IsDepositEnabled:  true,
+				IsWithdrawEnabled: true,
+			},
+			{
+				Symbol:            "XRP-USD",
+				BaseCurrency:      "XRP",
+				QuoteCurrency:     "USD",
+				MarketType:        "SPOT",
+				IsTradingEnabled:  true,
+				IsDepositEnabled:  true,
+				IsWithdrawEnabled: true,
+			},
+			{
+				Symbol:            "SOL-USD",
+				BaseCurrency:      "SOL",
 				QuoteCurrency:     "USD",
 				MarketType:        "SPOT",
 				IsTradingEnabled:  true,
@@ -322,7 +378,8 @@ func (c *CoinbaseClient) GetTicker(ctx context.Context, symbol Symbol) (float64,
 }
 
 func (c *CoinbaseClient) GetFutureTicker(ctx context.Context, symbol Symbol) (float64, error) {
-	return 0, nil
+	// Query Coinbase public perpetual/spot ticker for USD-settled price
+	return c.GetTicker(ctx, symbol)
 }
 
 func (c *CoinbaseClient) GetBalances(ctx context.Context) ([]Balance, error) {
@@ -492,9 +549,84 @@ func (c *CoinbaseClient) CancelOrder(ctx context.Context, orderID string, symbol
 }
 
 func (c *CoinbaseClient) ConnectWS(ctx context.Context, symbols []Symbol, priceUpdateCh chan<- PriceUpdate) error {
-	if c.apiName == "" || c.apiName == "public" || c.apiName == "dummy" {
-		return fmt.Errorf("public websocket connection not supported without advanced trade API keys")
+	var productIDs []string
+	for _, sym := range symbols {
+		productIDs = append(productIDs, toCoinbaseSymbol(sym))
 	}
+	productIDsBytes, err := json.Marshal(productIDs)
+	if err != nil {
+		return err
+	}
+
+	// If no authenticated Advanced Trade API key is configured, connect to Coinbase Public Exchange WebSocket feed
+	if c.apiName == "" || c.apiName == "public" || c.apiName == "dummy" {
+		pubWSURL := "wss://ws-feed.exchange.coinbase.com"
+		conn, _, dialErr := websocket.DefaultDialer.Dial(pubWSURL, nil)
+		if dialErr != nil {
+			return dialErr
+		}
+		c.wsConn = conn
+
+		subMsg := fmt.Sprintf(`{"type":"subscribe","product_ids":%s,"channels":["ticker"]}`, string(productIDsBytes))
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
+			conn.Close()
+			return err
+		}
+
+		go func() {
+			defer conn.Close()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_, message, err := conn.ReadMessage()
+					if err != nil {
+						return
+					}
+					var pubTick struct {
+						Type      string `json:"type"`
+						ProductID string `json:"product_id"`
+						Price     string `json:"price"`
+						BestBid   string `json:"best_bid"`
+						BestAsk   string `json:"best_ask"`
+					}
+					if err := json.Unmarshal(message, &pubTick); err == nil && pubTick.Type == "ticker" && pubTick.ProductID != "" {
+						bid, _ := strconv.ParseFloat(pubTick.BestBid, 64)
+						ask, _ := strconv.ParseFloat(pubTick.BestAsk, 64)
+						lastPrice, _ := strconv.ParseFloat(pubTick.Price, 64)
+						if bid <= 0 {
+							bid = lastPrice
+						}
+						if ask <= 0 {
+							ask = lastPrice
+						}
+						if bid > 0 && ask > 0 {
+							unifiedSym := toUnifiedSymbolFromCoinbase(pubTick.ProductID)
+							_, quoteCur := ParseSymbol(unifiedSym)
+							priceUpdateCh <- PriceUpdate{
+								Exchange:       c.GetName(),
+								Symbol:         unifiedSym,
+								QuoteCurrency:  quoteCur,
+								RawBid:         bid,
+								RawAsk:         ask,
+								RawFutureBid:   bid,
+								RawFutureAsk:   ask,
+								BidUSD:         bid,
+								AskUSD:         ask,
+								BidFutureUSD:   bid,
+								AskFutureUSD:   ask,
+								FXRate:         1.0,
+								FXCurrencyPair: "USD/USD",
+							}
+						}
+					}
+				}
+			}
+		}()
+		return nil
+	}
+
 	conn, _, err := websocket.DefaultDialer.Dial(coinbaseWSURL, nil)
 	if err != nil {
 		return err
@@ -507,14 +639,6 @@ func (c *CoinbaseClient) ConnectWS(ctx context.Context, symbols []Symbol, priceU
 		return err
 	}
 
-	var productIDs []string
-	for _, sym := range symbols {
-		productIDs = append(productIDs, toCoinbaseSymbol(sym))
-	}
-	productIDsBytes, err := json.Marshal(productIDs)
-	if err != nil {
-		return err
-	}
 	subMsg := fmt.Sprintf(`{
 		"type": "subscribe",
 		"product_ids": %s,

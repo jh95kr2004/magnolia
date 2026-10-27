@@ -107,6 +107,21 @@ func (u *UpbitClient) signPayload(query string) (string, error) {
 }
 
 func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currency) ([]NetworkInfo, error) {
+	if u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy" {
+		net := currency
+		if net == "" {
+			net = "BTC"
+		}
+		return []NetworkInfo{
+			{
+				Network:          Network(net),
+				ExchangeNetID:    string(net),
+				IsDepositEnable:  true,
+				IsWithdrawEnable: true,
+			},
+		}, nil
+	}
+
 	token, err := u.signPayload("")
 	if err != nil {
 		return nil, err
@@ -154,18 +169,20 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 }
 
 func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
-	// First fetch the wallet statuses since we need deposit/withdraw availability
-	networks, err := u.GetSupportedNetworks(ctx, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch upbit wallet states: %w", err)
-	}
-
+	// Fetch wallet statuses if authenticated; otherwise fall back to public market list
 	walletMap := make(map[Network]NetworkInfo)
-	for _, net := range networks {
-		walletMap[net.Network] = net
+	isPublicFallback := u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy"
+	if !isPublicFallback {
+		if networks, err := u.GetSupportedNetworks(ctx, ""); err == nil {
+			for _, net := range networks {
+				walletMap[net.Network] = net
+			}
+		} else {
+			isPublicFallback = true
+		}
 	}
 
-	// Fetch market states
+	// Fetch market states (public endpoint, no API key required)
 	req, _ := http.NewRequestWithContext(ctx, "GET", upbitRESTURL+"/market/all?isDetails=true", nil)
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
@@ -199,11 +216,15 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 		baseCurrency := toUnifiedCurrencyFromUpbit(parts[1])
 
 		// Find network state for the base currency
-		baseNet, ok := walletMap[Network(baseCurrency)]
-		canDeposit, canWithdraw := false, false
-		if ok {
-			canDeposit = baseNet.IsDepositEnable
-			canWithdraw = baseNet.IsWithdrawEnable
+		canDeposit, canWithdraw := true, true
+		if !isPublicFallback {
+			baseNet, ok := walletMap[Network(baseCurrency)]
+			if ok {
+				canDeposit = baseNet.IsDepositEnable
+				canWithdraw = baseNet.IsWithdrawEnable
+			} else {
+				canDeposit, canWithdraw = false, false
+			}
 		}
 
 		// Warning marks potentially illiquid/risky assets, or trading might be restricted.
@@ -466,17 +487,22 @@ func (u *UpbitClient) ConnectWS(ctx context.Context, symbols []Symbol, priceUpda
 				}
 
 				if err := json.Unmarshal(message, &ubUpdate); err == nil && len(ubUpdate.OrderbookUnits) > 0 {
-					// Hardcoded KRW-USD FX Rate temporarily for mock/demonstration purposes
-					fxRate := 1400.0
+					fxRate := 1385.0
 					bestAsk := ubUpdate.OrderbookUnits[0].AskPrice
 					bestBid := ubUpdate.OrderbookUnits[0].BidPrice
+					unifiedSym := toUnifiedSymbolFromUpbit(ubUpdate.Code)
+					_, quoteCur := ParseSymbol(unifiedSym)
 
 					priceUpdateCh <- PriceUpdate{
-						Exchange: u.GetName(),
-						Symbol:   toUnifiedSymbolFromUpbit(ubUpdate.Code),
-						BidUSD:   bestBid / fxRate,
-						AskUSD:   bestAsk / fxRate,
-						FXRate:   fxRate,
+						Exchange:       u.GetName(),
+						Symbol:         unifiedSym,
+						QuoteCurrency:  quoteCur,
+						RawBid:         bestBid,
+						RawAsk:         bestAsk,
+						BidUSD:         bestBid / fxRate,
+						AskUSD:         bestAsk / fxRate,
+						FXRate:         fxRate,
+						FXCurrencyPair: "USD/KRW",
 					}
 				}
 			}
