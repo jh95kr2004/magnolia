@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Search, Sliders, Zap, Layers, AlertOctagon, TrendingUp } from 'lucide-react';
+import { RefreshCw, Search, Sliders, Zap, Layers, AlertOctagon, FlaskConical } from 'lucide-react';
 import { apiClient } from '../../services/api';
-import { buildSseUrl } from '../../contexts/AuthContext';
+import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import './Opportunities.css';
 
 export const Opportunities = () => {
   const { showToast, requestConfirm } = useToast();
+  const { viewMode, switchViewMode } = useAuth();
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('filtered'); // 'filtered' | 'raw'
   const [filteredOpportunities, setFilteredOpportunities] = useState([]);
@@ -19,13 +20,18 @@ export const Opportunities = () => {
   const [lastSync, setLastSync] = useState(null);
 
   useEffect(() => {
-    const oppsSrc = new EventSource(buildSseUrl('/api/ws/opportunities'), { withCredentials: true });
+    setLoading(true);
+    const oppsSrc = new EventSource(buildSseUrl('/api/ws/opportunities', viewMode), { withCredentials: true });
 
     const processOpportunities = (dataList, isRaw) => {
       if (!Array.isArray(dataList)) return [];
       return [...dataList].sort((a, b) => {
-        const roiA = isRaw ? (a.expected_margin || 0) : (a.expected_roi || 0);
-        const roiB = isRaw ? (b.expected_margin || 0) : (b.expected_roi || 0);
+        const roiA = isRaw
+          ? (typeof a.expected_margin === 'number' ? a.expected_margin : (a.expected_roi || 0) * 100)
+          : (a.expected_roi || 0);
+        const roiB = isRaw
+          ? (typeof b.expected_margin === 'number' ? b.expected_margin : (b.expected_roi || 0) * 100)
+          : (b.expected_roi || 0);
         return roiB - roiA;
       });
     };
@@ -51,7 +57,7 @@ export const Opportunities = () => {
     return () => {
       oppsSrc.close();
     };
-  }, []);
+  }, [viewMode]);
 
   const handleForceEnter = (opp) => {
     const asset = opp.base_symbol?.split('-')[0] || opp.base_symbol;
@@ -60,14 +66,14 @@ export const Opportunities = () => {
     const weightPct = ((opp.target_weight || 0.2) * 100).toFixed(1);
 
     requestConfirm({
-      title: `Force Enter Arbitrage (${asset})`,
-      message: `Route: ${route}\nStrategy: ${opp.strategy}\nExpected Net ROI: +${roi}%\nAI Target Allocation Weight: ${weightPct}%\n\nConfirm real order execution via User Engine?`,
-      confirmText: 'Execute Hedge Entry',
-      danger: false,
+      title: `Force Enter Arbitrage (${asset} — ${viewMode} Mode)`,
+      message: `Mode: ${viewMode === 'PAPER' ? '🧪 모의매매 (Paper Engine)' : '⚡ 실매매 (Live Engine)'}\nRoute: ${route}\nStrategy: ${opp.strategy}\nExpected Net ROI: +${roi}%\nAI Target Allocation Weight: ${weightPct}%\n\nConfirm order execution via ${viewMode} Engine?`,
+      confirmText: `Execute ${viewMode} Hedge Entry`,
+      danger: viewMode === 'LIVE',
       onConfirm: async () => {
         try {
-          await apiClient.post('/positions/force_enter', opp);
-          showToast(`Force entry signal routed to Strategy Engine for ${route}.`, 'success');
+          await apiClient.post('/positions/force_enter', { ...opp, mode: viewMode });
+          showToast(`Force entry signal routed to ${viewMode} Strategy Engine for ${route}.`, 'success');
         } catch (err) {
           showToast('Failed to enter: ' + (err.response?.data?.error || err.message), 'error');
         }
@@ -93,7 +99,10 @@ export const Opportunities = () => {
       (o.base_symbol || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       (o.base_exchange || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       (o.foreign_exchange || '').toLowerCase().includes(searchTerm.toLowerCase());
-    const matchRoi = (o.expected_margin || 0) >= minRoi;
+    const marginVal = typeof o.expected_margin === 'number'
+      ? o.expected_margin
+      : ((o.expected_roi || 0) * 100);
+    const matchRoi = marginVal >= minRoi;
     return matchSearch && matchRoi;
   });
 
@@ -102,13 +111,23 @@ export const Opportunities = () => {
       <header className="page-header flex-between">
         <div>
           <h1 className="text-2xl font-bold flex items-center gap-sm">
-            <Sliders className="text-accent-primary" /> Global Arbitrage Scanner
+            <Sliders className="text-accent-primary" /> Global Arbitrage Scanner ({viewMode} Mode)
           </h1>
           <p className="text-secondary mt-xs">
-            Live cross-exchange spread telemetry, 8-hour AI Transformer forecasts, and RL portfolio target weights.
+            {viewMode === 'PAPER'
+              ? '100% Real Exchange Feeds + Paper Simulator Offset applied to AI forecasts & target weights.'
+              : 'Live cross-exchange spread telemetry, 8-hour AI Transformer forecasts, and RL portfolio target weights.'}
           </p>
         </div>
         <div className="flex items-center gap-sm">
+          <button
+            type="button"
+            className="btn-secondary flex items-center gap-2"
+            onClick={() => switchViewMode(viewMode === 'PAPER' ? 'LIVE' : 'PAPER')}
+          >
+            {viewMode === 'PAPER' ? <FlaskConical size={15} className="text-emerald-400" /> : <Zap size={15} className="text-amber-400" />}
+            <span>{viewMode === 'PAPER' ? '🧪 Paper View' : '⚡ Live View'}</span>
+          </button>
           {lastSync && <span className="text-xs text-muted font-mono">Sync: {lastSync.toLocaleTimeString()}</span>}
           <button className="btn-secondary flex items-center gap-2">
             <RefreshCw size={16} className={loading ? 'animate-spin text-accent-primary' : ''} />
@@ -238,8 +257,12 @@ export const Opportunities = () => {
                     </tr>
                   ) : (
                     displayFiltered.map((o, idx) => {
-                      const currPrem = typeof o.current_premium_pct === 'number' ? o.current_premium_pct : 0;
-                      const predPrem = typeof o.predicted_premium_pct === 'number' ? o.predicted_premium_pct : currPrem;
+                      const currPrem = typeof o.current_premium_pct === 'number'
+                        ? o.current_premium_pct
+                        : (typeof o.current_prem === 'number' ? o.current_prem * 100 : 0);
+                      const predPrem = typeof o.predicted_premium_pct === 'number'
+                        ? o.predicted_premium_pct
+                        : (typeof o.expected_future_prem === 'number' ? o.expected_future_prem * 100 : currPrem);
                       const weightPct = ((o.target_weight || 0) * 100).toFixed(1);
                       const invUsd = o.investment_usd || 0;
 
@@ -323,8 +346,12 @@ export const Opportunities = () => {
                     </tr>
                   ) : (
                     displayRaw.map((o, idx) => {
-                      const prem = o.premium_pct || 0;
-                      const margin = o.expected_margin || 0;
+                      const prem = typeof o.premium_pct === 'number'
+                        ? o.premium_pct
+                        : (typeof o.current_prem === 'number' ? o.current_prem * 100 : 0);
+                      const margin = typeof o.expected_margin === 'number'
+                        ? o.expected_margin
+                        : ((o.expected_roi || 0) * 100);
                       return (
                         <tr key={idx} className="opportunity-row">
                           <td>

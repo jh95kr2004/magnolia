@@ -1,9 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, TrendingUp, TrendingDown, Layers, CheckCircle, RefreshCw, DollarSign, Percent } from 'lucide-react';
+import { Clock, TrendingUp, TrendingDown, Layers, CheckCircle, RefreshCw, DollarSign, Percent, FlaskConical, Zap } from 'lucide-react';
 import { apiClient } from '../../services/api';
+import { useAuth } from '../../contexts/AuthContext';
 import './History.css';
 
 export const History = () => {
+  const { viewMode } = useAuth();
+  const [modeFilter, setModeFilter] = useState(viewMode || 'PAPER'); // 'PAPER' | 'LIVE' | 'ALL'
   const [positions, setPositions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -14,16 +17,23 @@ export const History = () => {
     winRate: 0
   });
 
-  const fetchHistory = async () => {
+  useEffect(() => {
+    if (viewMode) {
+      setModeFilter(viewMode);
+    }
+  }, [viewMode]);
+
+  const fetchHistory = async (targetMode = modeFilter) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiClient.get('/positions/history');
+      const res = await apiClient.get(`/positions/history?mode=${targetMode}`);
       if (Array.isArray(res.data)) {
         setPositions(res.data);
         calculateStats(res.data);
       } else {
         setPositions([]);
+        calculateStats([]);
       }
     } catch (err) {
       setError('Failed to fetch transaction history. Please try again.');
@@ -63,21 +73,46 @@ export const History = () => {
   };
 
   useEffect(() => {
-    fetchHistory();
-  }, []);
+    fetchHistory(modeFilter);
+  }, [modeFilter]);
 
   return (
     <div className="history-page animate-fade-in delay-100">
       <header className="page-header mb-lg flex-between">
         <div>
           <h1 className="text-2xl font-bold flex items-center gap-sm">
-            <Clock className="text-accent-primary" /> Trade History
+            <Clock className="text-accent-primary" /> Trade History ({modeFilter})
           </h1>
           <p className="text-secondary mt-xs">Completed arbitrage transactions and historical performance metrics.</p>
         </div>
-        <button className="btn-secondary flex items-center gap-2" onClick={fetchHistory} disabled={loading}>
-          <RefreshCw size={16} className={loading ? 'animate-spin text-accent-primary' : ''} /> Refresh
-        </button>
+        <div className="flex items-center gap-sm">
+          <div className="flex items-center gap-xs bg-black/30 p-1 rounded-lg border border-white/10">
+            <button
+              type="button"
+              className={`px-3 py-1 rounded text-xs font-bold ${modeFilter === 'PAPER' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'text-secondary'}`}
+              onClick={() => setModeFilter('PAPER')}
+            >
+              🧪 Paper
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-1 rounded text-xs font-bold ${modeFilter === 'LIVE' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'text-secondary'}`}
+              onClick={() => setModeFilter('LIVE')}
+            >
+              ⚡ Live
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-1 rounded text-xs font-bold ${modeFilter === 'ALL' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'text-secondary'}`}
+              onClick={() => setModeFilter('ALL')}
+            >
+              All
+            </button>
+          </div>
+          <button className="btn-secondary flex items-center gap-2" onClick={() => fetchHistory(modeFilter)} disabled={loading}>
+            <RefreshCw size={16} className={loading ? 'animate-spin text-accent-primary' : ''} /> Refresh
+          </button>
+        </div>
       </header>
 
       {/* Metrics Row */}
@@ -138,6 +173,7 @@ export const History = () => {
             <table className="history-table">
               <thead>
                 <tr>
+                  <th>Mode</th>
                   <th>Position ID</th>
                   <th>Strategy</th>
                   <th>Route</th>
@@ -150,12 +186,25 @@ export const History = () => {
               </thead>
               <tbody>
                 {positions.map(pos => {
-                  const pnl = pos.RealizedProfitUSD || pos.MaxUnrealizedROI || 0;
+                  const pnl = typeof pos.RealizedProfitUSD === 'number' && pos.RealizedProfitUSD !== 0
+                    ? pos.RealizedProfitUSD
+                    : (pos.MaxUnrealizedROI || 0) * (pos.InvestmentUSD || 0);
                   const isProfit = pnl >= 0;
                   const roi = pos.InvestmentUSD > 0 ? (pnl / pos.InvestmentUSD) * 100 : 0;
 
                   return (
                     <tr key={pos.ID || pos.PositionID}>
+                      <td>
+                        {pos.IsPaper ? (
+                          <span className="text-xs font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            🧪 PAPER
+                          </span>
+                        ) : (
+                          <span className="text-xs font-mono px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                            ⚡ LIVE
+                          </span>
+                        )}
+                      </td>
                       <td className="font-mono text-xs">{pos.PositionID || `POS-${pos.ID}`}</td>
                       <td>
                         <span className="strategy-tag">{pos.Type}</span>

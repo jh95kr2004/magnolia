@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Save, Key, Sliders, Bell, AlertTriangle, AlertCircle, XCircle, Clock, X, Scale } from 'lucide-react';
+import { Save, Key, Sliders, Bell, AlertTriangle, AlertCircle, XCircle, Clock, X, Scale, FlaskConical, RotateCcw } from 'lucide-react';
 import { Toggle } from '../../components/ui/Toggle';
 import { apiClient } from '../../services/api';
 import { useToast } from '../../contexts/ToastContext';
@@ -8,7 +8,7 @@ import './Settings.css';
 
 export const Settings = () => {
   const [searchParams] = useSearchParams();
-  const { showToast } = useToast();
+  const { showToast, requestConfirm } = useToast();
 
   const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'exchange');
   const [loading, setLoading] = useState(true);
@@ -44,7 +44,9 @@ export const Settings = () => {
     partialExitMode: 'FIXED',
     partialExitRatio: 0.5,
     enableStrategicSwitching: false,
-    switchingProfitMultiplier: 2.0
+    switchingProfitMultiplier: 2.0,
+    paperUpbitKrw: 50000000,
+    paperCoinbaseUsd: 35000
   });
 
   // Load Data
@@ -93,7 +95,9 @@ export const Settings = () => {
             partialExitMode: profileRes.data.PartialExitMode || 'FIXED',
             partialExitRatio: profileRes.data.PartialExitRatio || 0.5,
             enableStrategicSwitching: profileRes.data.EnableStrategicSwitching || false,
-            switchingProfitMultiplier: profileRes.data.SwitchingProfitMultiplier || 2.0
+            switchingProfitMultiplier: profileRes.data.SwitchingProfitMultiplier || 2.0,
+            paperUpbitKrw: profileRes.data.PaperUpbitKRW || 50000000,
+            paperCoinbaseUsd: profileRes.data.PaperCoinbaseUSD || 35000
           });
         }
       } catch (err) {
@@ -548,6 +552,72 @@ export const Settings = () => {
                   <Save size={18} /> {saving ? 'Saving...' : 'Update Parameters'}
                 </button>
               </form>
+
+              <div className="separator my-lg"></div>
+
+              {/* Paper Trading Virtual Seed Configuration */}
+              <div className="flex flex-col max-w-lg">
+                <h3 className="text-lg font-semibold mb-sm flex items-center gap-sm">
+                  <FlaskConical size={18} className="text-emerald-400" /> 모의매매 가상 시드머니 설정 (Paper Trading Virtual Seed)
+                </h3>
+                <p className="form-help-text mb-lg">
+                  모의매매(Paper Engine)에서 사용할 거래소별 초기 가상 시드머니를 설정하고 초기화할 수 있습니다. (실매매 잔고 및 포지션에는 영향을 주지 않습니다.)
+                </p>
+
+                <div className="form-group mb-md">
+                  <label className="text-sm font-semibold block mb-xs">Upbit 초기 가상 원화 잔고 (KRW)</label>
+                  <input
+                    type="number"
+                    step="1000000"
+                    min="100000"
+                    value={profile.paperUpbitKrw}
+                    onChange={e => setProfile({ ...profile, paperUpbitKrw: parseFloat(e.target.value) || 0 })}
+                    className="form-input w-full max-w-xs font-mono"
+                  />
+                </div>
+
+                <div className="form-group mb-lg">
+                  <label className="text-sm font-semibold block mb-xs">Coinbase 초기 가상 달러 잔고 (USD)</label>
+                  <input
+                    type="number"
+                    step="1000"
+                    min="100"
+                    value={profile.paperCoinbaseUsd}
+                    onChange={e => setProfile({ ...profile, paperCoinbaseUsd: parseFloat(e.target.value) || 0 })}
+                    className="form-input w-full max-w-xs font-mono"
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  disabled={saving}
+                  className="btn-secondary self-start flex items-center gap-2 px-md py-2 rounded border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+                  onClick={() => {
+                    requestConfirm({
+                      title: '모의매매 시드머니 저장 및 가상 계좌 초기화',
+                      message: `UPBIT ₩${Number(profile.paperUpbitKrw).toLocaleString()} KRW / COINBASE $${Number(profile.paperCoinbaseUsd).toLocaleString()} USD로 가상 계좌를 재설정하고 현재 열린 모의매매 포지션을 초기화하시겠습니까?`,
+                      confirmText: '시드 적용 및 초기화',
+                      danger: true,
+                      onConfirm: async () => {
+                        setSaving(true);
+                        try {
+                          await apiClient.post('/settings/paper_reset', {
+                            upbit_krw: parseFloat(profile.paperUpbitKrw),
+                            coinbase_usd: parseFloat(profile.paperCoinbaseUsd)
+                          });
+                          showToast('모의매매 가상 시드머니가 적용되고 계좌가 초기화되었습니다!', 'success');
+                        } catch (err) {
+                          showToast('초기화 실패: ' + (err.response?.data?.error || err.message), 'error');
+                        } finally {
+                          setSaving(false);
+                        }
+                      }
+                    });
+                  }}
+                >
+                  <RotateCcw size={16} /> 가상 시드 적용 및 모의계좌 초기화
+                </button>
+              </div>
             </div>
           )}
 

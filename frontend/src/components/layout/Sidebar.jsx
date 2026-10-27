@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Settings, Activity, History, LogOut, Shield } from 'lucide-react';
+import { LayoutDashboard, Settings, Activity, History, LogOut, Shield, FlaskConical, Zap } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import './Sidebar.css';
 
@@ -14,11 +14,18 @@ const navItems = [
 export const Sidebar = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, logout } = useAuth();
+  const { user, logout, viewMode, switchViewMode, botStatuses } = useAuth();
 
   const handleLogout = () => {
     logout();
     navigate('/auth', { replace: true });
+  };
+
+  const getStatusClass = (status) => {
+    const s = (status || '').toUpperCase();
+    if (s === 'RUNNING') return 'running';
+    if (s === 'DRAINING') return 'draining';
+    return 'stopped';
   };
 
   return (
@@ -30,6 +37,38 @@ export const Sidebar = () => {
         <div>
           <h1 className="logo-text text-gradient">Magnolia</h1>
           <div className="sidebar-subtitle">Delta-Neutral AI</div>
+        </div>
+      </div>
+
+      {/* Global Mode Switcher (Paper vs Live — Independent Background Goroutines) */}
+      <div className="sidebar-mode-switcher">
+        <div className="sidebar-mode-label">ACTIVE ENGINE VIEW</div>
+        <div className="sidebar-mode-tabs">
+          <button
+            type="button"
+            className={`sidebar-mode-btn paper ${viewMode === 'PAPER' ? 'active' : ''}`}
+            onClick={() => switchViewMode('PAPER')}
+            title="Switch UI to Paper Trading View (Live Engine keeps running in background)"
+          >
+            <FlaskConical size={14} />
+            <span>모의매매</span>
+            <span className={`mode-status-dot ${getStatusClass(botStatuses?.PAPER)}`} title={`Paper Bot: ${botStatuses?.PAPER || 'RUNNING'}`} />
+          </button>
+          <button
+            type="button"
+            className={`sidebar-mode-btn live ${viewMode === 'LIVE' ? 'active' : ''}`}
+            onClick={() => switchViewMode('LIVE')}
+            title="Switch UI to Live Trading View (Paper Engine keeps running in background)"
+          >
+            <Zap size={14} />
+            <span>실매매</span>
+            <span className={`mode-status-dot ${getStatusClass(botStatuses?.LIVE)}`} title={`Live Bot: ${botStatuses?.LIVE || 'STOPPED'}`} />
+          </button>
+        </div>
+        <div className="sidebar-mode-hint">
+          <span>Paper: <strong>{botStatuses?.PAPER || 'RUNNING'}</strong></span>
+          <span>•</span>
+          <span>Live: <strong>{botStatuses?.LIVE || 'STOPPED'}</strong></span>
         </div>
       </div>
 
