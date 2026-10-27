@@ -23,7 +23,9 @@ INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
 ORG = os.getenv("INFLUX_ORG", "magnolia")
 BUCKET = os.getenv("INFLUX_BUCKET", "market_data")
 
-WINDOW_SIZE = int(os.getenv("AI_WINDOW_SIZE", "1440")) # Ticks for MACD/BB context
+WINDOW_SIZE = int(os.getenv("AI_WINDOW_SIZE", "1440"))        # 1440 1-minute candles = 24 hours context
+PRED_LEN = int(os.getenv("AI_PRED_LEN", "480"))              # 480 1-minute steps = 8 hours (1 full funding cycle)
+MIN_WARMUP_STEPS = int(os.getenv("AI_MIN_WARMUP_STEPS", "10")) # Minimum steps before starting live inference
 
 def get_redis_client():
     return redis.from_url(REDIS_URL, decode_responses=True)
@@ -85,6 +87,7 @@ class UserAccountCache:
                 "available_balance": 10000.0,
                 "current_exposures": {},
                 "unrealized_pnls": {},
+                "pair_states": {},
                 "state": 0
             })
         
@@ -104,8 +107,9 @@ def run_daemon():
     
     rl_agent = PortfolioRLAgent(model_path="model/weights/ppo_arbitrage_final.zip", device="cpu", n_stack=15)
     
-    # In-memory sliding window cache. Collections.deque automatically evicts oldest (left) when reaching maxlen.
+    # In-memory sliding window cache (1-minute candle buckets, maxlen=1440 for 24h context).
     history_cache = collections.defaultdict(lambda: collections.deque(maxlen=WINDOW_SIZE))
+    forecast_minute_cache = {}  # key: pair_key -> {"minute": int, "mean": float, "max": float, "min": float}
     feature_cache = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.deque(maxlen=rl_agent.n_stack)))
     
     fetcher = None
@@ -160,8 +164,11 @@ def run_daemon():
                                 window_hours=25
                             )
                             if df is not None and not df.empty:
-                                for _, row in df.iterrows():
+                                for idx, row in df.iterrows():
+                                    row_ts = row.get("_time", None)
+                                    minute_bucket = int(pd.Timestamp(row_ts).timestamp() // 60) if row_ts is not None else int(time.time() // 60) - len(df) + idx
                                     tick_data = {
+                                        "minute_bucket": minute_bucket,
                                         "exchange_premium_spread": float(row["exchange_premium_spread"]),
                                         "local_price": float(row["local_price"]),
                                         "foreign_price": float(row["foreign_price"]),
@@ -169,7 +176,7 @@ def run_daemon():
                                         "base_funding_rate": float(row["base_funding_rate"]),
                                         "foreign_funding_rate": float(row["foreign_funding_rate"]),
                                         "base_fee": 0.0005,
-                                        "foreign_fee": 0.012,
+                                        "foreign_fee": 0.002,
                                         "slippage": 0.0005,
                                         "state": 0,
                                         "user_exposure": 0.0,
@@ -177,11 +184,13 @@ def run_daemon():
                                         "user_pnl": 0.0
                                     }
                                     history_cache[pair_key].append(tick_data)
-                                logger.info(f"Loaded {len(history_cache[pair_key])} historical ticks for {pair_key}.")
+                                logger.info(f"Loaded {len(history_cache[pair_key])} historical 1m candles for {pair_key}.")
                         except Exception as e:
                             logger.warning(f"Failed to lazy warmup cache for {pair_key}: {e}")
 
+                current_minute_bucket = int(time.time() // 60)
                 tick_data = {
+                    "minute_bucket": current_minute_bucket,
                     "exchange_premium_spread": opp.get("premium_pct", 0.0) / 100.0,
                     "local_price": opp.get("base_price_usd", 0.0) * fx_rate, 
                     "foreign_price": opp.get("foreign_price_usd", 0.0),
@@ -189,54 +198,74 @@ def run_daemon():
                     "base_funding_rate": opp.get("base_funding_rate_pct", 0.0) / 100.0, 
                     "foreign_funding_rate": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
                     "base_fee": 0.0005,
-                    "foreign_fee": 0.012,
+                    "foreign_fee": 0.002,
                     "slippage": 0.0005,
                     "state": 0,
                     "user_exposure": 0.0,
                     "user_balance": 10000.0,
                     "user_pnl": 0.0
                 }
-                history_cache[pair_key].append(tick_data)
+                # Maintain 1-minute step resolution once initial warmup threshold is met:
+                # update the current minute candle in-place on 1-second ticks, and append when a new minute starts.
+                if (
+                    len(history_cache[pair_key]) >= MIN_WARMUP_STEPS
+                    and history_cache[pair_key][-1].get("minute_bucket") == current_minute_bucket
+                ):
+                    history_cache[pair_key][-1] = tick_data
+                else:
+                    history_cache[pair_key].append(tick_data)
                 
                 current_cache_size = len(history_cache[pair_key])
-                if current_cache_size < WINDOW_SIZE:
+                if current_cache_size < MIN_WARMUP_STEPS:
                     if time.time() - logs_state["last_warmup_log_time"] > 10.0:
-                        logger.info(f"Warming up sliding window cache for {pair_key}: {current_cache_size}/{WINDOW_SIZE} ticks.")
+                        logger.info(f"Warming up sliding window cache for {pair_key}: {current_cache_size}/{MIN_WARMUP_STEPS} min steps.")
                         logs_state["last_warmup_log_time"] = time.time()
-                
-                if current_cache_size >= WINDOW_SIZE:
-                    context_df = pd.DataFrame(history_cache[pair_key])
-                    mean_pred, max_pred, min_pred, _ = predict_reversion(context_df, pred_len=60, device="cpu")
-                    
-                    # Compute rolling features
-                    context_df["sma_1h"] = context_df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
-                    context_df["sma_24h"] = context_df["exchange_premium_spread"].rolling(1440, min_periods=1).mean()
-                    context_df["std_24h"] = context_df["exchange_premium_spread"].rolling(1440, min_periods=1).std()
-                    context_df["z_score"] = (context_df["exchange_premium_spread"] - context_df["sma_24h"]) / (context_df["std_24h"] + 1e-8)
-                    
-                    bb_upper = context_df["sma_24h"] + (2.0 * context_df["std_24h"])
-                    bb_lower = context_df["sma_24h"] - (2.0 * context_df["std_24h"])
-                    context_df["bb_width"] = (bb_upper - bb_lower) / (context_df["sma_24h"] + 1e-8)
-                    
-                    ema_12 = context_df["exchange_premium_spread"].ewm(span=12, adjust=False).mean()
-                    ema_26 = context_df["exchange_premium_spread"].ewm(span=26, adjust=False).mean()
-                    context_df["macd"] = ema_12 - ema_26
-                    
-                    last_row = context_df.iloc[-1]
-                    global_forecasts[pair_key] = {
+                    continue
+
+                context_df = pd.DataFrame(history_cache[pair_key])
+                cached_fc = forecast_minute_cache.get(pair_key)
+                if cached_fc is None or cached_fc["minute"] != current_minute_bucket:
+                    mean_pred, max_pred, min_pred, _ = predict_reversion(context_df, pred_len=PRED_LEN, device="cpu")
+                    forecast_minute_cache[pair_key] = {
+                        "minute": current_minute_bucket,
                         "mean": mean_pred,
                         "max": max_pred,
                         "min": min_pred,
-                        "sma_1h": last_row.get("sma_1h", 0.0),
-                        "sma_24h": last_row.get("sma_24h", 0.0),
-                        "z_score": last_row.get("z_score", 0.0),
-                        "bb_width": last_row.get("bb_width", 0.0),
-                        "macd": last_row.get("macd", 0.0),
-                        "current_spread": opp.get("premium_pct", 0.0) / 100.0,
-                        "base_fund": opp.get("base_funding_rate_pct", 0.0) / 100.0,
-                        "foreign_fund": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
-                        "fx_rate": fx_rate
                     }
+                else:
+                    mean_pred = cached_fc["mean"]
+                    max_pred = cached_fc["max"]
+                    min_pred = cached_fc["min"]
+                
+                # Compute rolling features on 1-minute steps (60 = 1h, 1440 = 24h)
+                context_df["sma_1h"] = context_df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
+                context_df["sma_24h"] = context_df["exchange_premium_spread"].rolling(1440, min_periods=1).mean()
+                context_df["std_24h"] = context_df["exchange_premium_spread"].rolling(1440, min_periods=1).std().fillna(0.0)
+                context_df["z_score"] = (context_df["exchange_premium_spread"] - context_df["sma_24h"]) / (context_df["std_24h"] + 1e-8)
+                
+                bb_upper = context_df["sma_24h"] + (2.0 * context_df["std_24h"])
+                bb_lower = context_df["sma_24h"] - (2.0 * context_df["std_24h"])
+                context_df["bb_width"] = (bb_upper - bb_lower) / (context_df["sma_24h"].abs() + 1e-8)
+                
+                ema_12 = context_df["exchange_premium_spread"].ewm(span=12, adjust=False).mean()
+                ema_26 = context_df["exchange_premium_spread"].ewm(span=26, adjust=False).mean()
+                context_df["macd"] = ema_12 - ema_26
+                
+                last_row = context_df.iloc[-1]
+                global_forecasts[pair_key] = {
+                    "mean": mean_pred,
+                    "max": max_pred,
+                    "min": min_pred,
+                    "sma_1h": float(last_row.get("sma_1h", 0.0)),
+                    "sma_24h": float(last_row.get("sma_24h", 0.0)),
+                    "z_score": float(last_row.get("z_score", 0.0)),
+                    "bb_width": float(last_row.get("bb_width", 0.0)),
+                    "macd": float(last_row.get("macd", 0.0)),
+                    "current_spread": opp.get("premium_pct", 0.0) / 100.0,
+                    "base_fund": opp.get("base_funding_rate_pct", 0.0) / 100.0,
+                    "foreign_fund": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
+                    "fx_rate": fx_rate
+                }
 
             # --- [User Specific DRL Inference Step] ---
             # Loop over all active users in the system and execute customized DRL portfolio decisions.
@@ -247,11 +276,12 @@ def run_daemon():
             for user_id in active_users:
                 acc_state = user_cache.get_state(user_id)
                 available_balance = float(acc_state.get("available_balance", 10000.0))
-                user_state = int(acc_state.get("state", 0))
+                fallback_user_state = int(acc_state.get("state", 0))
                 
-                # Exposures map: e.g., "Binance|BTCUSDT" -> exposure float
+                # Exposures, PnLs, and per-pair state maps: e.g., "UPBIT|KRW-BTC"
                 current_exposures = acc_state.get("current_exposures", {})
                 unrealized_pnls = acc_state.get("unrealized_pnls", {})
+                pair_states = acc_state.get("pair_states", {})
 
                 for opp in raw_data:
                     pair_key = (opp["base_exchange"], opp["base_symbol"], opp["foreign_exchange"], opp["foreign_symbol"])
@@ -260,19 +290,20 @@ def run_daemon():
                         
                     m_data = global_forecasts[pair_key]
                     
-                    # Extract user exposure specific to this cross-market pair
+                    # Extract user exposure, unrealized PnL, and state specific to this cross-market pair
                     key_str = f"{opp['base_exchange']}|{opp['base_symbol']}"
                     user_exposure = float(current_exposures.get(key_str, 0.0))
                     user_pnl = float(unrealized_pnls.get(key_str, 0.0))
+                    pair_state = int(pair_states.get(key_str, fallback_user_state if abs(user_exposure) > 1e-6 else 0))
                     
                     base_fee = float(opp.get("base_fee_rate", 0.0005))
-                    foreign_fee = float(opp.get("foreign_fee_rate", 0.012))
+                    foreign_fee = float(opp.get("foreign_fee_rate", 0.002))
                     slippage = float(opp.get("slippage", 0.0005))
 
-                    state_neutral = 1.0 if user_state == 0 else 0.0
-                    state_holding = 1.0 if user_state == 1 else 0.0
-                    state_transferring = 1.0 if user_state == 2 else 0.0
-                    state_repaying = 1.0 if user_state == 3 else 0.0
+                    state_neutral = 1.0 if pair_state == 0 else 0.0
+                    state_holding = 1.0 if pair_state == 1 else 0.0
+                    state_transferring = 1.0 if pair_state == 2 else 0.0
+                    state_repaying = 1.0 if pair_state == 3 else 0.0
 
                     state_vector = np.array([
                         m_data["current_spread"],
