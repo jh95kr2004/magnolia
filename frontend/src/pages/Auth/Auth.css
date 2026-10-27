@@ -1,0 +1,8 @@
+.auth-login.glass-panel {
+    padding: var(--space-md);
+}
+
+.auth-login .form-group {
+    margin-top: var(--space-sm);
+    margin-bottom: var(--space-sm);
+}
