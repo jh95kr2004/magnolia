@@ -1,0 +1,36 @@
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# Install necessary build tools and protoc for gRPC compilation
+RUN apk add --no-cache git make protobuf protobuf-dev
+
+# Install protoc plugins
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
+RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+
+# Generate gRPC code
+RUN protoc --go_out=. --go_opt=paths=source_relative \
+    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+    internal/grpc/proto/arbitrage.proto
+
+# Build the master binary
+RUN CGO_ENABLED=0 go build -o master cmd/engine/main.go
+
+FROM alpine:latest
+
+WORKDIR /root/
+COPY --from=builder /app/master .
+
+# Add server version label for UI tracking
+ARG SERVER_VERSION="v1.0.0"
+ENV SERVER_VERSION=${SERVER_VERSION}
+
+EXPOSE 8080 50051
+
+CMD ["./master"]
