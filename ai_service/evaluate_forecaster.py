@@ -46,7 +46,7 @@ def evaluate_forecaster(csv_path: str, batch_size: int = 64):
     val_df = df.iloc[train_size:]
 
     seq_len = 24 * 60  # 24 hours of 1-minute historical data natively
-    pred_len = 5 * 60  # Project future outputs over 5 hours natively
+    pred_len = int(os.getenv("AI_PRED_LEN", str(8 * 60)))  # Project future outputs over 8 hours (480 minutes) natively
 
     features = [
         "exchange_premium_spread",

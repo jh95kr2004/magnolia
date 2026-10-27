@@ -27,7 +27,7 @@ class PremiumForecaster(nn.Module):
     """
 
     def __init__(
-        self, input_size=6, hidden_size=128, num_layers=2, pred_len=60, output_size=3
+        self, input_size=6, hidden_size=128, num_layers=2, pred_len=480, output_size=3
     ):
         super(PremiumForecaster, self).__init__()
         self.hidden_size = hidden_size
@@ -67,10 +67,10 @@ class PremiumForecaster(nn.Module):
 _predictors_cache = {}
 _cache_lock = threading.Lock()
 
-def predict_reversion(historical_df: pd.DataFrame, pred_len=60, device="cpu") -> tuple:
+def predict_reversion(historical_df: pd.DataFrame, pred_len=480, device="cpu") -> tuple:
     """
     Loads pretrained scalers/model and dynamically predicts the future premium spread and funding rates
-    inverse-transforming data back identically representing true market decimals perfectly.
+    over an 8-hour horizon (pred_len=480 1-minute steps, matching 1 full perpetual funding cycle).
     Uses in-memory cache to avoid disk I/O bottlenecks.
     Returns:
         mean_premium: float
@@ -133,19 +133,24 @@ def predict_reversion(historical_df: pd.DataFrame, pred_len=60, device="cpu") ->
     try:
         raw_data = historical_df[features].values
 
-        # IMPORTANT CORE PATCH: Downscale astronomical asset prices targeting standardized distributions (-1,1 bounds approx)
-        scaled_x = feature_scaler.transform(raw_data)
+        # Downscale asset prices and clamp standardized values to [-5.0, 5.0] so out-of-distribution
+        # coin price regimes (e.g., ETH/XRP or higher BTC prices) never explode GRU hidden states.
+        scaled_x = np.clip(feature_scaler.transform(raw_data), -5.0, 5.0)
 
         # Create a batched tensor shape constraint validating properly (batch_size=1, seq_len=len(df), input_size=6)
-        input_tensor = torch.tensor([scaled_x], dtype=torch.float32).to(device)
+        input_tensor = torch.tensor(np.array([scaled_x], dtype=np.float32), dtype=torch.float32).to(device)
 
         with torch.no_grad():
             predictions = model(input_tensor)  # Computes outputs scaled relative predicting Normalized constraints [1, loaded_pred_len, 3]
 
         preds_scaled = predictions[0].cpu().numpy() # Extract [loaded_pred_len, 3] from inner batch dimension structure
-        preds_scaled = preds_scaled[:pred_len]      # Slice to the requested pred_len
+        if len(preds_scaled) >= pred_len:
+            preds_scaled = preds_scaled[:pred_len]
+        else:
+            pad_len = pred_len - len(preds_scaled)
+            preds_scaled = np.pad(preds_scaled, ((0, pad_len), (0, 0)), mode="edge")
 
-        # CRITICAL PATCH: Inverse transformation maps abstract standardized numericals back identically simulating Real Life USD/Spread
+        # Inverse transformation maps abstract standardized numericals back identically simulating Real Life USD/Spread
         real_preds = target_scaler.inverse_transform(preds_scaled)
 
         # The initial index '0' refers physically to Exchange_Premium_Spread outputs mapped specifically via targets variable array configuration
@@ -161,10 +166,10 @@ def predict_reversion(historical_df: pd.DataFrame, pred_len=60, device="cpu") ->
         print(f"Error during forecasting inference computations: {e}")
         return 0.0, 0.0, 0.0, []
 
-def append_forecast_features(df: pd.DataFrame, pred_len=300, seq_len=1440, device="cpu") -> pd.DataFrame:
+def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=1440, device="cpu") -> pd.DataFrame:
     """
     Batches the entire DataFrame through the pretrained Forecaster to generate an offline 
-    'predicted_spread' column. Enables O(1) RL temporal queries without GPU bottlenecking during PPO steps.
+    'predicted_spread' column over an 8-hour (480-minute) horizon.
     """
     scaler_dir = "model/weights"
     feat_scaler_path = os.path.join(scaler_dir, "feature_scaler.pkl")
@@ -185,18 +190,23 @@ def append_forecast_features(df: pd.DataFrame, pred_len=300, seq_len=1440, devic
     
     feature_scaler = joblib.load(feat_scaler_path)
     target_scaler = joblib.load(target_scaler_path)
+
+    loaded_pred_len = pred_len
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    if "fc_out.bias" in checkpoint:
+        loaded_pred_len = checkpoint["fc_out.bias"].shape[0] // 3
     
-    model = PremiumForecaster(input_size=6, hidden_size=128, pred_len=pred_len, output_size=3).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model = PremiumForecaster(input_size=6, hidden_size=128, pred_len=loaded_pred_len, output_size=3).to(device)
+    model.load_state_dict(checkpoint)
     model.eval()
 
     features = ["exchange_premium_spread", "local_price", "foreign_price", "fx_rate", "base_funding_rate", "foreign_funding_rate"]
     targets = ["exchange_premium_spread", "base_funding_rate", "foreign_funding_rate"]
 
-    scaled_x = feature_scaler.transform(df[features].values)
+    scaled_x = np.clip(feature_scaler.transform(df[features].values), -5.0, 5.0)
     dummy_y = np.zeros((len(df), len(targets))) # Bypassed internally during inference
     
-    dataset = CryptoArbitrageDataset(scaled_x, dummy_y, seq_len, pred_len)
+    dataset = CryptoArbitrageDataset(scaled_x, dummy_y, seq_len, loaded_pred_len)
     loader = DataLoader(dataset, batch_size=512, shuffle=False)
 
     all_preds = []

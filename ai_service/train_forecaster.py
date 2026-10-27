@@ -38,7 +38,7 @@ def train_forecaster(
 
     # 2. Forecasting Topology Configurations
     seq_len = 24 * 60  # 24 hours of accumulated context records (1-minute frames)
-    pred_len = 5 * 60  # Project future outputs continuously scaling spanning the next 5 hours
+    pred_len = int(os.getenv("AI_PRED_LEN", str(8 * 60)))  # Project future outputs spanning the next 8 hours (480 minutes = 1 full funding cycle)
     features = [
         "exchange_premium_spread",
         "local_price",
