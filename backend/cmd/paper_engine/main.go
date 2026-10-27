@@ -87,14 +87,16 @@ func main() {
 	log.Println("[PaperEngine] Initializing Upbit Live Client...")
 	realUpbit := exchange.NewUpbitClient(upbitAccessKey, upbitSecretKey)
 
+	userID := uint(1) // Admin user ID
+
 	// 5. Wrap Clients inside Paper wrappers for risk-free simulation using live feeds
-	paperUpbit := exchange.NewPaperClient(realUpbit, map[string]float64{
+	paperUpbit := exchange.NewPaperClientForUser(userID, realUpbit, map[string]float64{
 		"KRW": 50000000.0, // 50,000,000 KRW virtual balance
 		"BTC": 0.0,
 	})
 
-	paperCoinbase := exchange.NewPaperClient(realCoinbase, map[string]float64{
-		"USD": 50000.0, // 50,000 USD virtual balance
+	paperCoinbase := exchange.NewPaperClientForUser(userID, realCoinbase, map[string]float64{
+		"USD": 35000.0, // 35,000 USD virtual balance
 		"BTC": 0.0,
 	})
 
@@ -104,8 +106,7 @@ func main() {
 
 	// 6. Instantiate the Strategy Engine
 	nodeID := "live-paper-node-1"
-	userID := uint(1) // Admin user ID
-	engine := strategy.NewEngine(nodeID, userID, db, pubsubClient, "default", clients, nil)
+	engine := strategy.NewEngine(nodeID, userID, db, pubsubClient, "PremiumStrategy", clients, nil)
 	log.Println("[PaperEngine] Core Arbitrage Strategy Engine initialized.")
 
 	// 7. Start AI Opportunities Subscription Daemon

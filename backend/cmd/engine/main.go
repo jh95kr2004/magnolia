@@ -134,6 +134,17 @@ func main() {
 		go runUserEngine(ctx, &wg, db, redisClient, nodeID, engineRegion, u.ID)
 	}
 
+	// 미할당(Unassigned) 유저 자동 인수 (부팅 시 초기 시드 유저 포함)
+	if unassignedUsers, err := db.GetUnassignedUsers(engineRegion); err == nil && len(unassignedUsers) > 0 {
+		for _, u := range unassignedUsers {
+			if assignErr := db.AssignEngineNode(u.ID, nodeID); assignErr == nil {
+				log.Printf("[Engine] Claimed unassigned user %d (%s) on startup.", u.ID, u.Email)
+				wg.Add(1)
+				go runUserEngine(ctx, &wg, db, redisClient, nodeID, engineRegion, u.ID)
+			}
+		}
+	}
+
 	// 2단계: 무한 루프 진입하여 Dangling 큐에서 떨어져 나온 사용자 Pop
 	go func() {
 		for {
@@ -238,31 +249,64 @@ func runUserEngine(
 		}
 	}
 
-	clients := []exchange.Client{}
+	liveClients := []exchange.Client{}
+	paperClients := []exchange.Client{}
+
+	paperUpbitKRW := 50000000.0
+	paperCoinbaseUSD := 35000.0
+	if settings, err := db.GetUserSettings(userID); err == nil && settings != nil {
+		if settings.PaperUpbitKRW > 0 {
+			paperUpbitKRW = settings.PaperUpbitKRW
+		}
+		if settings.PaperCoinbaseUSD > 0 {
+			paperCoinbaseUSD = settings.PaperCoinbaseUSD
+		}
+	}
 
 	upbitClient := exchange.NewUpbitClient(upbitAccess, upbitSecret)
-	clients = append(clients, upbitClient)
+	liveClients = append(liveClients, upbitClient)
+	paperClients = append(paperClients, exchange.NewPaperClientForUser(userID, upbitClient, map[string]float64{
+		"KRW": paperUpbitKRW,
+		"BTC": 0.0,
+	}))
 
 	coinbaseClient, err := exchange.NewCoinbaseClient(coinbaseAccess, coinbaseSecret, coinbaseLimit)
 	if err != nil {
 		log.Printf("[Engine] Failed to create Coinbase client for User %d: %v", userID, err)
 	} else {
-		clients = append(clients, coinbaseClient)
+		liveClients = append(liveClients, coinbaseClient)
+		paperClients = append(paperClients, exchange.NewPaperClientForUser(userID, coinbaseClient, map[string]float64{
+			"USD": paperCoinbaseUSD,
+			"BTC": 0.0,
+		}))
 	}
 
-	// Create and Start the isolated Engine instance specifically for this userID
-	engine := strategy.NewEngine(
+	// Create Dual Independent Engines for this userID:
+	// 1. Live Engine (real exchange execution)
+	liveEngine := strategy.NewEngine(
 		nodeID,
 		userID,
 		db,
 		rClient,
 		"PremiumStrategy",
-		clients,
-		nil, // TODO: Get wallet from the user if any.
+		liveClients,
+		nil,
 	)
 
-	// Run parallel listeners
-	go engine.ListenOpportunities(ctx)
+	// 2. Paper Engine (virtual balance & simulator execution on 100% real feeds)
+	paperEngine := strategy.NewEngine(
+		nodeID,
+		userID,
+		db,
+		rClient,
+		"PremiumStrategy",
+		paperClients,
+		nil,
+	)
+
+	// Run parallel listeners for both Live and Paper engines
+	go liveEngine.ListenOpportunities(ctx)
+	go paperEngine.ListenOpportunities(ctx)
 
 	// Start Position Monitor for the user's active positions and opportunities evaluation
 	targetCoinsEnv := os.Getenv("TARGET_COINS")
@@ -287,17 +331,40 @@ func runUserEngine(
 		symbolsToMonitor = []exchange.Symbol{"BTC-KRW", "BTC-USD", "ETH-KRW", "ETH-USD"}
 	}
 
-	priceCh := make(chan exchange.PriceUpdate, 1000)
-	go rClient.SubscribeTickers(ctx, symbolsToMonitor, priceCh)
-	go engine.RunPositionMonitor(ctx, priceCh)
+	rawPriceCh := make(chan exchange.PriceUpdate, 1000)
+	livePriceCh := make(chan exchange.PriceUpdate, 1000)
+	paperPriceCh := make(chan exchange.PriceUpdate, 1000)
 
-	log.Printf("[Engine] Dedicated Go-routines started for User %d.", userID)
+	go rClient.SubscribeTickers(ctx, symbolsToMonitor, rawPriceCh)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case tick := <-rawPriceCh:
+				select {
+				case livePriceCh <- tick:
+				default:
+				}
+				select {
+				case paperPriceCh <- tick:
+				default:
+				}
+			}
+		}
+	}()
+
+	go liveEngine.RunPositionMonitor(ctx, livePriceCh)
+	go paperEngine.RunPositionMonitor(ctx, paperPriceCh)
+
+	log.Printf("[Engine] Dual (Live + Paper) Go-routines started for User %d.", userID)
 
 	// Wait until context is done for shutdown
 	<-ctx.Done()
 
-	log.Printf("[Engine] Graceful Shutdown triggered for User %d. Draining...", userID)
-	engine.StartDraining()
+	log.Printf("[Engine] Graceful Shutdown triggered for User %d. Draining both Live and Paper engines...", userID)
+	liveEngine.StartDraining()
+	paperEngine.StartDraining()
 
 	// 1. Release Lock in DB
 	if err := db.ReleaseEngineNode(userID); err != nil {
