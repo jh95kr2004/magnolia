@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/magnolia/backend/internal/exchange"
@@ -105,13 +106,21 @@ func (p *PubSubClient) SubscribeFXRate(ctx context.Context, base, quote string, 
 
 // PushDanglingClient adds a user to the regional queue for an engine node to pick up.
 func (p *PubSubClient) PushDanglingClient(ctx context.Context, region string, userID string) error {
-	queueName := "queue:dangling_clients:" + region
+	normRegion := strings.ToLower(strings.TrimSpace(region))
+	if normRegion == "" {
+		normRegion = "kr"
+	}
+	queueName := "queue:dangling_clients:" + normRegion
 	return p.client.LPush(ctx, queueName, userID).Err()
 }
 
 // PopDanglingClient blocks until a user is available in the regional queue, then pops and returns it.
 func (p *PubSubClient) PopDanglingClient(ctx context.Context, region string) (string, error) {
-	queueName := "queue:dangling_clients:" + region
+	normRegion := strings.ToLower(strings.TrimSpace(region))
+	if normRegion == "" {
+		normRegion = "kr"
+	}
+	queueName := "queue:dangling_clients:" + normRegion
 	// BRPop blocks until an element is available or timeout (0 = block indefinitely)
 	result, err := p.client.BRPop(ctx, 0, queueName).Result()
 	if err != nil {
@@ -165,9 +174,47 @@ func (p *PubSubClient) PublishUserOpportunities(ctx context.Context, userID stri
 	return p.client.Publish(ctx, channel, payload).Err()
 }
 
+// PublishUserOpportunitiesByMode sends filtered opportunities for a specific mode ("paper" or "live").
+func (p *PubSubClient) PublishUserOpportunitiesByMode(ctx context.Context, userID, mode string, payload []byte) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "paper"
+	}
+	channel := "user:" + userID + ":opportunities:" + mode
+	_ = p.client.Set(ctx, channel+":latest", payload, 2*time.Minute).Err()
+	_ = p.PublishUserOpportunities(ctx, userID, payload)
+	return p.client.Publish(ctx, channel, payload).Err()
+}
+
 // SubscribeUserOpportunities listens for filtered opportunities targeted at a specific user.
 func (p *PubSubClient) SubscribeUserOpportunities(ctx context.Context, userID string, outCh chan<- []byte) {
 	channel := "user:" + userID + ":opportunities"
+	pubsub := p.client.Subscribe(ctx, channel)
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			outCh <- []byte(msg.Payload)
+		}
+	}
+}
+
+// SubscribeUserOpportunitiesByMode listens for filtered opportunities for a specific mode ("paper" or "live").
+func (p *PubSubClient) SubscribeUserOpportunitiesByMode(ctx context.Context, userID, mode string, outCh chan<- []byte) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "paper"
+	}
+	channel := "user:" + userID + ":opportunities:" + mode
+	if cached, err := p.client.Get(ctx, channel+":latest").Bytes(); err == nil && len(cached) > 0 {
+		select {
+		case outCh <- cached:
+		default:
+		}
+	}
 	pubsub := p.client.Subscribe(ctx, channel)
 	defer pubsub.Close()
 	ch := pubsub.Channel()
@@ -188,12 +235,38 @@ func (p *PubSubClient) PublishUserState(ctx context.Context, userID string, payl
 	return p.client.Publish(ctx, channel, payload).Err()
 }
 
+// PublishUserStateByMode broadcasts and caches account state for a specific mode ("paper" or "live").
+func (p *PubSubClient) PublishUserStateByMode(ctx context.Context, userID, mode string, payload []byte) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "paper"
+	}
+	modeChannel := "user:" + userID + ":state:" + mode
+	_ = p.client.Set(ctx, modeChannel+":latest", payload, 5*time.Minute).Err()
+	_ = p.client.Publish(ctx, modeChannel, payload).Err()
+	return p.PublishUserState(ctx, userID, payload)
+}
+
 // GetLatestUserState retrieves the latest cached account state snapshot for a user.
 func (p *PubSubClient) GetLatestUserState(ctx context.Context, userID string) ([]byte, error) {
 	key := "user:" + userID + ":state:latest"
 	val, err := p.client.Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, err
+	}
+	return val, nil
+}
+
+// GetLatestUserStateByMode retrieves the latest cached account state for a user and mode ("paper" or "live").
+func (p *PubSubClient) GetLatestUserStateByMode(ctx context.Context, userID, mode string) ([]byte, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "paper"
+	}
+	key := "user:" + userID + ":state:" + mode + ":latest"
+	val, err := p.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return p.GetLatestUserState(ctx, userID)
 	}
 	return val, nil
 }

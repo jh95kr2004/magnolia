@@ -7,6 +7,7 @@ package postgres
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"gorm.io/driver/postgres"
@@ -53,6 +54,10 @@ func NewDB(dsn string) (*DB, error) {
 
 // CreateUser inserts a new user record.
 func (db *DB) CreateUser(user *User) error {
+	user.Region = strings.ToLower(strings.TrimSpace(user.Region))
+	if user.Region == "" {
+		user.Region = "kr"
+	}
 	return db.conn.Create(user).Error
 }
 
@@ -84,6 +89,17 @@ func (db *DB) ReleaseEngineNode(userID uint) error {
 func (db *DB) GetUsersByEngineNode(nodeID string) ([]User, error) {
 	var users []User
 	err := db.conn.Where("engine_node_id = ?", nodeID).Find(&users).Error
+	return users, err
+}
+
+// GetUnassignedUsers fetches users in the given region (or all if empty) who have no assigned engine node.
+func (db *DB) GetUnassignedUsers(region string) ([]User, error) {
+	var users []User
+	q := db.conn.Where("engine_node_id IS NULL OR engine_node_id = ''")
+	if region != "" {
+		q = q.Where("LOWER(region) = LOWER(?)", region)
+	}
+	err := q.Find(&users).Error
 	return users, err
 }
 
@@ -127,7 +143,28 @@ func (db *DB) CleanOrphanedUsers() ([]User, error) {
 func (db *DB) GetUserSettings(userID uint) (*UserSettings, error) {
 	var settings UserSettings
 	err := db.conn.Where("user_id = ?", userID).First(&settings).Error
-	return &settings, err
+	if err != nil {
+		return &settings, err
+	}
+	if settings.ActiveViewMode == "" {
+		settings.ActiveViewMode = "PAPER"
+	}
+	if settings.PaperBotStatus == "" {
+		settings.PaperBotStatus = "RUNNING"
+	}
+	if settings.LiveBotStatus == "" {
+		settings.LiveBotStatus = "STOPPED"
+	}
+	if settings.PaperUpbitKRW <= 0 {
+		settings.PaperUpbitKRW = 50000000.0
+	}
+	if settings.PaperCoinbaseUSD <= 0 {
+		settings.PaperCoinbaseUSD = 35000.0
+	}
+	if settings.SimExchange == "" {
+		settings.SimExchange = "UPBIT"
+	}
+	return &settings, nil
 }
 
 // SaveUserSettings updates or creates global user configurations.
@@ -259,11 +296,32 @@ func (db *DB) GetActivePositionsByUser(userID uint) ([]ActivePosition, error) {
 	return positions, err
 }
 
+// GetActivePositionsByUserAndMode fetches active positions filtered by Paper vs Live mode.
+func (db *DB) GetActivePositionsByUserAndMode(userID uint, isPaper bool) ([]ActivePosition, error) {
+	var positions []ActivePosition
+	err := db.conn.Where("user_id = ? AND is_paper = ? AND status IN ?", userID, isPaper, []string{"OPEN", "IN_TRANSIT", "TRANSFERRING", "REPAYING", "AWAITING_REPAY"}).Find(&positions).Error
+	return positions, err
+}
+
 // GetClosedPositionsByUser fetches all closed/historical positions belonging to a specific user.
 func (db *DB) GetClosedPositionsByUser(userID uint) ([]ActivePosition, error) {
 	var positions []ActivePosition
 	err := db.conn.Where("user_id = ? AND status = ?", userID, "CLOSED").Order("opened_at desc").Find(&positions).Error
 	return positions, err
+}
+
+// GetClosedPositionsByUserAndMode fetches closed/historical positions filtered by Paper vs Live mode.
+func (db *DB) GetClosedPositionsByUserAndMode(userID uint, isPaper bool) ([]ActivePosition, error) {
+	var positions []ActivePosition
+	err := db.conn.Where("user_id = ? AND is_paper = ? AND status = ?", userID, isPaper, "CLOSED").Order("opened_at desc").Find(&positions).Error
+	return positions, err
+}
+
+// CloseAllActivePositionsByUserAndMode marks all open positions for a user and mode as CLOSED.
+func (db *DB) CloseAllActivePositionsByUserAndMode(userID uint, isPaper bool) error {
+	return db.conn.Model(&ActivePosition{}).
+		Where("user_id = ? AND is_paper = ? AND status != ?", userID, isPaper, "CLOSED").
+		Update("status", "CLOSED").Error
 }
 
 // GetPositionByID fetches a position record by its unique positionID

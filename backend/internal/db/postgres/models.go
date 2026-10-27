@@ -39,10 +39,10 @@ type UserAPIKey struct {
 
 // UserSettings stores notification and app-level preferences for a User
 type UserSettings struct {
-	ID                uint      `gorm:"primaryKey"`
-	UserID            uint      `gorm:"uniqueIndex;not null"` // Relation back to the User
-	DiscordWebhookURL string                                  // Discord channel hook URL for alerts
-	TelegramChatID    string                                  // Telegram chat target ID
+	ID                        uint      `gorm:"primaryKey"`
+	UserID                    uint      `gorm:"uniqueIndex;not null"` // Relation back to the User
+	DiscordWebhookURL         string                                  // Discord channel hook URL for alerts
+	TelegramChatID            string                                  // Telegram chat target ID
 	NotifyOnEntry             bool      `gorm:"default:true"`         // Send notification when a new position opens
 	NotifyOnExit              bool      `gorm:"default:true"`         // Send notification on position closure
 	NotifyOnException         bool      `gorm:"default:true"`         // Send alert for system errors
@@ -50,6 +50,17 @@ type UserSettings struct {
 	PartialExitRatio          float64   `gorm:"default:0.5"`          // If FIXED, the fraction of position to close on SCALE_OUT (e.g. 0.5)
 	EnableStrategicSwitching  bool      `gorm:"default:false"`        // Allow closing a profitable position if a much better one appears
 	SwitchingProfitMultiplier float64   `gorm:"default:2.0"`          // Required ROI multiple to trigger a strategic switch
+	ActiveViewMode            string    `gorm:"default:'PAPER'"`      // 'PAPER' or 'LIVE'
+	PaperBotStatus            string    `gorm:"default:'RUNNING'"`    // 'RUNNING', 'DRAINING', or 'STOPPED'
+	LiveBotStatus             string    `gorm:"default:'STOPPED'"`    // 'RUNNING', 'DRAINING', or 'STOPPED'
+	PaperUpbitKRW             float64   `gorm:"default:50000000"`     // Virtual seed KRW on Upbit
+	PaperCoinbaseUSD          float64   `gorm:"default:35000"`        // Virtual seed USD on Coinbase
+	PaperBalancesJSON         string    `gorm:"type:text"`            // Persisted JSON snapshot of PaperClient balances/futures/borrows
+	SimExchange               string    `gorm:"default:'UPBIT'"`      // Target exchange for price offset simulator ('UPBIT' or 'COINBASE')
+	SimStartOffsetPct         float64   `gorm:"default:0"`            // Starting offset (%) when ramp was initiated
+	SimTargetOffsetPct        float64   `gorm:"default:0"`            // Target offset (%) to reach after SimRampMinutes
+	SimRampMinutes            float64   `gorm:"default:0"`            // Duration in minutes to ramp from start to target offset
+	SimStartedAt              int64     `gorm:"default:0"`            // Unix timestamp (seconds) when ramp was started
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
 }
@@ -111,6 +122,7 @@ type UserThreshold struct {
 type ActivePosition struct {
 	ID                 uint      `gorm:"primaryKey"`
 	UserID             uint      `gorm:"index;not null"` // [NEW] Link position directly to the user
+	IsPaper            bool      `gorm:"index;default:false"`
 	PositionID         string    `gorm:"uniqueIndex"`
 	MonitorNodeID      string    `gorm:"index"` // ID of the K8s Replica that opened and monitors this position
 	Status             string    // e.g. "OPEN", "IN_TRANSIT", "CLOSED"
@@ -127,6 +139,7 @@ type ActivePosition struct {
 	EntryPremium       float64
 	ExpectedFuturePrem float64
 	MaxUnrealizedROI   float64   // Track peaks for Trailing Stop logic
+	RealizedProfitUSD  float64   // Settled realized profit in USD on close
 	BuyOrderID         string
 	SellOrderID        string
 	HedgeMarket        string    // e.g. "SPOT" or "FUTURE", used natively by Strategy C
