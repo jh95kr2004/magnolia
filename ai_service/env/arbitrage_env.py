@@ -102,6 +102,11 @@ class ArbitrageEnv(gym.Env):
         self.entry_spread = 0.0
         self.state = self.STATE_NEUTRAL
         self.transfer_remaining_steps = 0
+        # Backend-identical Foreign USD Capital Skew & Dual-Trigger Rebalance thresholds (GEMINI.md Section 8.3)
+        self.foreign_usd_skew = 0.50
+        self.balance_skew_threshold = 0.15
+        self.rebalance_trigger_skew = 0.20
+        self.rebalance_max_premium = 0.0005
 
         if self.randomize_fees:
             # Dynamic asymmetric fee generation to simulate any combination of exchanges
@@ -158,7 +163,11 @@ class ArbitrageEnv(gym.Env):
     def _get_unrealized_pnl(self, current_spread):
         if self.exposure == 0:
             return 0.0
-        # Bidirectional PnL equation matching physics of trades:
+        # In Transfer Arbitrage (TRANSFERRING or REPAYING state with Short Base / Long Foreign),
+        # the coin bought on Foreign is transferred to repay the Base coin loan 1:1, locking in entry_spread.
+        if self.state in (self.STATE_TRANSFERRING, self.STATE_REPAYING) and self.exposure < 0:
+            return abs(self.exposure) * self.initial_balance * max(0.0, self.entry_spread)
+        # Bidirectional PnL equation matching physics of convergence trades:
         # If exposure > 0 (Long Base, Short Foreign), profit when spread RISES
         # If exposure < 0 (Short Base, Long Foreign), profit when spread FALLS
         return (
@@ -169,14 +178,15 @@ class ArbitrageEnv(gym.Env):
 
     def step(self, action):
         # 1. Parse Action
+        # Center interval [-0.33, +0.33] maps to 0 (TRADE/HOLD) so Gaussian mean 0.0 naturally trades/holds
         action_exposure = float(np.clip(action[0], -1.0, 1.0).item())
-        action_dec = action[1]
-        if action_dec < -0.33:
-            action_type = 0  # TRADE
-        elif action_dec < 0.33:
-            action_type = 1  # TRANSFER
+        action_dec = float(np.clip(action[1], -1.0, 1.0).item())
+        if action_dec > 0.33:
+            action_type = 1  # TRANSFER (Strategy C)
+        elif action_dec < -0.33:
+            action_type = 2  # REPAY / EXIT
         else:
-            action_type = 2  # REPAY
+            action_type = 0  # TRADE / HOLD
 
         row = self.df.iloc[self.current_step]
         current_spread = float(row["exchange_premium_spread"])
@@ -191,6 +201,28 @@ class ArbitrageEnv(gym.Env):
         borrow_rate_pct = float(row.get("borrow_rate_pct", 0.0041))  # Default roughly 0.0041% hourly
         borrow_rate = borrow_rate_pct / 100.0
 
+        prev_state = self.state
+        step_fees_paid = 0.0
+        repay_via_transfer = False
+        rebalance_triggered = False
+
+        # 3b. Dual-Trigger 100% Delta-Neutral Reverse Transfer Rebalancing (GEMINI.md Section 8.3)
+        # Triggered when in NEUTRAL state, Foreign USD Skew <= 20% (RebalanceTriggerSkew), and spread <= RebalanceMaxPremium
+        if (
+            self.state == self.STATE_NEUTRAL
+            and self.foreign_usd_skew <= self.rebalance_trigger_skew
+            and current_spread <= self.rebalance_max_premium
+        ):
+            rebalance_amount = 0.50 - self.foreign_usd_skew
+            rebalance_notional = rebalance_amount * self.initial_balance
+            rebalance_fee = rebalance_notional * (self.current_base_fee_rate + self.current_foreign_fee_rate) + 2.50
+            # Reverse premium bonus/cost when buying Spot Base at negative/near-zero spread and shorting Foreign
+            rebalance_spread_pnl = rebalance_notional * (-current_spread)
+            self.balance = self.balance - rebalance_fee + rebalance_spread_pnl
+            step_fees_paid += rebalance_fee
+            self.foreign_usd_skew = 0.50
+            rebalance_triggered = True
+
         # 4. State Machine Transition Logic
         target_exposure = self.exposure
 
@@ -202,49 +234,55 @@ class ArbitrageEnv(gym.Env):
                 self.state = self.STATE_REPAYING  # Transfer completed, awaiting repayment
 
         elif self.state == self.STATE_NEUTRAL:
-            if action_type == 0 and abs(action_exposure) >= self.execution_threshold:
+            # In Neutral state, there is no open position to transfer or repay; any exposure >= threshold is an entry
+            if abs(action_exposure) >= self.execution_threshold:
                 target_exposure = action_exposure
                 self.state = self.STATE_HOLDING_LEG
-                self.entry_spread = current_spread
             else:
                 target_exposure = 0.0
 
         elif self.state == self.STATE_HOLDING_LEG:
-            if action_type == 1:  # TRANSFER
-                if self.exposure != 0:
+            if action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, entry_spread >= 0.5%, and Foreign USD Skew >= 15%)
+                if (
+                    self.exposure < 0
+                    and self.entry_spread >= 0.005
+                    and self.foreign_usd_skew >= self.balance_skew_threshold
+                ):
                     self.state = self.STATE_TRANSFERRING
-                    self.transfer_remaining_steps = np.random.randint(5, 15)  # 5~15 step delay simulation
-                    # Charge one-time chain gas/withdrawal fee
-                    gas_fee = 10.0  # Simulated flat gas fee
+                    self.transfer_remaining_steps = 8 if self.is_eval else np.random.randint(5, 15)
+                    gas_fee = 2.50
                     self.balance -= gas_fee
+                    step_fees_paid += gas_fee
+                    # Moving coin from Foreign to Base consumes Foreign USD allocation
+                    self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(self.exposure) * 0.15)
                     target_exposure = self.exposure
-                else:
+                elif abs(action_exposure) < self.execution_threshold:
                     self.state = self.STATE_NEUTRAL
                     target_exposure = 0.0
-            elif action_type == 2:  # REPAY / Force exit
-                target_exposure = 0.0
-                self.state = self.STATE_NEUTRAL
-            elif action_type == 0:  # TRADE (Rebalance)
-                if abs(action_exposure) < self.execution_threshold:
-                    target_exposure = 0.0
-                    self.state = self.STATE_NEUTRAL
                 else:
                     target_exposure = action_exposure
-
-        elif self.state == self.STATE_REPAYING:
-            if action_type == 2:  # REPAY (Complete loan return)
+            elif action_type == 2 or abs(action_exposure) < self.execution_threshold:  # REPAY / Market Unwind
                 target_exposure = 0.0
                 self.state = self.STATE_NEUTRAL
+            else:  # TRADE (Hold / Scale-In / Scale-Out)
+                target_exposure = action_exposure
+
+        elif self.state == self.STATE_REPAYING:
+            if action_type == 2 or abs(action_exposure) < self.execution_threshold or current_spread <= 0.002:
+                # Complete loan return using transferred coin
+                target_exposure = 0.0
+                self.state = self.STATE_NEUTRAL
+                repay_via_transfer = True
             else:
                 # Deferring repayment for funding rate yield optimization. Still holding position.
                 target_exposure = self.exposure
-                # Suffer continuous borrow interest penalty
                 borrow_fee = abs(self.exposure) * self.initial_balance * borrow_rate * (1.0 / 60.0)
                 self.balance -= borrow_fee
+                step_fees_paid += borrow_fee
 
         # 5. Order Execution and Digital Twin Cost Calculation
         delta_exposure = target_exposure - self.exposure
-        is_short_base = target_exposure < 0
+        is_short_base = (target_exposure < 0) if target_exposure != 0 else (self.exposure < 0)
 
         base_spot_tx = self.current_base_fee_rate + self.current_slippage
         foreign_spot_tx = self.current_foreign_fee_rate + self.current_slippage
@@ -268,31 +306,59 @@ class ArbitrageEnv(gym.Env):
 
         cheapest_base_exec = min(base_spot_cost, base_future_cost)
         cheapest_foreign_exec = min(foreign_spot_cost, foreign_future_cost)
-        optimal_round_trip_fee = cheapest_base_exec + cheapest_foreign_exec
+        optimal_round_trip_fee = max(0.0005, cheapest_base_exec + cheapest_foreign_exec)
 
-        if abs(delta_exposure) >= self.execution_threshold:
-            # --- Non-linear Slippage Adjustment ---
+        vetoed = False
+        # Only run Veto Manager when INCREASING exposure or flipping direction (never block exits or scale-outs!)
+        is_opening_or_increasing = (
+            target_exposure != 0.0
+            and (
+                abs(target_exposure) > abs(self.exposure)
+                or np.sign(target_exposure) != np.sign(self.exposure)
+            )
+        )
+        if is_opening_or_increasing and abs(delta_exposure) >= self.execution_threshold:
             trade_value = abs(delta_exposure) * self.initial_balance
             actual_slippage = self.current_slippage * (1.0 + (trade_value / 5000.0) ** 2)
             optimal_round_trip_fee = optimal_round_trip_fee - self.current_slippage + actual_slippage
 
-            # --- Deterministic Veto Manager ---
-            if target_exposure > self.exposure:
-                predicted_jump = float(row.get("predicted_spread_max", current_spread)) - current_spread
+            if target_exposure > 0:
+                # Long Base / Short Foreign: profits when spread widens (or reverts up from negative reverse premium)
+                forecast_widening = float(row.get("predicted_spread_max", current_spread)) - current_spread
+                mean_reversion_up = float(row.get("sma_24h", 0.0)) - current_spread
+                predicted_jump = max(forecast_widening, mean_reversion_up * 0.6)
             else:
-                predicted_jump = current_spread - float(row.get("predicted_spread_min", current_spread))
+                # Short Base / Long Foreign: profits from spread convergence OR instant transfer spread
+                convergence_jump = current_spread - float(row.get("predicted_spread_min", current_spread))
+                mean_reversion_down = current_spread - float(row.get("sma_24h", 0.0))
+                transfer_spread = max(0.0, current_spread)
+                predicted_jump = max(convergence_jump, mean_reversion_down * 0.6, transfer_spread)
 
             fee_percentage_wall = optimal_round_trip_fee
             if predicted_jump < fee_percentage_wall:
-                # VETO trigger: Rollback trade execution
+                # VETO trigger: Rollback trade execution and state transition
                 target_exposure = self.exposure
                 delta_exposure = 0.0
+                self.state = prev_state
+                vetoed = True
 
+        trade_executed = False
         # Execute final trade deductions
         if abs(delta_exposure) >= self.execution_threshold:
+            trade_executed = True
             trade_value = abs(delta_exposure) * self.initial_balance
-            transaction_cost = trade_value * optimal_round_trip_fee
+            if repay_via_transfer:
+                # Returning transferred coin to repay loan incurs no market sell/buy fee
+                transaction_cost = 0.0
+            elif abs(target_exposure) > abs(self.exposure):
+                # Entry leg fee (half of round-trip)
+                transaction_cost = trade_value * (optimal_round_trip_fee * 0.5)
+            else:
+                # Exit leg fee (half of round-trip)
+                transaction_cost = trade_value * (optimal_round_trip_fee * 0.5)
+
             self.balance -= transaction_cost
+            step_fees_paid += transaction_cost
 
             # Realized PnL Calculation
             if self.exposure != 0:
@@ -305,18 +371,27 @@ class ArbitrageEnv(gym.Env):
                         closed_exposure = self.exposure - target_exposure
                     else:
                         closed_exposure = 0.0
-                
+
                 if closed_exposure != 0:
-                    realized_pnl = closed_exposure * self.initial_balance * (current_spread - self.entry_spread)
+                    if repay_via_transfer and closed_exposure < 0:
+                        # Strategy C (Transfer Arbitrage): locked in entry_spread directly
+                        realized_pnl = abs(closed_exposure) * self.initial_balance * max(0.0, self.entry_spread)
+                    else:
+                        # Strategy A/B/D/E (Convergence Arbitrage): realized spread difference
+                        realized_pnl = closed_exposure * self.initial_balance * (current_spread - self.entry_spread)
                     self.balance += realized_pnl
 
             # Weighted dollar-cost average Entry Spread
-            if self.exposure == 0 or (np.sign(target_exposure) != np.sign(self.exposure) and target_exposure != 0):
+            if self.exposure == 0 and target_exposure != 0:
+                self.entry_spread = current_spread
+            elif np.sign(target_exposure) != np.sign(self.exposure) and target_exposure != 0:
                 self.entry_spread = current_spread
             elif abs(target_exposure) > abs(self.exposure):
                 old_weight = abs(self.exposure)
                 added_weight = abs(target_exposure) - abs(self.exposure)
                 self.entry_spread = (self.entry_spread * old_weight + current_spread * added_weight) / abs(target_exposure)
+            elif target_exposure == 0:
+                self.entry_spread = 0.0
 
             self.exposure = target_exposure
 
@@ -335,9 +410,10 @@ class ArbitrageEnv(gym.Env):
         self.balance += funding_pnl
 
         # Base Borrow interest fee hourly accrual applied per step
-        if is_short_base and self.exposure != 0:
+        if self.exposure < 0:
             borrow_fee = abs(self.exposure) * self.initial_balance * borrow_rate * (1.0 / 60.0)
             self.balance -= borrow_fee
+            step_fees_paid += borrow_fee
 
         # 7. Reward & Step Output
         if done:
@@ -360,6 +436,14 @@ class ArbitrageEnv(gym.Env):
             "total_equity": float(total_equity_curr),
             "unrealized_pnl": float(unrealized_pnl_curr),
             "state": int(self.state),
+            "action_type": int(action_type),
+            "trade_executed": bool(trade_executed),
+            "repay_via_transfer": bool(repay_via_transfer),
+            "rebalance_triggered": bool(rebalance_triggered),
+            "foreign_usd_skew": float(self.foreign_usd_skew),
+            "vetoed": bool(vetoed),
+            "step_fees_paid": float(step_fees_paid),
+            "step_funding_pnl": float(funding_pnl),
         }
 
         return self._get_obs(), float(reward), done, False, info
