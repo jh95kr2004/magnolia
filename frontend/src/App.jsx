@@ -7,6 +7,7 @@ import { Opportunities } from './pages/Opportunities/Opportunities';
 import { Settings } from './pages/Settings/Settings';
 import { History } from './pages/History/History';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { ToastProvider } from './contexts/ToastContext';
 
 // Protect private routes wrapper
 const ProtectedRoute = ({ children }) => {
@@ -20,25 +21,27 @@ const ProtectedRoute = ({ children }) => {
 
 export const App = () => {
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/auth" element={<Auth />} />
-          
-          <Route path="/" element={
-            <ProtectedRoute>
-              <Layout />
-            </ProtectedRoute>
-          }>
-            <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="dashboard" element={<Dashboard />} />
-            <Route path="opportunities" element={<Opportunities />} />
-            <Route path="settings" element={<Settings />} />
-            <Route path="history" element={<History />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </AuthProvider>
+    <ToastProvider>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/auth" element={<Auth />} />
+            
+            <Route path="/" element={
+              <ProtectedRoute>
+                <Layout />
+              </ProtectedRoute>
+            }>
+              <Route index element={<Navigate to="/dashboard" replace />} />
+              <Route path="dashboard" element={<Dashboard />} />
+              <Route path="opportunities" element={<Opportunities />} />
+              <Route path="settings" element={<Settings />} />
+              <Route path="history" element={<History />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </AuthProvider>
+    </ToastProvider>
   );
 };
 
