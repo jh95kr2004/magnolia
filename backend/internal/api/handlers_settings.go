@@ -10,9 +10,10 @@ import (
 
 // handleExchangeKeySubmit validates and saves the user API keys
 func (s *Server) handleExchangeKeySubmit(w http.ResponseWriter, r *http.Request) {
+	userID := getUserIDFromContext(r)
 	if r.Method == http.MethodGet {
 		// Return list of keys
-		keys, err := s.DB.GetAllAPIKeys(1) // Mock UI User 1
+		keys, err := s.DB.GetAllAPIKeys(userID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -90,7 +91,7 @@ func (s *Server) handleExchangeKeySubmit(w http.ResponseWriter, r *http.Request)
 	}
 
 	keyRecord := &postgres.UserAPIKey{
-		UserID:                 1, // Harcoded mock 1
+		UserID:                 userID,
 		Exchange:               req.Exchange,
 		AccessKey:              req.AccessKey,
 		SecretKey:              string(encryptedSecret),
@@ -100,7 +101,7 @@ func (s *Server) handleExchangeKeySubmit(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Delete old key if overwriting
-	s.DB.DeleteAPIKey(1, req.Exchange)
+	s.DB.DeleteAPIKey(userID, req.Exchange)
 
 	if err := s.DB.SaveAPIKey(keyRecord); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -118,6 +119,7 @@ func (s *Server) handleExchangeKeyDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	userID := getUserIDFromContext(r)
 	var req struct {
 		Exchange string `json:"exchange"`
 		Force    bool   `json:"force"`
@@ -132,12 +134,7 @@ func (s *Server) handleExchangeKeyDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if count > 0 && req.Force {
-		// Mock: forcefully close active positions related to this exchange
-		// s.Engine.ForceCloseAll(req.Exchange) 
-	}
-
-	if err := s.DB.DeleteAPIKey(1, req.Exchange); err != nil {
+	if err := s.DB.DeleteAPIKey(userID, req.Exchange); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -151,6 +148,7 @@ func (s *Server) handleExchangeKeyToggle(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	userID := getUserIDFromContext(r)
 	var req struct {
 		Exchange string `json:"exchange"`
 		IsActive bool   `json:"is_active"`
@@ -169,14 +167,15 @@ func (s *Server) handleExchangeKeyToggle(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	s.DB.UpdateAPIKeyStatus(1, req.Exchange, req.IsActive)
+	s.DB.UpdateAPIKeyStatus(userID, req.Exchange, req.IsActive)
 	w.Write([]byte(`{"message": "Exchange status toggled"}`))
 }
 
 // handleAlgoParameters sets tracking limits for a strategy
 func (s *Server) handleAlgoParameters(w http.ResponseWriter, r *http.Request) {
+	userID := getUserIDFromContext(r)
 	if r.Method == http.MethodGet {
-		threshold, _ := s.DB.LoadThresholds(1, "PremiumStrategy")
+		threshold, _ := s.DB.LoadThresholds(userID, "PremiumStrategy")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(threshold)
 		return
@@ -188,8 +187,15 @@ func (s *Server) handleAlgoParameters(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		
-		req.UserID = 1 // Enforce mock
+
+		existing, err := s.DB.LoadThresholds(userID, "PremiumStrategy")
+		if err == nil && existing != nil {
+			req.ID = existing.ID
+		}
+		req.UserID = userID
+		if req.StrategyName == "" {
+			req.StrategyName = "PremiumStrategy"
+		}
 		if err := s.DB.SaveThresholds(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -203,8 +209,9 @@ func (s *Server) handleAlgoParameters(w http.ResponseWriter, r *http.Request) {
 
 // handleSettingsProfile manages user meta-data
 func (s *Server) handleSettingsProfile(w http.ResponseWriter, r *http.Request) {
+	userID := getUserIDFromContext(r)
 	if r.Method == http.MethodGet {
-		settings, _ := s.DB.GetUserSettings(1)
+		settings, _ := s.DB.GetUserSettings(userID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(settings)
 		return
@@ -215,11 +222,11 @@ func (s *Server) handleSettingsProfile(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&req)
 		
 		// Map the existing settings with new updates, preserving ID
-		existing, _ := s.DB.GetUserSettings(1)
+		existing, _ := s.DB.GetUserSettings(userID)
 		if existing != nil {
 			req.ID = existing.ID
 		}
-		req.UserID = 1 // For Prototype Fixation
+		req.UserID = userID
 		
 		s.DB.SaveUserSettings(&req)
 		w.Write([]byte(`{"message": "Settings updated"}`))

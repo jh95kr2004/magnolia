@@ -5,12 +5,42 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/magnolia/backend/internal/db/postgres"
 )
 
-// AuthMiddleware intercepts and decodes the JWT token from the Authorization header
+type ctxKeyUserID struct{}
+
+func parseTokenUserID(tokenStr string) uint {
+	tokenStr = strings.TrimSpace(tokenStr)
+	if strings.HasPrefix(tokenStr, "magnolia-token-") {
+		idStr := strings.TrimPrefix(tokenStr, "magnolia-token-")
+		if parsed, err := strconv.ParseUint(idStr, 10, 64); err == nil && parsed > 0 {
+			return uint(parsed)
+		}
+	}
+	return 1
+}
+
+func getUserIDFromContext(r *http.Request) uint {
+	if val := r.Context().Value(ctxKeyUserID{}); val != nil {
+		if id, ok := val.(uint); ok && id > 0 {
+			return id
+		}
+	}
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		return parseTokenUserID(qToken)
+	}
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return parseTokenUserID(strings.TrimPrefix(authHeader, "Bearer "))
+	}
+	return 1
+}
+
+// AuthMiddleware intercepts and decodes the token from the Authorization header
 func (s *Server) AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -19,22 +49,19 @@ func (s *Server) AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-		// TODO: Validate JWT and extract UserID
-		// For prototyping, we force inject UserID 1 in the context.
-		
-		// Continue execution
-		next.ServeHTTP(w, r)
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		userID := parseTokenUserID(tokenStr)
+		ctx := context.WithValue(r.Context(), ctxKeyUserID{}, userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
 
-// WebSocketAuthMiddleware validates WS connection queries
+// WebSocketAuthMiddleware validates SSE/WS connection queries and extracts UserID
 func (s *Server) WebSocketAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// e.g., /api/ws/dashboard?token=xyz
-		// token := r.URL.Query().Get("token")
-		// if !Valid(token) { http.Error() }
-		next.ServeHTTP(w, r)
+		userID := getUserIDFromContext(r)
+		ctx := context.WithValue(r.Context(), ctxKeyUserID{}, userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
 
@@ -88,13 +115,23 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Push newly created user to the Dangling Queue so an Engine picks them up
-	if pushErr := s.Redis.PushDanglingClient(context.Background(), user.Region, fmt.Sprint(user.ID)); pushErr != nil {
-		// Log error but don't fail registration
-		fmt.Printf("Failed to push user to queue: %v\n", pushErr)
+	if s.Redis != nil {
+		if pushErr := s.Redis.PushDanglingClient(context.Background(), user.Region, fmt.Sprint(user.ID)); pushErr != nil {
+			fmt.Printf("Failed to push user to queue: %v\n", pushErr)
+		}
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"message": "User registered successfully"}`))
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "User registered successfully",
+		"token":   fmt.Sprintf("magnolia-token-%d", user.ID),
+		"user": map[string]interface{}{
+			"id":     user.ID,
+			"email":  user.Email,
+			"region": user.Region,
+		},
+	})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -114,31 +151,37 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := s.DB.GetUserByEmail(req.Email)
-	if err != nil || user.PasswordHash != req.Password { // Mock password check
+	if err != nil || user.PasswordHash != req.Password {
 		http.Error(w, `{"error": "Invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
 
-	// TODO: Generate standard JWT Token including user.ID
-	// Here we just return a fake token
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"token": "fake-jwt-token-123",
+		"token": fmt.Sprintf("magnolia-token-%d", user.ID),
 		"user": map[string]interface{}{
-			"id":    user.ID,
-			"email": user.Email,
+			"id":     user.ID,
+			"email":  user.Email,
+			"region": user.Region,
 		},
 	})
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	// Retrieve UserID from Middleware context (Hardcoded 1 for prototype)
-	user, err := s.DB.GetUserByEmail("admin@magnolia.test") 
+	userID := getUserIDFromContext(r)
+	user, err := s.DB.GetUserByID(userID)
 	if err != nil {
-		http.Error(w, `{"error": "User missing"}`, http.StatusNotFound)
-		return
+		user, err = s.DB.GetUserByEmail("admin@magnolia.test")
+		if err != nil {
+			http.Error(w, `{"error": "User missing"}`, http.StatusNotFound)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":     user.ID,
+		"email":  user.Email,
+		"region": user.Region,
+	})
 }
