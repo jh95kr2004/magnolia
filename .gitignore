@@ -1,0 +1,35 @@
+# Binaries and build artifacts
+backend/bin/
+backend/main
+backend/feed
+backend/node
+backend/paper_engine
+backend/sandbox_bin
+*.exe
+*.out
+*.test
+
+# Logs and temporary outputs
+*.log
+output.txt
+
+# Environment variables and local secrets
+.env
+.env.*
+ai_service/config.json
+
+# Python cache and virtualenvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+ai_service/venv/
+ai_service/.venv/
+ai_service/data/*.csv
+ai_service/logs/
+
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
+.DS_Store
+.vscode/
+
