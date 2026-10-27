@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -210,15 +211,25 @@ func (r *GlobalRawRanker) EvaluateAllCache(ctx context.Context, pairs []CrossMar
 			continue
 		}
 
-		// Prevent redundant calculations for opposite directions.
-		// Since Upbit-Coinbase and Coinbase-Upbit are mirror images of each other,
-		// we only evaluate the direction where the base price is greater than or equal to
-		// the foreign price. The opposite direction will have a negative premium/profit and is skipped.
-		if baseUSD < foreignUSD {
+		// Emit a single canonical direction per exchange pair so that both positive (+) and negative (-)
+		// spreads stream continuously into the AI time-series buffer and allow exit/repay signals during reverse premium.
+		// Canonical rule: Local fiat quote (e.g. KRW on UPBIT) is Base and USD quote (e.g. COINBASE) is Foreign;
+		// if both share the same quote currency type, break ties lexicographically by exchange name.
+		baseQuoteCur := string(p.BaseMarketInfo.QuoteCurrency)
+		foreignQuoteCur := string(p.ForeignMarketInfo.QuoteCurrency)
+		isCanonicalDirection := false
+		if baseQuoteCur != "USD" && foreignQuoteCur == "USD" {
+			isCanonicalDirection = true
+		} else if baseQuoteCur == "USD" && foreignQuoteCur != "USD" {
+			isCanonicalDirection = false
+		} else {
+			isCanonicalDirection = p.BaseClient.GetName() < p.ForeignClient.GetName()
+		}
+		if !isCanonicalDirection {
 			continue
 		}
 
-		// 1. 김치 프리미엄
+		// 1. 김치 프리미엄 (Signed: positive = premium, negative = reverse premium / discount)
 		premiumPct := ((baseUSD - foreignUSD) / foreignUSD) * 100.0
 
 		// 2. 펀딩비 
@@ -228,7 +239,7 @@ func (r *GlobalRawRanker) EvaluateAllCache(ctx context.Context, pairs []CrossMar
 		// 3. 대여 이자
 		borrowRatePct := baseUpdate.BorrowRatePerHour * 24.0 * 100.0
 
-		margin := premiumPct + foreignFundingRatePct - baseFundingRatePct - borrowRatePct
+		margin := math.Abs(premiumPct) + foreignFundingRatePct - baseFundingRatePct - borrowRatePct
 
 		raw := RawOpportunity{
 			BaseExchange:          p.BaseClient.GetName(),
