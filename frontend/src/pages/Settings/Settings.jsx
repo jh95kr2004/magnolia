@@ -1,11 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Save, Key, Sliders, Bell, AlertTriangle, ShieldCheck, AlertCircle, XCircle, Clock, X } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { Save, Key, Sliders, Bell, AlertTriangle, AlertCircle, XCircle, Clock, X, Scale } from 'lucide-react';
 import { Toggle } from '../../components/ui/Toggle';
 import { apiClient } from '../../services/api';
+import { useToast } from '../../contexts/ToastContext';
 import './Settings.css';
 
 export const Settings = () => {
-  const [activeTab, setActiveTab] = useState('exchange');
+  const [searchParams] = useSearchParams();
+  const { showToast } = useToast();
+
+  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'exchange');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -14,22 +19,27 @@ export const Settings = () => {
   const [supportedExchanges, setSupportedExchanges] = useState([]);
   const [editMode, setEditMode] = useState(false);
   const [popupConfig, setPopupConfig] = useState(null);
-  const [showNoVNCModal, setShowNoVNCModal] = useState(false);
+  const [showNoVNCModal, setShowNoVNCModal] = useState(searchParams.get('openNoVNC') === '1');
   const [noVNCUrl, setNoVNCUrl] = useState('http://localhost:6080');
   const [apiKeys, setApiKeys] = useState({ exchange: '', access_key: '', secret_key: '' });
   const [params, setParams] = useState({
     usePercentParams: false,
-    minTargetProfitUsd: 10, maxStopLossUsd: 50,
-    minTargetProfitPct: 1.0, maxStopLossPct: 10.0,
+    minTargetProfitUsd: 10,
+    maxStopLossUsd: 50,
+    minTargetProfitPct: 1.0,
+    maxStopLossPct: -10.0,
     maxAcceptableSpread: 0.01,
     capitalLimitUsd: 10000,
     maxRiskScore: 50.0,
-    riskMultiplier: 1.5
+    riskMultiplier: 1.5,
+    rebalanceTriggerSkewPct: 20.0,
+    rebalanceTargetSkewPct: 50.0,
+    rebalanceMaxPremiumPct: 0.0
   });
-  const [profile, setProfile] = useState({ 
-    notifyOnEntry: true, 
-    notifyOnExit: true, 
-    discordWebhook: '', 
+  const [profile, setProfile] = useState({
+    notifyOnEntry: true,
+    notifyOnExit: true,
+    discordWebhook: '',
     telegramChatId: '',
     partialExitMode: 'FIXED',
     partialExitRatio: 0.5,
@@ -57,17 +67,20 @@ export const Settings = () => {
           setRegisteredKeys(keysRes.data);
         }
 
-        if (paramsRes.data && paramsRes.data.ID) { // DB struct has ID
+        if (paramsRes.data && paramsRes.data.ID) {
           setParams({
             usePercentParams: paramsRes.data.UsePercentParams || false,
             minTargetProfitUsd: paramsRes.data.MinTargetProfit || 10,
             maxStopLossUsd: paramsRes.data.MaxStopLoss || 50,
             minTargetProfitPct: paramsRes.data.MinTargetProfitPercent || 1.0,
-            maxStopLossPct: paramsRes.data.MaxStopLossPercent || 10.0,
+            maxStopLossPct: paramsRes.data.MaxStopLossPercent || -10.0,
             maxAcceptableSpread: paramsRes.data.MaxAcceptableSpread || 0.01,
             capitalLimitUsd: paramsRes.data.CapitalLimitUsd || 10000,
             maxRiskScore: paramsRes.data.MaxRiskScore || 50.0,
-            riskMultiplier: paramsRes.data.RiskMultiplier || 1.5
+            riskMultiplier: paramsRes.data.RiskMultiplier || 1.5,
+            rebalanceTriggerSkewPct: (paramsRes.data.RebalanceTriggerSkew || 0.20) * 100,
+            rebalanceTargetSkewPct: (paramsRes.data.RebalanceTargetSkew || 0.50) * 100,
+            rebalanceMaxPremiumPct: (paramsRes.data.RebalanceMaxPremium || 0.0) * 100
           });
         }
 
@@ -84,13 +97,13 @@ export const Settings = () => {
           });
         }
       } catch (err) {
-        console.error("Failed to load settings", err);
+        showToast('Failed to load user configuration.', 'error');
       } finally {
         setLoading(false);
       }
     };
     fetchData();
-  }, []);
+  }, [showToast]);
 
   const handleSaveKeys = async (e) => {
     e.preventDefault();
@@ -98,12 +111,11 @@ export const Settings = () => {
     try {
       await apiClient.post('/settings/exchange', apiKeys);
       setApiKeys(prev => ({ ...prev, access_key: '', secret_key: '' }));
-      // Refresh keys
       const keysRes = await apiClient.get('/settings/exchange');
       if (keysRes.data) setRegisteredKeys(keysRes.data);
-      alert('API Keys verified and saved successfully!');
+      showToast(`${apiKeys.exchange} API keys verified and saved!`, 'success');
     } catch (err) {
-      alert("Verification failed: " + (err.response?.data?.error || err.message));
+      showToast('Verification failed: ' + (err.response?.data?.error || err.message), 'error');
     } finally {
       setSaving(false);
     }
@@ -112,14 +124,14 @@ export const Settings = () => {
   const handleToggleExchange = async (exchange, newState) => {
     try {
       await apiClient.post('/settings/exchange/toggle', { exchange, is_active: newState, force: false });
-      // Refresh
       const keysRes = await apiClient.get('/settings/exchange');
       if (keysRes.data) setRegisteredKeys(keysRes.data);
+      showToast(`${exchange} ${newState ? 'enabled' : 'paused'}.`, 'info');
     } catch (err) {
       if (err.response && err.response.status === 409) {
         setPopupConfig({ type: 'toggle', exchange, targetState: newState });
       } else {
-        alert('Toggle failed: ' + (err.response?.data?.error || err.message));
+        showToast('Toggle failed: ' + (err.response?.data?.error || err.message), 'error');
       }
     }
   };
@@ -127,14 +139,14 @@ export const Settings = () => {
   const handleDeleteExchange = async (exchange) => {
     try {
       await apiClient.post('/settings/exchange/delete', { exchange, force: false });
-      // Refresh
       const keysRes = await apiClient.get('/settings/exchange');
       if (keysRes.data) setRegisteredKeys(keysRes.data);
+      showToast(`${exchange} connection removed.`, 'info');
     } catch (err) {
       if (err.response && err.response.status === 409) {
         setPopupConfig({ type: 'delete', exchange });
       } else {
-        alert('Delete failed: ' + (err.response?.data?.error || err.message));
+        showToast('Delete failed: ' + (err.response?.data?.error || err.message), 'error');
       }
     }
   };
@@ -154,8 +166,9 @@ export const Settings = () => {
       }
       const keysRes = await apiClient.get('/settings/exchange');
       if (keysRes.data) setRegisteredKeys(keysRes.data);
+      showToast(`Exchange ${popupConfig.exchange} updated.`, 'success');
     } catch (err) {
-      alert('Action failed: ' + (err.response?.data?.error || err.message));
+      showToast('Action failed: ' + (err.response?.data?.error || err.message), 'error');
     } finally {
       setPopupConfig(null);
       setSaving(false);
@@ -175,7 +188,7 @@ export const Settings = () => {
     setSaving(true);
     try {
       await apiClient.post('/settings/parameters', {
-        StrategyName: "PremiumStrategy",
+        StrategyName: 'PremiumStrategy',
         UsePercentParams: params.usePercentParams,
         MinTargetProfit: parseFloat(params.minTargetProfitUsd),
         MaxStopLoss: parseFloat(params.maxStopLossUsd),
@@ -184,11 +197,14 @@ export const Settings = () => {
         MaxAcceptableSpread: parseFloat(params.maxAcceptableSpread),
         CapitalLimitUsd: parseFloat(params.capitalLimitUsd),
         MaxRiskScore: parseFloat(params.maxRiskScore),
-        RiskMultiplier: parseFloat(params.riskMultiplier)
+        RiskMultiplier: parseFloat(params.riskMultiplier),
+        RebalanceTriggerSkew: parseFloat(params.rebalanceTriggerSkewPct) / 100.0,
+        RebalanceTargetSkew: parseFloat(params.rebalanceTargetSkewPct) / 100.0,
+        RebalanceMaxPremium: parseFloat(params.rebalanceMaxPremiumPct) / 100.0
       });
-      alert('Trading parameters updated!');
+      showToast('Trading & Auto-Rebalancing parameters updated!', 'success');
     } catch (err) {
-      alert('Failed to save parameters');
+      showToast('Failed to save parameters.', 'error');
     } finally {
       setSaving(false);
     }
@@ -208,9 +224,9 @@ export const Settings = () => {
         EnableStrategicSwitching: profile.enableStrategicSwitching,
         SwitchingProfitMultiplier: parseFloat(profile.switchingProfitMultiplier)
       });
-      alert('Profile & AI Settings updated!');
+      showToast('Profile & AI Portfolio Settings updated!', 'success');
     } catch (err) {
-      alert('Failed to save profile');
+      showToast('Failed to save profile settings.', 'error');
     } finally {
       setSaving(false);
     }
@@ -222,7 +238,7 @@ export const Settings = () => {
     <div className="settings-page animate-fade-in delay-100">
       <header className="page-header mb-lg">
         <h1 className="text-2xl font-bold">Trading Configuration</h1>
-        <p className="text-secondary mt-xs">Manage your exchange connections, algorithm risk parameters, and notifications.</p>
+        <p className="text-secondary mt-xs">Manage your exchange connections, delta-neutral rebalancing parameters, and notifications.</p>
       </header>
 
       <div className="settings-layout">
@@ -233,17 +249,16 @@ export const Settings = () => {
               <Key size={18} /> Exchange Connections
             </button>
             <button className={`settings-tab ${activeTab === 'params' ? 'active' : ''}`} onClick={() => setActiveTab('params')}>
-              <Sliders size={18} /> Trade Parameters
+              <Sliders size={18} /> Trade & Skew Parameters
             </button>
             <button className={`settings-tab ${activeTab === 'profile' ? 'active' : ''}`} onClick={() => setActiveTab('profile')}>
-              <Bell size={18} /> Webhooks & Alerts
+              <Bell size={18} /> Webhooks & AI Portfolio
             </button>
           </nav>
         </div>
 
         {/* Tab Content Area */}
         <div className="settings-content">
-
           {activeTab === 'exchange' && (
             <div className="settings-card glass-panel p-xl animate-fade-in">
               <div className="flex-between mb-md">
@@ -275,7 +290,6 @@ export const Settings = () => {
                         )}
                       </div>
 
-                      {/* Warnings */}
                       {!ex.is_valid && (
                         <div className="text-red-400 text-xs mt-2 flex items-center gap-1">
                           <XCircle size={14} className="flex-shrink-0" /> {ex.error_msg || 'API Key is invalid or lacks necessary permissions.'}
@@ -386,7 +400,7 @@ export const Settings = () => {
 
           {activeTab === 'params' && (
             <div className="settings-card glass-panel p-xl animate-fade-in">
-              <h2 className="settings-h2 text-xl font-semibold mb-lg">Arbitrage Parameters</h2>
+              <h2 className="settings-h2 text-xl font-semibold mb-lg">Arbitrage & Risk Parameters</h2>
               <form onSubmit={handleSaveParams} className="flex flex-col max-w-lg">
                 <div className="flex-between mb-lg">
                   <div>
@@ -445,7 +459,7 @@ export const Settings = () => {
 
                 <div className="form-group">
                   <label className="text-sm font-semibold block mb-xs">Max Acceptable Slippage (Spread %)</label>
-                  <p className="form-help-text mb-sm">The maximum allowed difference between the expected API price and the actual executed market price. Keeps you safe from flash crashes.</p>
+                  <p className="form-help-text mb-sm">Maximum allowed difference between expected quote and actual executed market fill.</p>
                   <input
                     type="number" step="0.001" min="0" required
                     value={params.maxAcceptableSpread}
@@ -456,7 +470,7 @@ export const Settings = () => {
 
                 <div className="form-group mb-md">
                   <label className="text-sm font-semibold block mb-xs">Capital Allocation Limit (USD)</label>
-                  <p className="form-help-text mb-sm">The maximum USD equivalent of exposure the bot is allowed to allocate simultaneously for this strategy.</p>
+                  <p className="form-help-text mb-sm">Maximum USD equivalent of exposure the bot is allowed to allocate simultaneously.</p>
                   <input
                     type="number" step="1" min="10" required
                     value={params.capitalLimitUsd}
@@ -467,7 +481,7 @@ export const Settings = () => {
 
                 <div className="form-group mb-md">
                   <label className="text-sm font-semibold block mb-xs">Max AI Risk Score</label>
-                  <p className="form-help-text mb-sm">Opportunities yielding a Risk Score higher than this soft limit are ignored.</p>
+                  <p className="form-help-text mb-sm">Opportunities yielding a Risk Score higher than this limit are ignored.</p>
                   <input
                     type="number" step="0.1" min="1" max="100" required
                     value={params.maxRiskScore}
@@ -483,6 +497,49 @@ export const Settings = () => {
                     type="number" step="0.1" min="0" required
                     value={params.riskMultiplier}
                     onChange={e => setParams({ ...params, riskMultiplier: e.target.value })}
+                    className="form-input w-full max-w-xs"
+                  />
+                </div>
+
+                <div className="separator mb-lg"></div>
+
+                {/* 100% Delta-Neutral Auto-Rebalancing Section */}
+                <h3 className="text-lg font-semibold mb-sm flex items-center gap-sm">
+                  <Scale size={18} className="text-blue-400" /> 100% Delta-Neutral Capital Rebalancing
+                </h3>
+                <p className="form-help-text mb-lg">
+                  When Transfer Arbitrage (Strategy C) shifts quote capital from Foreign (USD) to Base (KRW), the Engine automatically executes a hedged reverse transfer (Base Spot Buy + Foreign 1x Short → Transfer → Foreign Sell + Close Short) once the Dual-Trigger conditions below are met.
+                </p>
+
+                <div className="form-group mb-md">
+                  <label className="text-sm font-semibold block mb-xs">Rebalance Trigger Foreign Share (%)</label>
+                  <p className="form-help-text mb-sm">Trigger auto-rebalancing when Foreign USD balance falls below this percentage of total portfolio equity (Default: 20%).</p>
+                  <input
+                    type="number" step="1" min="5" max="45" required
+                    value={params.rebalanceTriggerSkewPct}
+                    onChange={e => setParams({ ...params, rebalanceTriggerSkewPct: e.target.value })}
+                    className="form-input w-full max-w-xs"
+                  />
+                </div>
+
+                <div className="form-group mb-md">
+                  <label className="text-sm font-semibold block mb-xs">Rebalance Target Foreign Share (%)</label>
+                  <p className="form-help-text mb-sm">Target Foreign USD share to restore during hedged reverse transfer (Default: 50% for 50:50 balance).</p>
+                  <input
+                    type="number" step="1" min="30" max="70" required
+                    value={params.rebalanceTargetSkewPct}
+                    onChange={e => setParams({ ...params, rebalanceTargetSkewPct: e.target.value })}
+                    className="form-input w-full max-w-xs"
+                  />
+                </div>
+
+                <div className="form-group mb-lg">
+                  <label className="text-sm font-semibold block mb-xs">Max Rebalance Spread / Premium (%)</label>
+                  <p className="form-help-text mb-sm">Only execute reverse transfer when the Base-vs-Foreign premium is at or below this threshold (e.g., 0.0% break-even or negative reverse premium).</p>
+                  <input
+                    type="number" step="0.1" min="-5.0" max="2.0" required
+                    value={params.rebalanceMaxPremiumPct}
+                    onChange={e => setParams({ ...params, rebalanceMaxPremiumPct: e.target.value })}
                     className="form-input w-full max-w-xs"
                   />
                 </div>
@@ -518,16 +575,15 @@ export const Settings = () => {
 
                 <div className="separator mb-lg"></div>
 
-                <h2 className="settings-h2 text-xl font-semibold mb-lg mt-md">AI Portfolio Management (Phase 3)</h2>
-                
+                <h2 className="settings-h2 text-xl font-semibold mb-lg mt-md">AI Portfolio Management</h2>
+
                 <div className="flex flex-col gap-xl mb-xl">
-                  {/* Partial Exit (Scale Out) Settings */}
                   <div className="form-group">
                     <div className="flex-between mb-xs">
                       <h4 className="font-semibold text-sm">Partial Exit (Scale-Out) Mode</h4>
                     </div>
                     <p className="form-help-text mb-sm">
-                      Should the bot sell a fixed 50% fraction on a SCALE_OUT signal, or dynamically reduce weight based on the AI confidence drop?
+                      Should the bot sell a fixed fraction on a SCALE_OUT signal, or dynamically reduce weight based on the AI target weight?
                     </p>
                     <select
                       value={profile.partialExitMode}
@@ -552,12 +608,11 @@ export const Settings = () => {
                     </div>
                   )}
 
-                  {/* Strategic Switching */}
                   <div className="form-group mt-md">
                     <div className="flex-between mb-xs">
                       <div>
                         <h4 className="font-semibold text-sm">Enable Strategic Opportunity Switching</h4>
-                        <p className="text-xs text-muted mt-xs">Allow the AI to close a profitable position early if a vastly superior arbitrage opportunity is discovered globally.</p>
+                        <p className="text-xs text-muted mt-xs">Allow the AI to rotate capital early if a vastly superior arbitrage opportunity is discovered globally.</p>
                       </div>
                       <Toggle checked={profile.enableStrategicSwitching} onChange={e => setProfile({ ...profile, enableStrategicSwitching: e.target.checked })} />
                     </div>
@@ -609,9 +664,8 @@ export const Settings = () => {
               </form>
             </div>
           )}
-
         </div>
-      </div >
+      </div>
 
       {/* Popups */}
       {popupConfig && (
@@ -666,6 +720,7 @@ export const Settings = () => {
           </div>
         </div>
       )}
+
       {/* noVNC Browser Session Modal */}
       {showNoVNCModal && (
         <div className="fixed inset-0 bg-black/80 flex-center z-50 p-lg">
@@ -696,6 +751,6 @@ export const Settings = () => {
           </div>
         </div>
       )}
-    </div >
+    </div>
   );
 };
