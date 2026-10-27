@@ -8,7 +8,6 @@ export const AuthProvider = ({ children }) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Attempt to hydrate user from token on load
     const token = localStorage.getItem('magnolia_token');
     if (token) {
       apiClient.get('/auth/me')
@@ -28,6 +27,15 @@ export const AuthProvider = ({ children }) => {
     const { token, user: userData } = res.data;
     localStorage.setItem('magnolia_token', token);
     setUser(userData);
+    return userData;
+  };
+
+  const register = async (email, password, region = 'KR') => {
+    const res = await apiClient.post('/auth/register', { email, password, region });
+    const { token, user: userData } = res.data;
+    localStorage.setItem('magnolia_token', token);
+    setUser(userData);
+    return userData;
   };
 
   const logout = () => {
@@ -36,10 +44,17 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, logout, isAuthenticated: !!user, loading }}>
+    <AuthContext.Provider value={{ user, login, register, logout, isAuthenticated: !!user, loading }}>
       {children}
     </AuthContext.Provider>
   );
 };
 
 export const useAuth = () => useContext(AuthContext);
+
+export const buildSseUrl = (path) => {
+  const token = localStorage.getItem('magnolia_token') || '';
+  const baseHost = import.meta.env?.VITE_API_BASE_URL || '';
+  const separator = path.includes('?') ? '&' : '?';
+  return `${baseHost}${path}${separator}token=${encodeURIComponent(token)}`;
+};

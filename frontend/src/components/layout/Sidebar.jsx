@@ -1,17 +1,25 @@
 import React from 'react';
-import { NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Settings, Activity, History, LogOut } from 'lucide-react';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { LayoutDashboard, Settings, Activity, History, LogOut, Shield } from 'lucide-react';
+import { useAuth } from '../../contexts/AuthContext';
 import './Sidebar.css';
 
 const navItems = [
-  { path: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={20} /> },
-  { path: '/opportunities', label: 'Opportunities', icon: <Activity size={20} /> },
-  { path: '/history', label: 'History', icon: <History size={20} /> },
-  { path: '/settings', label: 'Settings', icon: <Settings size={20} /> },
+  { path: '/dashboard', label: 'Control Center', icon: <LayoutDashboard size={20} /> },
+  { path: '/opportunities', label: 'Global Scanner', icon: <Activity size={20} /> },
+  { path: '/history', label: 'Trade History', icon: <History size={20} /> },
+  { path: '/settings', label: 'Configuration', icon: <Settings size={20} /> },
 ];
 
 export const Sidebar = () => {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { user, logout } = useAuth();
+
+  const handleLogout = () => {
+    logout();
+    navigate('/auth', { replace: true });
+  };
 
   return (
     <aside className="sidebar glass-panel animate-slide-up">
@@ -19,7 +27,10 @@ export const Sidebar = () => {
         <div className="logo-container animate-pulse">
           <div className="logo-orb"></div>
         </div>
-        <h1 className="logo-text text-gradient">Magnolia</h1>
+        <div>
+          <h1 className="logo-text text-gradient">Magnolia</h1>
+          <div className="sidebar-subtitle">Delta-Neutral AI</div>
+        </div>
       </div>
 
       <nav className="sidebar-nav">
@@ -36,8 +47,21 @@ export const Sidebar = () => {
       </nav>
 
       <div className="sidebar-footer">
-        <button className="logout-btn animate-fade-in delay-500">
-          <LogOut size={20} />
+        {user && (
+          <div className="sidebar-user-card">
+            <div className="sidebar-user-info">
+              <div className="sidebar-user-email" title={user.email}>
+                {user.email}
+              </div>
+              <div className="sidebar-user-meta">
+                <Shield size={11} />
+                <span>Region: {user.region || 'KR'}</span>
+              </div>
+            </div>
+          </div>
+        )}
+        <button className="logout-btn animate-fade-in delay-500" onClick={handleLogout}>
+          <LogOut size={18} />
           <span>Sign Out</span>
         </button>
       </div>
