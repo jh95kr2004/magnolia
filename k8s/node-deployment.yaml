@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magnolia-node
+  labels:
+    app: magnolia-node
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  
+  selector:
+    matchLabels:
+      app: magnolia-node
+  template:
+    metadata:
+      labels:
+        app: magnolia-node
+    spec:
+      containers:
+      - name: node
+        image: magnolia-node:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50051
+        env:
+        - name: MASTER_ADDR
+          value: "master-service:50051"
+        - name: REGION
+          value: "KR"
+        - name: POSTGRES_DSN
+          value: "host=postgres-service user=magnolia_user password=magnolia_password dbname=magnolia_db port=5432 sslmode=disable"
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/0"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "echo 'Initiating Node Graceful Shutdown. Rejecting new trades.' && sleep 120"]
