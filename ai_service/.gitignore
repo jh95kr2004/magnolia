@@ -174,8 +174,9 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
-# Trained models
-model/weights
+# Trained models (keep evaluation report JSON tracked)
+model/weights/*
+!model/weights/eval_report.json
 
 # Logs
 logs/

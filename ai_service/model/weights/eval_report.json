@@ -1,0 +1,139 @@
+{
+  "forecaster": {
+    "evaluated_at": "2026-10-27T19:38:08.124198+00:00",
+    "dataset_path": "data/historical_dump.csv",
+    "total_rows": 85610,
+    "validation_rows": 17122,
+    "evaluated_sequences": 15203,
+    "seq_len_minutes": 1440,
+    "pred_len_minutes": 480,
+    "horizons": {
+      "1h": {
+        "horizon_minutes": 60,
+        "mae_pct": 0.2203,
+        "rmse_pct": 0.3781,
+        "naive_mae_pct": 0.2217,
+        "naive_rmse_pct": 0.3817,
+        "skill_score_mae_pct": 0.61,
+        "skill_score_rmse_pct": 0.96,
+        "directional_accuracy_all_pct": 54.17,
+        "directional_accuracy_significant_pct": 54.64
+      },
+      "4h": {
+        "horizon_minutes": 240,
+        "mae_pct": 0.4213,
+        "rmse_pct": 0.6273,
+        "naive_mae_pct": 0.432,
+        "naive_rmse_pct": 0.6467,
+        "skill_score_mae_pct": 2.47,
+        "skill_score_rmse_pct": 3.01,
+        "directional_accuracy_all_pct": 57.41,
+        "directional_accuracy_significant_pct": 58.28
+      },
+      "full_horizon": {
+        "horizon_minutes": 480,
+        "mae_pct": 0.5867,
+        "rmse_pct": 0.8078,
+        "naive_mae_pct": 0.6183,
+        "naive_rmse_pct": 0.8532,
+        "skill_score_mae_pct": 5.12,
+        "skill_score_rmse_pct": 5.32,
+        "directional_accuracy_all_pct": 58.57,
+        "directional_accuracy_significant_pct": 59.65
+      }
+    },
+    "summary_features_mae_pct": {
+      "window_mean_spread_mae_pct": 0.4866,
+      "window_max_spread_mae_pct": 0.9339,
+      "window_min_spread_mae_pct": 0.8214
+    }
+  },
+  "rl_agent_benchmark": {
+    "evaluated_at": "2026-10-27T19:39:50.244632+00:00",
+    "test_period_minutes": 17122,
+    "test_period_days": 11.89,
+    "friction_assumptions": {
+      "base_fee_rate": 0.0005,
+      "foreign_fee_rate": 0.002,
+      "slippage": 0.0005,
+      "execution_threshold": 0.1
+    },
+    "models": {
+      "full_magnolia_ai": {
+        "strategy_name": "Full Magnolia AI (8h Forecaster + PPO Agent)",
+        "initial_capital_usd": 10000.0,
+        "final_equity_usd": 12600.67,
+        "net_profit_usd": 2600.67,
+        "net_roi_pct": 26.007,
+        "max_drawdown_pct": 1.068,
+        "sharpe_ratio": 27.808,
+        "sortino_ratio": 59.691,
+        "total_trades": 149,
+        "closed_round_trips": 74,
+        "win_rate_pct": 100.0,
+        "transfer_arbitrage_cycles": 42,
+        "reverse_rebalance_events": 6,
+        "final_foreign_usd_skew_pct": 22.08,
+        "vetoed_entries": 0,
+        "total_fees_paid_usd": 584.35,
+        "total_funding_pnl_usd": 0.37,
+        "state_residence_pct": {
+          "NEUTRAL_HOLD": 29.09,
+          "CONVERGENCE_HEDGE_ABDE": 68.71,
+          "TRANSFERRING_C": 1.96,
+          "REPAYING_C": 0.25
+        }
+      },
+      "rl_only_ablation": {
+        "strategy_name": "RL-Only Ablation (PPO w/o Forecaster)",
+        "initial_capital_usd": 10000.0,
+        "final_equity_usd": 10668.09,
+        "net_profit_usd": 668.09,
+        "net_roi_pct": 6.681,
+        "max_drawdown_pct": 1.533,
+        "sharpe_ratio": 8.065,
+        "sortino_ratio": 11.365,
+        "total_trades": 45,
+        "closed_round_trips": 22,
+        "win_rate_pct": 100.0,
+        "transfer_arbitrage_cycles": 0,
+        "reverse_rebalance_events": 0,
+        "final_foreign_usd_skew_pct": 50.0,
+        "vetoed_entries": 0,
+        "total_fees_paid_usd": 246.64,
+        "total_funding_pnl_usd": 0.88,
+        "state_residence_pct": {
+          "NEUTRAL_HOLD": 32.63,
+          "CONVERGENCE_HEDGE_ABDE": 67.37,
+          "TRANSFERRING_C": 0.0,
+          "REPAYING_C": 0.0
+        }
+      },
+      "rule_based_baseline": {
+        "strategy_name": "Rule-Based Static Threshold Bot",
+        "initial_capital_usd": 10000.0,
+        "final_equity_usd": 10903.63,
+        "net_profit_usd": 903.63,
+        "net_roi_pct": 9.036,
+        "max_drawdown_pct": 1.529,
+        "sharpe_ratio": 10.733,
+        "sortino_ratio": 15.478,
+        "total_trades": 53,
+        "closed_round_trips": 26,
+        "win_rate_pct": 100.0,
+        "transfer_arbitrage_cycles": 0,
+        "reverse_rebalance_events": 0,
+        "final_foreign_usd_skew_pct": 50.0,
+        "vetoed_entries": 0,
+        "total_fees_paid_usd": 284.21,
+        "total_funding_pnl_usd": 0.89,
+        "state_residence_pct": {
+          "NEUTRAL_HOLD": 30.37,
+          "CONVERGENCE_HEDGE_ABDE": 69.63,
+          "TRANSFERRING_C": 0.0,
+          "REPAYING_C": 0.0
+        }
+      }
+    }
+  }
+}
