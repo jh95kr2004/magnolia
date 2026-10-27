@@ -35,12 +35,15 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/auth/me", s.AuthMiddleware(s.handleMe))
 
 	// 2. Settings Service Routes (Protected)
-	mux.HandleFunc("/api/settings/exchange", s.AuthMiddleware(s.handleExchangeKeySubmit))          // POST, GET
-	mux.HandleFunc("/api/settings/exchange/delete", s.AuthMiddleware(s.handleExchangeKeyDelete))   // POST
-	mux.HandleFunc("/api/settings/exchange/toggle", s.AuthMiddleware(s.handleExchangeKeyToggle))   // POST
+	mux.HandleFunc("/api/settings/exchange", s.AuthMiddleware(s.handleExchangeKeySubmit))            // POST, GET
+	mux.HandleFunc("/api/settings/exchange/delete", s.AuthMiddleware(s.handleExchangeKeyDelete))     // POST
+	mux.HandleFunc("/api/settings/exchange/toggle", s.AuthMiddleware(s.handleExchangeKeyToggle))     // POST
 	mux.HandleFunc("/api/settings/supported_exchanges", s.AuthMiddleware(s.handleSupportedExchanges)) // GET
-	mux.HandleFunc("/api/settings/parameters", s.AuthMiddleware(s.handleAlgoParameters))           // POST, GET
-	mux.HandleFunc("/api/settings/profile", s.AuthMiddleware(s.handleSettingsProfile))             // POST, GET
+	mux.HandleFunc("/api/settings/parameters", s.AuthMiddleware(s.handleAlgoParameters))             // POST, GET
+	mux.HandleFunc("/api/settings/profile", s.AuthMiddleware(s.handleSettingsProfile))               // POST, GET
+	mux.HandleFunc("/api/settings/bot_status", s.AuthMiddleware(s.handleBotStatus))                  // POST, GET
+	mux.HandleFunc("/api/settings/sim_offset", s.AuthMiddleware(s.handleSimOffset))                  // POST, GET
+	mux.HandleFunc("/api/settings/paper_reset", s.AuthMiddleware(s.handlePaperReset))                // POST
 
 	// 3. Trading & Positions Routes (Protected)
 	mux.HandleFunc("/api/positions/active", s.AuthMiddleware(s.handleActivePositions))        // GET

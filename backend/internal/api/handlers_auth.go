@@ -105,9 +105,15 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create Default Settings
 	err := s.DB.SaveUserSettings(&postgres.UserSettings{
-		UserID: user.ID,
-		NotifyOnEntry: true,
-		NotifyOnExit: true,
+		UserID:           user.ID,
+		NotifyOnEntry:    true,
+		NotifyOnExit:     true,
+		ActiveViewMode:   "PAPER",
+		PaperBotStatus:   "RUNNING",
+		LiveBotStatus:    "STOPPED",
+		PaperUpbitKRW:    50000000.0,
+		PaperCoinbaseUSD: 35000.0,
+		SimExchange:      "UPBIT",
 	})
 	if err != nil {
 		http.Error(w, `{"error": "Could not bootstrap profile"}`, http.StatusInternalServerError)
@@ -156,6 +162,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if user.EngineNodeID == "" && s.Redis != nil {
+		_ = s.Redis.PushDanglingClient(context.Background(), user.Region, fmt.Sprint(user.ID))
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token": fmt.Sprintf("magnolia-token-%d", user.ID),
@@ -176,6 +186,10 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "User missing"}`, http.StatusNotFound)
 			return
 		}
+	}
+
+	if user.EngineNodeID == "" && s.Redis != nil {
+		_ = s.Redis.PushDanglingClient(context.Background(), user.Region, fmt.Sprint(user.ID))
 	}
 
 	w.Header().Set("Content-Type", "application/json")

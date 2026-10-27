@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// handleActivePositions lists all currently open positions for the authenticated user
+// handleActivePositions lists all currently open positions for the authenticated user and requested mode (PAPER or LIVE)
 func (s *Server) handleActivePositions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -15,7 +15,16 @@ func (s *Server) handleActivePositions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := getUserIDFromContext(r)
-	positions, err := s.DB.GetActivePositionsByUser(userID)
+	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+	if mode != "PAPER" && mode != "LIVE" {
+		if settings, err := s.DB.GetUserSettings(userID); err == nil && settings != nil && settings.ActiveViewMode != "" {
+			mode = strings.ToUpper(settings.ActiveViewMode)
+		} else {
+			mode = "PAPER"
+		}
+	}
+
+	positions, err := s.DB.GetActivePositionsByUserAndMode(userID, mode == "PAPER")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -25,7 +34,7 @@ func (s *Server) handleActivePositions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(positions)
 }
 
-// handlePositionHistory queries closed positions for the authenticated user
+// handlePositionHistory queries closed positions for the authenticated user (optionally filtered by ?mode=PAPER|LIVE|ALL)
 func (s *Server) handlePositionHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -33,6 +42,18 @@ func (s *Server) handlePositionHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := getUserIDFromContext(r)
+	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+	if mode == "PAPER" || mode == "LIVE" {
+		positions, err := s.DB.GetClosedPositionsByUserAndMode(userID, mode == "PAPER")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(positions)
+		return
+	}
+
 	positions, err := s.DB.GetClosedPositionsByUser(userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -44,7 +65,7 @@ func (s *Server) handlePositionHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleForceClose dispatches a FORCE_CLOSE command over Redis to the user's Engine goroutine
-// so real exchange exit orders and loan repayments are executed safely.
+// so real or paper exchange exit orders and loan repayments are executed safely.
 func (s *Server) handleForceClose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -63,9 +84,12 @@ func (s *Server) handleForceClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+
 	cmdPayload, _ := json.Marshal(map[string]interface{}{
 		"action":      "FORCE_CLOSE",
 		"position_id": posID,
+		"mode":        mode,
 	})
 
 	if s.Redis != nil {
@@ -85,8 +109,8 @@ func (s *Server) handleForceClose(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"message": "Force close command dispatched to Strategy Engine"}`))
 }
 
-// handleForceEnter dispatches a FORCE_ENTER command over Redis to the user's Engine goroutine
-// to execute real atomic dual-leg orders.
+// handleForceEnter dispatches a FORCE_ENTER command over Redis to the user's target Engine goroutine (PAPER or LIVE)
+// to execute atomic dual-leg orders.
 func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -95,6 +119,7 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 
 	userID := getUserIDFromContext(r)
 	var req struct {
+		Mode            string  `json:"mode"`
 		BaseExchange    string  `json:"base_exchange"`
 		ForeignExchange string  `json:"foreign_exchange"`
 		BaseSymbol      string  `json:"base_symbol"`
@@ -111,6 +136,18 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode := strings.ToUpper(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+	}
+	if mode != "PAPER" && mode != "LIVE" {
+		if settings, err := s.DB.GetUserSettings(userID); err == nil && settings != nil && settings.ActiveViewMode != "" {
+			mode = strings.ToUpper(settings.ActiveViewMode)
+		} else {
+			mode = "PAPER"
+		}
+	}
+
 	baseSym := req.BaseSymbol
 	if baseSym == "" {
 		baseSym = req.Symbol
@@ -122,6 +159,7 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 
 	cmdPayload, _ := json.Marshal(map[string]interface{}{
 		"action":           "FORCE_ENTER",
+		"mode":             mode,
 		"base_exchange":    req.BaseExchange,
 		"foreign_exchange": req.ForeignExchange,
 		"base_symbol":      baseSym,
