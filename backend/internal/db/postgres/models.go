@@ -99,6 +99,9 @@ type UserThreshold struct {
 	MaxRiskScore           float64                                           // Maximum allowed AI Risk Score threshold (e.g. 50.0)
 	RiskMultiplier         float64                                           // Configurable multiplier weight amplifying the Risk Score formula
 	BalanceSkewThreshold   float64                                           // Custom threshold to deter transfer looping (e.g. 0.15)
+	RebalanceTriggerSkew   float64   `gorm:"default:0.20"`                   // Trigger reverse rebalancing when Foreign USD share drops <= this (e.g. 0.20)
+	RebalanceTargetSkew    float64   `gorm:"default:0.50"`                   // Stop reverse rebalancing once Foreign USD share reaches this target (e.g. 0.50)
+	RebalanceMaxPremium    float64   `gorm:"default:0.0"`                    // Max premium allowed to execute reverse rebalancing (e.g. 0.0 for <= 0%)
 	RetryOnFailure         bool                                              // Toggle execution atomic rollback retries on failure
 	CreatedAt              time.Time
 	UpdatedAt              time.Time

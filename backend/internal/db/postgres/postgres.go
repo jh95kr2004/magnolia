@@ -63,6 +63,13 @@ func (db *DB) GetUserByEmail(email string) (*User, error) {
 	return &user, err
 }
 
+// GetUserByID finds a user by their primary ID.
+func (db *DB) GetUserByID(userID uint) (*User, error) {
+	var user User
+	err := db.conn.First(&user, userID).Error
+	return &user, err
+}
+
 // AssignEngineNode locks a user to a specific tracking engine node.
 func (db *DB) AssignEngineNode(userID uint, nodeID string) error {
 	return db.conn.Model(&User{}).Where("id = ?", userID).Update("engine_node_id", nodeID).Error
