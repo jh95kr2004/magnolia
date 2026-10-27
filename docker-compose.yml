@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: magnolia_postgres
+    environment:
+      POSTGRES_USER: magnolia_user
+      POSTGRES_PASSWORD: magnolia_password
+      POSTGRES_DB: magnolia_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: magnolia_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: magnolia_admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: magnolia_password123
+      DOCKER_INFLUXDB_INIT_ORG: magnolia
+      DOCKER_INFLUXDB_INIT_BUCKET: market_data
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: magnolia_admin_secret_token_123
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: magnolia_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  browser_session:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: magnolia_browser_session
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Asia/Seoul
+      CHROME_CLI: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --user-data-dir=/config/chrome-profile https://upbit.com/staking/lending"
+    ports:
+      - "6080:3000"
+      - "9222:9222"
+    volumes:
+      - browser_profile_data:/config
+    shm_size: "1gb"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  influxdb_data:
+  redis_data:
+  browser_profile_data:
