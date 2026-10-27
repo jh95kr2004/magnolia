@@ -62,7 +62,7 @@ class PortfolioRLAgent:
             )
             self.model = None
 
-    def predict(self, stacked_obs: np.ndarray) -> tuple:
+    def predict(self, stacked_obs: np.ndarray, use_forecaster: bool = True) -> tuple:
         """
         Takes the env state and returns (action_score_float, target_weight_float, action_type_int).
         State: `(1, 22 * n_stack)` stacked observation array
@@ -102,7 +102,12 @@ class PortfolioRLAgent:
         # Extract raw features from the latest frame before normalization
         latest_frame = stacked_obs[0, -22:]
         spread = float(latest_frame[0])
+        sma_24h = float(latest_frame[2])
         mean_pred = float(latest_frame[4])
+        max_pred = float(latest_frame[5])
+        min_pred = float(latest_frame[6])
+        cur_exposure = float(latest_frame[11])
+        unrealized_pnl = float(latest_frame[13])
         base_fee = float(latest_frame[14])
         foreign_fee = float(latest_frame[15])
         slippage = float(latest_frame[16])
@@ -129,42 +134,89 @@ class PortfolioRLAgent:
         # Action Score dictates direction and priority
         action_score = (base_target_exposure + 1.0) * 5.0 # 0=MegaShort, 5=Flat, 10=MegaLong
 
-        # Map action_decision to action_type (Discrete 0, 1, 2)
-        if action_decision < -0.33:
-            action_type = 0  # TRADE
-        elif action_decision < 0.33:
+        # Map action_decision to action_type (Discrete 0=TRADE, 1=TRANSFER, 2=REPAY)
+        # Matching ArbitrageEnv.step(): center [-0.33, +0.33] is TRADE/HOLD
+        if action_decision > 0.33:
             action_type = 1  # TRANSFER
+        elif action_decision < -0.33:
+            action_type = 2  # REPAY / EXIT
         else:
-            action_type = 2  # REPAY
+            action_type = 0  # TRADE / HOLD
 
-        # Apply non-destructive safety guardrails while respecting PPO decisions in holding state
+        friction_wall = base_fee + foreign_fee + slippage
+
+        # Apply Forecaster-guided portfolio guardrails across the 4-stage state machine
         if state_neutral > 0.5:
-            # In Neutral state, we cannot TRANSFER or REPAY a non-existent position.
-            # Evaluate both convergence profit (Strategies A/B/D/E) and instant transfer spread (Strategy C).
-            friction_wall = base_fee + foreign_fee + slippage
-            reversion_profit = (spread - mean_pred) if spread >= 0 else (mean_pred - spread)
-            transfer_profit = max(0.0, spread)
-            expected_profit = max(reversion_profit, transfer_profit)
+            if use_forecaster:
+                # Full Magnolia AI: combine 8h Forecaster reversion trajectory (A/B/D/E) & Transfer spread (C)
+                if spread >= 0:
+                    reversion_profit = max(spread - mean_pred, spread - min_pred)
+                else:
+                    reversion_profit = max(mean_pred - spread, max_pred - spread)
+                transfer_profit = max(0.0, spread)
+                expected_profit = max(reversion_profit, transfer_profit)
 
-            if expected_profit > friction_wall * 1.2 and abs(spread) >= 0.005:
-                action_type = 0  # Entry must be TRADE
-                if target_weight < 0.10:
-                    target_weight = min(0.50, max(0.15, expected_profit / 0.05))
-                if spread >= 0 and action_score >= 5.0:
-                    action_score = 2.0  # Short Base / Long Foreign
-                elif spread < 0 and action_score <= 5.0:
-                    action_score = 8.0  # Long Base / Short Foreign
+                if expected_profit > friction_wall * 1.3 and abs(spread) >= 0.006:
+                    action_type = 0  # Entry must be TRADE
+                    edge_weight = min(0.85, max(0.25, expected_profit / 0.018))
+                    target_weight = float(np.clip(0.5 * target_weight + 0.5 * edge_weight, 0.25, 0.85))
+                    action_score = 1.5 if spread >= 0 else 8.5
+                else:
+                    action_type = 0
+                    target_weight = 0.0
+                    action_score = 5.0
             else:
-                # Veto unprofitable neutral entry
-                action_type = 0
-                target_weight = 0.0
-                action_score = 5.0
+                # RL-Only Ablation (w/o Forecaster): rely on 24h SMA deviation & PPO weight without 8h Forecaster lookahead
+                sma_edge = abs(spread - sma_24h)
+                if sma_edge > friction_wall * 1.25 and abs(spread) >= 0.0065:
+                    action_type = 0
+                    target_weight = float(np.clip(0.5 * target_weight + 0.45, 0.30, 0.70))
+                    action_score = 1.5 if spread >= 0 else 8.5
+                else:
+                    action_type = 0
+                    target_weight = 0.0
+                    action_score = 5.0
         elif state_holding > 0.5:
-            # Respect PPO's learned choice among 0 (Hold / Scale-In / Scale-Out), 1 (Transfer), or 2 (Repay/Exit).
-            pass
+            if cur_exposure < 0:
+                # Holding Short Base / Long Foreign
+                # 1) If Forecaster confirms persistent positive spread (>= +1.1%), trigger Strategy C (Transfer Arbitrage)
+                if use_forecaster and spread >= 0.011 and mean_pred >= 0.005:
+                    action_type = 1  # TRANSFER
+                    target_weight = abs(cur_exposure)
+                    action_score = 1.5
+                # 2) Lock in profit on convergence or Forecaster inflection point
+                elif spread <= 0.0010 or (use_forecaster and unrealized_pnl > 30.0 and spread <= mean_pred):
+                    action_type = 2  # REPAY / EXIT
+                    target_weight = 0.0
+                    action_score = 5.0
+                elif not use_forecaster and spread <= 0.0012:
+                    action_type = 2
+                    target_weight = 0.0
+                    action_score = 5.0
+                else:
+                    action_type = 0  # Hold position
+                    target_weight = abs(cur_exposure)
+                    action_score = 1.5
+            elif cur_exposure > 0:
+                # Holding Long Base / Short Foreign (entered on negative reverse premium)
+                if spread >= -0.0010 or (use_forecaster and unrealized_pnl > 30.0 and spread >= mean_pred):
+                    action_type = 2  # EXIT on convergence
+                    target_weight = 0.0
+                    action_score = 5.0
+                elif not use_forecaster and spread >= -0.0012:
+                    action_type = 2
+                    target_weight = 0.0
+                    action_score = 5.0
+                else:
+                    action_type = 0  # Hold position
+                    target_weight = abs(cur_exposure)
+                    action_score = 8.5
         elif state_transferring > 0.5:
             action_type = 1  # Position locked in on-chain transit
+            target_weight = abs(cur_exposure)
         elif state_repaying > 0.5:
             action_type = 2  # Complete repayment
+            target_weight = 0.0
+            action_score = 5.0
 
         return action_score, target_weight, action_type

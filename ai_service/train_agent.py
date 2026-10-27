@@ -73,7 +73,7 @@ def train_agent(csv_path: str, total_timesteps: int = 500_000, n_stack: int = 15
         "df": train_df,
         "initial_balance": 10000.0,
         "base_fee_rate": 0.0005,
-        "foreign_fee_rate": 0.004,
+        "foreign_fee_rate": 0.002,
         "slippage": 0.0005,
         "execution_threshold": 0.10,
         "randomize_fees": False,  # Disable randomization for cleaner threshold learning
@@ -137,4 +137,10 @@ def train_agent(csv_path: str, total_timesteps: int = 500_000, n_stack: int = 15
 
 
 if __name__ == "__main__":
-    train_agent("data/historical_dump.csv", total_timesteps=300000, n_stack=15)
+    import argparse
+    parser = argparse.ArgumentParser(description="Train PPO Arbitrage Agent")
+    parser.add_argument("--data", type=str, default="data/historical_dump.csv")
+    parser.add_argument("--timesteps", type=int, default=120000)
+    parser.add_argument("--n_stack", type=int, default=15)
+    args = parser.parse_args()
+    train_agent(args.data, total_timesteps=args.timesteps, n_stack=args.n_stack)
