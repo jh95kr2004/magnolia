@@ -1,0 +1,28 @@
+{
+    "target_pairs": [
+        {
+            "local": {
+                "exchange": "upbit",
+                "symbol": "BTC-KRW",
+                "is_future": false
+            },
+            "foreign": {
+                "exchange": "coinbase",
+                "symbol": "BTC-USD",
+                "is_future": false
+            }
+        },
+        {
+            "local": {
+                "exchange": "upbit",
+                "symbol": "ETH-KRW",
+                "is_future": false
+            },
+            "foreign": {
+                "exchange": "binance",
+                "symbol": "ETH-USDT",
+                "is_future": true
+            }
+        }
+    ]
+}
