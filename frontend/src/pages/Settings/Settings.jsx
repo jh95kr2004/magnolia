@@ -20,7 +20,12 @@ export const Settings = () => {
   const [editMode, setEditMode] = useState(false);
   const [popupConfig, setPopupConfig] = useState(null);
   const [showNoVNCModal, setShowNoVNCModal] = useState(searchParams.get('openNoVNC') === '1');
-  const [noVNCUrl, setNoVNCUrl] = useState('http://localhost:6080');
+  const [noVNCUrl, setNoVNCUrl] = useState(() => {
+    if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+      return `${window.location.origin}/novnc/`;
+    }
+    return 'http://localhost:6080';
+  });
   const [apiKeys, setApiKeys] = useState({ exchange: '', access_key: '', secret_key: '' });
   const [params, setParams] = useState({
     usePercentParams: false,
