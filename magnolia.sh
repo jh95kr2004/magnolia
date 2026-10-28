@@ -223,22 +223,28 @@ apply_nginx_conf() {
         return 0
     fi
 
-    if [ "$(id -u)" -eq 0 ]; then
-        cp "$NGINX_CONF_FILE" "$NGINX_SITE_AVAILABLE"
-        ln -sf "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED"
-        nginx -t && systemctl reload nginx
-        log_ok "Nginx reloaded for domain: ${domain}"
-    elif sudo -n true 2>/dev/null; then
-        sudo cp "$NGINX_CONF_FILE" "$NGINX_SITE_AVAILABLE"
-        sudo ln -sf "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED"
-        sudo nginx -t && sudo systemctl reload nginx
-        log_ok "Nginx reloaded for domain: ${domain}"
-    elif [ -t 0 ]; then
+    local ssl_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local run_sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+        run_sudo="sudo"
+    fi
+
+    if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null || [ -t 0 ]; then
         log_info "Applying Nginx config to ${NGINX_SITE_ENABLED} (enter sudo password if prompted)..."
-        if sudo cp "$NGINX_CONF_FILE" "$NGINX_SITE_AVAILABLE" && \
-           sudo ln -sf "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" && \
-           sudo nginx -t && sudo systemctl reload nginx; then
-            log_ok "Nginx reloaded for domain: ${domain}"
+        if $run_sudo cp "$NGINX_CONF_FILE" "$NGINX_SITE_AVAILABLE" && \
+           $run_sudo ln -sf "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" && \
+           $run_sudo nginx -t && $run_sudo systemctl reload nginx; then
+            log_ok "Nginx HTTP config reloaded for domain: ${domain}"
+
+            # Automatically issue & attach Let's Encrypt HTTPS certificate if certbot is installed and cert doesn't exist yet
+            if [ "$domain" != "_" ] && [ "$domain" != "localhost" ] && ! $run_sudo test -f "$ssl_cert" && command -v certbot >/dev/null 2>&1; then
+                log_info "Issuing Let's Encrypt HTTPS certificate for ${domain} via Certbot..."
+                if $run_sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
+                    log_ok "HTTPS (SSL 443) certificate automatically issued and enabled for https://${domain}!"
+                else
+                    log_warn "Certbot HTTPS issuance failed or skipped. HTTP (http://${domain}) remains active."
+                fi
+            fi
         else
             log_warn "Skipped automatic Nginx reload (run './magnolia.sh start ${domain}' in your terminal to enter sudo password)."
         fi
