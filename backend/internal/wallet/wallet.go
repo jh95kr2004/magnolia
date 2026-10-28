@@ -35,4 +35,5 @@ type TransferRequest struct {
 	Amount       float64
 	Network      string
 	ToAddress    string
+	ToTag        string
 }

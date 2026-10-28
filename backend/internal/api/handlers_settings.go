@@ -289,9 +289,9 @@ func computeSimStatusFromSettings(settings *postgres.UserSettings) map[string]in
 	remSec := 0.0
 	isRamping := false
 
-	if settings.SimStartedAt != nil && rampMin > 0 && math.Abs(targetPct-startPct) > 1e-6 {
+	if settings.SimStartedAt > 0 && rampMin > 0 && math.Abs(targetPct-startPct) > 1e-6 {
 		totalSec := rampMin * 60.0
-		elapsedSec := time.Since(*settings.SimStartedAt).Seconds()
+		elapsedSec := time.Since(time.Unix(settings.SimStartedAt, 0)).Seconds()
 		if elapsedSec < 0 {
 			elapsedSec = 0
 		}
@@ -502,12 +502,12 @@ func (s *Server) handleSimOffset(w http.ResponseWriter, r *http.Request) {
 		currOffset = 0.0
 	}
 
-	now := time.Now()
+	now := time.Now().Unix()
 	settings.SimExchange = ex
 	settings.SimStartOffsetPct = currOffset
 	settings.SimTargetOffsetPct = req.TargetOffsetPct
 	settings.SimRampMinutes = req.RampMinutes
-	settings.SimStartedAt = &now
+	settings.SimStartedAt = now
 	_ = s.DB.SaveUserSettings(settings)
 
 	if s.Redis != nil {

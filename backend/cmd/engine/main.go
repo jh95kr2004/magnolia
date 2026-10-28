@@ -29,12 +29,12 @@ func main() {
 
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
-		log.Fatalf("[Engine] ERROR: NODE_ID environment variable is missing!")
+		nodeID = "engine-kr-1"
 	}
 
 	engineRegion := os.Getenv("ENGINE_REGION")
 	if engineRegion == "" {
-		log.Fatalf("[Engine] ERROR: ENGINE_REGION environment variable is missing!")
+		engineRegion = "kr"
 	}
 
 	log.Printf("[Engine] Node ID: %s | Region: %s", nodeID, engineRegion)
