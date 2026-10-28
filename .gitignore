@@ -12,6 +12,8 @@ backend/sandbox_bin
 # Logs and temporary outputs
 *.log
 output.txt
+.magnolia_ai.pid
+.magnolia_domain
 
 # Environment variables and local secrets
 .env

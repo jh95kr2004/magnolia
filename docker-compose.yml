@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -12,6 +10,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U magnolia_user -d magnolia_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   influxdb:
@@ -37,22 +40,111 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   browser_session:
-    image: lscr.io/linuxserver/chromium:latest
+    image: selenium/standalone-chromium:latest
     container_name: magnolia_browser_session
     environment:
-      PUID: 1000
-      PGID: 1000
       TZ: Asia/Seoul
-      CHROME_CLI: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --user-data-dir=/config/chrome-profile https://upbit.com/staking/lending"
+      SE_VNC_NO_PASSWORD: "1"
+      SE_NODE_MAX_SESSIONS: "1"
     ports:
-      - "6080:3000"
+      - "6080:7900"
       - "9222:9222"
-    volumes:
-      - browser_profile_data:/config
     shm_size: "1gb"
+    restart: unless-stopped
+
+  ai:
+    image: ubuntu:latest
+    container_name: magnolia_ai
+    working_dir: /app
+    command: ["/home/jh95kr2004/miniconda3/envs/torch_env/bin/python", "-u", "app.py"]
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: "magnolia_admin_secret_token_123"
+      INFLUX_ORG: "magnolia"
+      INFLUX_BUCKET: "market_data"
+    volumes:
+      - ./ai_service:/app
+      - /home/jh95kr2004/miniconda3:/home/jh95kr2004/miniconda3:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_started
+    restart: unless-stopped
+
+  feed:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.master
+    image: magnolia_master:latest
+    container_name: magnolia_feed
+    command: ["/app/feed"]
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: "magnolia_admin_secret_token_123"
+      INFLUX_ORG: "magnolia"
+      INFLUX_BUCKET: "market_data"
+      ACTIVE_EXCHANGES: "upbit,coinbase"
+      TARGET_COINS: "BTC,ETH"
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_started
+    restart: unless-stopped
+
+  engine:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.master
+    image: magnolia_master:latest
+    container_name: magnolia_engine
+    command: ["/app/engine"]
+    environment:
+      NODE_ID: "engine-kr-1"
+      ENGINE_REGION: "kr"
+      POSTGRES_DSN: "host=postgres user=magnolia_user password=magnolia_password dbname=magnolia_db port=5432 sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      CHROME_CDP_URL: "http://browser_session:9222"
+      TARGET_COINS: "BTC,ETH"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  node:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.node
+    image: magnolia_node:latest
+    container_name: magnolia_node
+    environment:
+      NODE_REGION: "kr"
+      ACTIVE_EXCHANGES: "upbit,coinbase"
+      POSTGRES_DSN: "host=postgres user=magnolia_user password=magnolia_password dbname=magnolia_db port=5432 sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      STATIC_DIR: "/app/frontend/dist"
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
