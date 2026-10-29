@@ -51,6 +51,7 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/positions/history", s.AuthMiddleware(s.handlePositionHistory))       // GET
 	mux.HandleFunc("/api/positions/force_enter", s.AuthMiddleware(s.handleForceEnter))        // POST
 	mux.HandleFunc("/api/portfolio/history", s.AuthMiddleware(s.handlePortfolioHistory))      // GET
+	mux.HandleFunc("/api/opportunities/chart", s.AuthMiddleware(s.handleOpportunityChart))    // GET
 
 	// 4. WebSocket Steaming Endpoints
 	mux.HandleFunc("/api/ws/dashboard", s.WebSocketAuthMiddleware(s.handleDashboardWS))

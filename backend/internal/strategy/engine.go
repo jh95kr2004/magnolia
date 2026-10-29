@@ -915,6 +915,13 @@ type AIPredictedOpportunity struct {
 	ActionType          int     `json:"action_type"`
 	PremiumPct          float64 `json:"premium_pct"`
 	PredictedPremiumPct float64 `json:"predicted_premium_pct"`
+	MeanPremiumPct      float64 `json:"mean_premium_pct"`
+	MaxPremiumPct       float64 `json:"max_premium_pct"`
+	MinPremiumPct       float64 `json:"min_premium_pct"`
+	TargetOffsetMin     int     `json:"target_offset_min"`
+	MaxOffsetMin        int     `json:"max_offset_min"`
+	MinOffsetMin        int     `json:"min_offset_min"`
+	Direction           string  `json:"direction"`
 	Timestamp           float64 `json:"timestamp"`
 }
 
@@ -1112,7 +1119,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						continue
 					}
 
-					// --- ActionType = 0 (TRADE / 진입 및 리밸런싱) ---
+					// --- ActionType = 0 (TRADE / 진입 및 리밸런싱 / Two-Wave 스위칭) ---
 					entryBaseEx := opp.BaseExchange
 					entryForeignEx := opp.ForeignExchange
 					entryBaseSym := opp.BaseSymbol
@@ -1126,8 +1133,30 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						entryPredictedSpread = -opp.PredictedPremiumPct
 					}
 
-					delta := targetDollarVolume - currentExposure
 					toleranceAmount := e.config.CapitalLimitUsd * 0.02
+
+					// Two-Wave Flip: If an open position exists in the OPPOSITE direction of the new AI signal,
+					// immediately close the existing position to lock in Wave 1 profit before entering Wave 2.
+					if matchingPos != nil && matchingPos.Status == "OPEN" && matchingPos.BaseExchange != entryBaseEx && targetDollarVolume > toleranceAmount {
+						log.Printf("🔄 [AI TWO-WAVE FLIP] (%s) User %d flipping %s from (%s -> %s) to (%s -> %s)",
+							e.ModeString(), e.userID, opp.BaseSymbol,
+							matchingPos.BaseExchange, matchingPos.ForeignExchange,
+							entryBaseEx, entryForeignEx)
+
+						flipStrategy := e.findStrategy(StrategyType(matchingPos.Type))
+						flipPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
+						if flipStrategy != nil && flipPair != nil {
+							if err := flipStrategy.ExecuteExit(ctx, e.executor, *flipPair, *matchingPos, 1.0, e.walletProxy); err == nil {
+								_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
+								e.persistPaperState()
+								e.notifyPositionClosed(ctx, matchingPos.PositionID)
+								matchingPos = nil
+								currentExposure = 0.0
+							}
+						}
+					}
+
+					delta := targetDollarVolume - currentExposure
 
 					if delta > toleranceAmount {
 						targetPair := e.findPair(entryBaseEx, entryForeignEx, entryBaseSym)
@@ -1239,9 +1268,17 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 				BaseSymbol          string  `json:"base_symbol"`
 				ForeignSymbol       string  `json:"foreign_symbol"`
 				Strategy            string  `json:"strategy"`
+				Direction           string  `json:"direction"`
+				ActionScore         float64 `json:"action_score"`
 				ExpectedRoi         float64 `json:"expected_roi"`
 				CurrentPremiumPct   float64 `json:"current_premium_pct"`
 				PredictedPremiumPct float64 `json:"predicted_premium_pct"`
+				MeanPremiumPct      float64 `json:"mean_premium_pct"`
+				MaxPremiumPct       float64 `json:"max_premium_pct"`
+				MinPremiumPct       float64 `json:"min_premium_pct"`
+				TargetOffsetMin     int     `json:"target_offset_min"`
+				MaxOffsetMin        int     `json:"max_offset_min"`
+				MinOffsetMin        int     `json:"min_offset_min"`
 				TargetWeight        float64 `json:"target_weight"`
 				RiskScore           float64 `json:"risk_score"`
 				InvestmentUsd       float64 `json:"investment_usd"`
@@ -1255,35 +1292,63 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 					isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
 					isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
 
+					direction := opp.Direction
+					if direction == "" {
+						if opp.ActionScore > 5.0 || opp.PredictedPremiumPct > opp.PremiumPct {
+							direction = "WIDENING"
+						} else {
+							direction = "NARROWING"
+						}
+					}
+					directionalSpreadMove := math.Abs(opp.PremiumPct - opp.PredictedPremiumPct)
+					meanPct := opp.MeanPremiumPct * 100.0
+					if opp.MeanPremiumPct == 0 {
+						meanPct = opp.PredictedPremiumPct * 100.0
+					}
+
 					if isBaseFuture && isForeignFuture {
 						// Strategy E: Future-Future
-						roi := opp.PremiumPct - opp.PredictedPremiumPct
 						dtoList = append(dtoList, FilteredOppDTO{
 							BaseExchange:        opp.BaseExchange,
 							ForeignExchange:     opp.ForeignExchange,
 							BaseSymbol:          opp.BaseSymbol,
 							ForeignSymbol:       opp.ForeignSymbol,
 							Strategy:            "Future-Future (E)",
-							ExpectedRoi:         roi - 0.0005, // minus estimated trading fee rate (0.05%)
+							Direction:           direction,
+							ActionScore:         opp.ActionScore,
+							ExpectedRoi:         directionalSpreadMove - 0.0005, // minus estimated trading fee rate (0.05%)
 							CurrentPremiumPct:   opp.PremiumPct * 100.0,
 							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+							MeanPremiumPct:      meanPct,
+							MaxPremiumPct:       opp.MaxPremiumPct * 100.0,
+							MinPremiumPct:       opp.MinPremiumPct * 100.0,
+							TargetOffsetMin:     opp.TargetOffsetMin,
+							MaxOffsetMin:        opp.MaxOffsetMin,
+							MinOffsetMin:        opp.MinOffsetMin,
 							TargetWeight:        opp.TargetWeight,
-							RiskScore:           15.0,         // low risk, no transfer time exposure
+							RiskScore:           15.0,
 							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
 							IsValid:             true,
 						})
 					} else if isBaseFuture {
 						// Strategy D: Future-Spot
-						roi := opp.PremiumPct - opp.PredictedPremiumPct
 						dtoList = append(dtoList, FilteredOppDTO{
 							BaseExchange:        opp.BaseExchange,
 							ForeignExchange:     opp.ForeignExchange,
 							BaseSymbol:          opp.BaseSymbol,
 							ForeignSymbol:       opp.ForeignSymbol,
 							Strategy:            "Future-Spot (D)",
-							ExpectedRoi:         roi - 0.0006, // minus estimated fee rate (0.06%)
+							Direction:           direction,
+							ActionScore:         opp.ActionScore,
+							ExpectedRoi:         directionalSpreadMove - 0.0006, // minus estimated fee rate (0.06%)
 							CurrentPremiumPct:   opp.PremiumPct * 100.0,
 							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+							MeanPremiumPct:      meanPct,
+							MaxPremiumPct:       opp.MaxPremiumPct * 100.0,
+							MinPremiumPct:       opp.MinPremiumPct * 100.0,
+							TargetOffsetMin:     opp.TargetOffsetMin,
+							MaxOffsetMin:        opp.MaxOffsetMin,
+							MinOffsetMin:        opp.MinOffsetMin,
 							TargetWeight:        opp.TargetWeight,
 							RiskScore:           18.0,
 							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
@@ -1293,7 +1358,6 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						// Base is Spot (Margin) - requires margin support on base exchange
 						if targetPair.BaseClient.SupportsMargin() {
 							// 1. Holding Strategy: Margin-Spot (A) or Margin-Future (B)
-							roiHolding := opp.PremiumPct - opp.PredictedPremiumPct
 							strategyHoldingName := "Margin-Spot (A)"
 							if isForeignFuture {
 								strategyHoldingName = "Margin-Future (B)"
@@ -1304,11 +1368,19 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								BaseSymbol:          opp.BaseSymbol,
 								ForeignSymbol:       opp.ForeignSymbol,
 								Strategy:            strategyHoldingName,
-								ExpectedRoi:         roiHolding - 0.0013, // accounting for spot trading fees + estimated borrow interest over hold (0.13%)
+								Direction:           direction,
+								ActionScore:         opp.ActionScore,
+								ExpectedRoi:         directionalSpreadMove - 0.0013, // accounting for spot trading fees + estimated borrow interest over hold (0.13%)
 								CurrentPremiumPct:   opp.PremiumPct * 100.0,
 								PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+								MeanPremiumPct:      meanPct,
+								MaxPremiumPct:       opp.MaxPremiumPct * 100.0,
+								MinPremiumPct:       opp.MinPremiumPct * 100.0,
+								TargetOffsetMin:     opp.TargetOffsetMin,
+								MaxOffsetMin:        opp.MaxOffsetMin,
+								MinOffsetMin:        opp.MinOffsetMin,
 								TargetWeight:        opp.TargetWeight,
-								RiskScore:           18.0,                // lower risk, no block confirmation delay
+								RiskScore:           18.0,
 								InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
 								IsValid:             true,
 							})
@@ -1340,9 +1412,17 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									BaseSymbol:          opp.BaseSymbol,
 									ForeignSymbol:       opp.ForeignSymbol,
 									Strategy:            "Transfer Loop (C)",
+									Direction:           "TRANSFER",
+									ActionScore:         opp.ActionScore,
 									ExpectedRoi:         roiTransfer - 0.0022, // accounting for trading fees + network gas/withdrawal fees (0.22%)
 									CurrentPremiumPct:   opp.PremiumPct * 100.0,
 									PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
+									MeanPremiumPct:      meanPct,
+									MaxPremiumPct:       opp.MaxPremiumPct * 100.0,
+									MinPremiumPct:       opp.MinPremiumPct * 100.0,
+									TargetOffsetMin:     opp.TargetOffsetMin,
+									MaxOffsetMin:        opp.MaxOffsetMin,
+									MinOffsetMin:        opp.MinOffsetMin,
 									TargetWeight:        opp.TargetWeight,
 									RiskScore:           totalRisk,
 									InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,

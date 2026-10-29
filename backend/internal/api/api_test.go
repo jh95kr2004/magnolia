@@ -167,4 +167,25 @@ func TestDashboardSSESnapshotAndOpportunitiesSSE(t *testing.T) {
 	if !ok || len(pts) < 2 {
 		t.Fatalf("expected at least 2 baseline points in portfolio history, got: %v", histResp)
 	}
+
+	// Test GET /api/opportunities/chart returns historical actual + past AI + 8h forecast trajectory
+	reqChart := httptest.NewRequest(http.MethodGet, "/api/opportunities/chart?base_exchange=UPBIT&base_symbol=BTC-KRW&foreign_exchange=COINBASE&foreign_symbol=BTC-USD&range=6H&mode=PAPER", nil)
+	reqChart.Header.Set("Authorization", "Bearer "+token)
+	wChart := httptest.NewRecorder()
+	srv.AuthMiddleware(srv.handleOpportunityChart)(wChart, reqChart)
+	if wChart.Code != http.StatusOK {
+		t.Fatalf("handleOpportunityChart GET failed: %d %s", wChart.Code, wChart.Body.String())
+	}
+	var chartResp map[string]interface{}
+	if err := json.Unmarshal(wChart.Body.Bytes(), &chartResp); err != nil {
+		t.Fatalf("failed to decode opportunity chart JSON: %v", err)
+	}
+	chartHist, ok := chartResp["history"].([]interface{})
+	if !ok || len(chartHist) == 0 {
+		t.Fatalf("expected non-empty history in opportunity chart, got: %v", chartResp)
+	}
+	chartFc, ok := chartResp["forecast"].([]interface{})
+	if !ok || len(chartFc) == 0 {
+		t.Fatalf("expected non-empty forecast in opportunity chart, got: %v", chartResp)
+	}
 }

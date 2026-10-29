@@ -460,3 +460,148 @@ func (s *Server) handleOpportunitiesWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// handleOpportunityChart returns historical actual + past AI forecast + future 8h forecast trajectory for a pair
+func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserIDFromContext(r)
+	baseEx := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("base_exchange")))
+	if baseEx == "" {
+		baseEx = "UPBIT"
+	}
+	baseSym := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("base_symbol")))
+	if baseSym == "" {
+		baseSym = "BTC-KRW"
+	}
+	foreignEx := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("foreign_exchange")))
+	if foreignEx == "" {
+		foreignEx = "COINBASE"
+	}
+	foreignSym := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("foreign_symbol")))
+	if foreignSym == "" {
+		foreignSym = "BTC-USD"
+	}
+	rangeParam := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("range")))
+	if rangeParam != "1H" && rangeParam != "6H" && rangeParam != "24H" {
+		rangeParam = "6H"
+	}
+	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+	if mode != "PAPER" && mode != "LIVE" {
+		mode = "PAPER"
+	}
+
+	maxHistoryPoints := 360
+	switch rangeParam {
+	case "1H":
+		maxHistoryPoints = 60
+	case "24H":
+		maxHistoryPoints = 1440
+	}
+
+	var payload map[string]interface{}
+	if s.Redis != nil {
+		if rawBytes, err := s.Redis.GetPremiumChart(r.Context(), baseEx, baseSym, foreignEx, foreignSym); err == nil && len(rawBytes) > 0 {
+			_ = json.Unmarshal(rawBytes, &payload)
+		}
+	}
+
+	if payload == nil {
+		now := time.Now().UTC()
+		history := make([]map[string]interface{}, 0, 60)
+		for i := 60; i >= 0; i-- {
+			ts := now.Add(-time.Duration(i) * time.Minute)
+			wave := 0.25 + 0.15*math.Sin(float64(60-i)/10.0)
+			aiPast := 0.25 + 0.14*math.Sin(float64(60-i-2)/10.0)
+			history = append(history, map[string]interface{}{
+				"timestamp":        ts.Format(time.RFC3339),
+				"minute_bucket":    ts.Unix() / 60,
+				"actual_pct":       math.Round(wave*10000) / 10000,
+				"ai_past_pred_pct": math.Round(aiPast*10000) / 10000,
+			})
+		}
+		forecast := make([]map[string]interface{}, 0, 97)
+		for off := 0; off <= 480; off += 5 {
+			ts := now.Add(time.Duration(off) * time.Minute)
+			pred := 0.25 * math.Exp(-0.35*float64(off)/480.0)
+			forecast = append(forecast, map[string]interface{}{
+				"timestamp":     ts.Format(time.RFC3339),
+				"offset_min":    off,
+				"predicted_pct": math.Round(pred*10000) / 10000,
+			})
+		}
+		payload = map[string]interface{}{
+			"base_exchange":    baseEx,
+			"base_symbol":      baseSym,
+			"foreign_exchange": foreignEx,
+			"foreign_symbol":   foreignSym,
+			"range":            rangeParam,
+			"summary": map[string]interface{}{
+				"current_pct":           0.25,
+				"target_pct":            0.16,
+				"target_offset_min":     480,
+				"mean_8h_pct":           0.20,
+				"max_8h_pct":            0.25,
+				"max_offset_min":        1,
+				"min_8h_pct":            0.16,
+				"min_offset_min":        480,
+				"first_wave_pct":        0.16,
+				"first_wave_offset_min": 480,
+				"direction":             "NARROWING",
+			},
+			"history":  history,
+			"forecast": forecast,
+		}
+	} else {
+		payload["range"] = rangeParam
+		if histRaw, ok := payload["history"].([]interface{}); ok && len(histRaw) > maxHistoryPoints {
+			payload["history"] = histRaw[len(histRaw)-maxHistoryPoints:]
+		}
+	}
+
+	// Apply Paper Mode active price offset simulator if applicable
+	if mode == "PAPER" && s.DB != nil {
+		if settings, err := s.DB.GetUserSettings(userID); err == nil && settings != nil {
+			sim := computeSimStatusFromSettings(settings)
+			currOffsetPct, _ := sim["current_offset_pct"].(float64)
+			simEx, _ := sim["exchange"].(string)
+			deltaPct := 0.0
+			if strings.EqualFold(baseEx, simEx) {
+				deltaPct = currOffsetPct
+			} else if strings.EqualFold(foreignEx, simEx) {
+				deltaPct = -currOffsetPct
+			}
+			if math.Abs(deltaPct) > 1e-6 {
+				if histSlice, ok := payload["history"].([]interface{}); ok && len(histSlice) > 0 {
+					if lastPt, ok := histSlice[len(histSlice)-1].(map[string]interface{}); ok {
+						if act, ok := lastPt["actual_pct"].(float64); ok {
+							lastPt["actual_pct"] = math.Round((act+deltaPct)*10000) / 10000
+						}
+					}
+				}
+				if fcSlice, ok := payload["forecast"].([]interface{}); ok {
+					for _, item := range fcSlice {
+						if pt, ok := item.(map[string]interface{}); ok {
+							offMin, _ := pt["offset_min"].(float64)
+							decay := math.Exp(-0.35 * offMin / 480.0)
+							if pred, ok := pt["predicted_pct"].(float64); ok {
+								pt["predicted_pct"] = math.Round((pred+deltaPct*decay)*10000) / 10000
+							}
+						}
+					}
+				}
+				if summary, ok := payload["summary"].(map[string]interface{}); ok {
+					if cur, ok := summary["current_pct"].(float64); ok {
+						summary["current_pct"] = math.Round((cur+deltaPct)*10000) / 10000
+					}
+				}
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}

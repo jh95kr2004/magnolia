@@ -321,3 +321,9 @@ func (p *PubSubClient) SubscribeUserEvents(ctx context.Context, userID string, o
 		}
 	}
 }
+
+// GetPremiumChart retrieves the cached 24h historical + 8h AI forecast trajectory payload for a market pair.
+func (p *PubSubClient) GetPremiumChart(ctx context.Context, baseEx, baseSym, foreignEx, foreignSym string) ([]byte, error) {
+	key := "market:premium_chart:" + baseEx + ":" + baseSym + ":" + foreignEx + ":" + foreignSym
+	return p.client.Get(ctx, key).Bytes()
+}
