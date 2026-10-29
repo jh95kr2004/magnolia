@@ -139,16 +139,30 @@ export const Dashboard = () => {
     });
   };
 
-  const upbitEx = portfolio.exchanges.find((x) => x.name === 'UPBIT');
-  const coinbaseEx = portfolio.exchanges.find((x) => x.name === 'COINBASE');
+  const displayExchanges =
+    portfolio.exchanges && portfolio.exchanges.length > 0
+      ? portfolio.exchanges
+      : [
+          {
+            name: 'UPBIT',
+            quoteCurrency: 'KRW',
+            nativeBalance: viewMode === 'PAPER' ? 50000000 : 0,
+            usdValue: viewMode === 'PAPER' ? 36000 : 0,
+            percent: 50
+          },
+          {
+            name: 'COINBASE',
+            quoteCurrency: 'USD',
+            nativeBalance: viewMode === 'PAPER' ? 35000 : 0,
+            usdValue: viewMode === 'PAPER' ? 35000 : 0,
+            percent: 50
+          }
+        ];
 
-  const upbitKrw = upbitEx ? upbitEx.nativeBalance : viewMode === 'PAPER' ? 50000000 : 0;
-  const upbitUsd = upbitEx ? upbitEx.usdValue : viewMode === 'PAPER' ? 36000 : 0;
-  const coinbaseUsd = coinbaseEx ? coinbaseEx.usdValue : viewMode === 'PAPER' ? 35000 : 0;
-
+  const sumExchangeUsd = displayExchanges.reduce((acc, ex) => acc + (ex.usdValue || 0), 0);
   const totalUnrealizedPnl = activePositions.reduce((acc, p) => acc + (p.currentPnlUsd || 0), 0);
   const displayTotalUsd =
-    portfolio.totalUsd > 0 ? portfolio.totalUsd : upbitUsd + coinbaseUsd + totalUnrealizedPnl;
+    portfolio.totalUsd > 0 ? portfolio.totalUsd : sumExchangeUsd + totalUnrealizedPnl;
 
   const foreignPct = Math.round((portfolio.foreignShare || 0.5) * 100);
   const domesticPct = Math.max(0, 100 - foreignPct);
@@ -242,31 +256,45 @@ export const Dashboard = () => {
           </div>
         </div>
 
-        <div className="metric-item">
-          <div className="metric-label">
-            <span>{t.dashboard.upbitCash}</span>
-            <span className="mono" style={{ color: 'var(--text-muted)' }}>UPBIT</span>
-          </div>
-          <div className="metric-value mono">
-            ₩{Math.round(upbitKrw).toLocaleString()}
-          </div>
-          <div className="metric-sub mono">
-            ≈ ${upbitUsd.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} USD
-          </div>
-        </div>
-
-        <div className="metric-item">
-          <div className="metric-label">
-            <span>{t.dashboard.coinbaseCash}</span>
-            <span className="mono" style={{ color: 'var(--text-muted)' }}>COINBASE</span>
-          </div>
-          <div className="metric-value mono">
-            ${coinbaseUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </div>
-          <div className="metric-sub">
-            {lang === 'ko' ? '해외 롱/숏 증거금 및 매수 자금' : 'Foreign quote & margin liquidity'}
-          </div>
-        </div>
+        {displayExchanges.map((ex) => {
+          const isKrw = ex.quoteCurrency === 'KRW';
+          return (
+            <div key={ex.name} className="metric-item">
+              <div className="metric-label">
+                <span>
+                  {isKrw
+                    ? lang === 'ko'
+                      ? `${ex.name} 가용 원화 (KRW)`
+                      : `${ex.name} Available (KRW)`
+                    : lang === 'ko'
+                      ? `${ex.name} 가용 달러 (${ex.quoteCurrency || 'USD'})`
+                      : `${ex.name} Available (${ex.quoteCurrency || 'USD'})`}
+                </span>
+                <span className="mono" style={{ color: 'var(--text-muted)' }}>
+                  {ex.name}
+                </span>
+              </div>
+              <div className="metric-value mono">
+                {isKrw
+                  ? `₩${Math.round(ex.nativeBalance || 0).toLocaleString()}`
+                  : `$${Number(ex.usdValue || ex.nativeBalance || 0).toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2
+                    })}`}
+              </div>
+              <div className="metric-sub mono">
+                {isKrw
+                  ? `≈ $${Number(ex.usdValue || 0).toLocaleString(undefined, {
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 0
+                    })} USD (${Math.round(ex.percent || 0)}%)`
+                  : lang === 'ko'
+                    ? `비중 ${Math.round(ex.percent || 0)}% · 롱/숏 증거금 및 매수 자금`
+                    : `Share ${Math.round(ex.percent || 0)}% · Quote & margin liquidity`}
+              </div>
+            </div>
+          );
+        })}
 
         <div className="metric-item">
           <div className="metric-label">

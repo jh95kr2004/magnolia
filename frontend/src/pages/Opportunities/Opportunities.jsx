@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { apiClient } from '../../services/api';
 import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
@@ -6,12 +6,23 @@ import { useI18n } from '../../contexts/LanguageContext';
 import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
 
+const normalizeStrategyCode = (raw) => {
+  const s = String(raw || '').toUpperCase();
+  if (s.includes('TRANSFER') || s.includes('(C)')) return 'FOREIGN_TRANSFER';
+  if (s.includes('MARGIN_FUTURE') || s.includes('MARGIN-FUTURE') || s.includes('(B)')) return 'MARGIN_FUTURE';
+  if (s.includes('FUTURE_SPOT') || s.includes('FUTURE-SPOT') || s.includes('(D)')) return 'FUTURE_SPOT';
+  if (s.includes('FUTURE_FUTURE') || s.includes('FUTURE-FUTURE') || s.includes('(E)')) return 'FUTURE_FUTURE';
+  return 'MARGIN_SPOT';
+};
+
 export const Opportunities = () => {
   const { viewMode } = useAuth();
   const { lang, t } = useI18n();
   const { showToast, requestConfirm } = useToast();
 
   const [opportunities, setOpportunities] = useState([]);
+  const rawMapRef = useRef({});
+  const aiMapRef = useRef({});
   const [simStatus, setSimStatus] = useState({
     exchange: 'UPBIT',
     current_offset_pct: 0,
@@ -44,31 +55,118 @@ export const Opportunities = () => {
       withCredentials: true
     });
 
-    oppsSrc.addEventListener('opportunities', (e) => {
+    const rebuildMergedList = () => {
+      const rawEntries = Object.values(rawMapRef.current);
+      const aiByCoin = aiMapRef.current;
+
+      if (rawEntries.length > 0) {
+        const merged = rawEntries
+          .filter((r) => Math.abs(Number(r.premium_pct || 0)) < 80)
+          .map((item, idx) => {
+            const coin = String(item.base_symbol || 'BTC-KRW').split('-')[0].toUpperCase();
+            const aiInfo = aiByCoin[coin];
+            const livePremPct = Number(item.premium_pct ?? 0);
+            const predPct =
+              aiInfo && typeof aiInfo.predicted_premium_pct === 'number'
+                ? Number(aiInfo.predicted_premium_pct)
+                : livePremPct * 0.65;
+            const strategyCode = aiInfo?.strategy
+              ? normalizeStrategyCode(aiInfo.strategy)
+              : livePremPct >= 1.0
+              ? 'FOREIGN_TRANSFER'
+              : 'MARGIN_SPOT';
+            const expectedMarginPct =
+              aiInfo && typeof aiInfo.expected_roi === 'number' && Math.abs(aiInfo.expected_roi) < 0.8
+                ? Math.max(Number(aiInfo.expected_roi) * 100, Math.abs(livePremPct) - 0.15)
+                : Number(item.expected_margin ?? Math.abs(livePremPct));
+            const targetWeightPct =
+              aiInfo && typeof aiInfo.target_weight === 'number' && aiInfo.target_weight > 0
+                ? Math.round(aiInfo.target_weight * 100)
+                : Math.abs(livePremPct) >= 1.5
+                ? 35
+                : 20;
+
+            return {
+              id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+              baseExchange: item.base_exchange || 'UPBIT',
+              foreignExchange: item.foreign_exchange || 'COINBASE',
+              baseSymbol: item.base_symbol || `${coin}-KRW`,
+              foreignSymbol: item.foreign_symbol || `${coin}-USD`,
+              basePriceUsd: Number(item.base_price_usd || 0),
+              foreignPriceUsd: Number(item.foreign_price_usd || 0),
+              premiumPct: livePremPct,
+              predictedPct: predPct,
+              expectedMarginPct,
+              strategy: strategyCode,
+              targetWeightPct
+            };
+          });
+        setOpportunities(merged);
+      } else {
+        const aiEntries = Object.values(aiByCoin);
+        if (aiEntries.length > 0) {
+          const fallbackList = aiEntries
+            .filter((a) => Math.abs(Number(a.current_premium_pct || 0)) < 80)
+            .map((item, idx) => {
+              const curPct = Number(item.current_premium_pct || 0);
+              const predPct = Number(item.predicted_premium_pct ?? curPct * 0.65);
+              return {
+                id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+                baseExchange: item.base_exchange || 'UPBIT',
+                foreignExchange: item.foreign_exchange || 'COINBASE',
+                baseSymbol: item.base_symbol || 'BTC-KRW',
+                foreignSymbol: item.foreign_symbol || 'BTC-USD',
+                basePriceUsd: Number(item.base_price_usd || 0),
+                foreignPriceUsd: Number(item.foreign_price_usd || 0),
+                premiumPct: curPct,
+                predictedPct: predPct,
+                expectedMarginPct: Number(item.expected_roi || 0) * 100,
+                strategy: normalizeStrategyCode(item.strategy),
+                targetWeightPct:
+                  typeof item.target_weight === 'number' && item.target_weight > 0
+                    ? Math.round(item.target_weight * 100)
+                    : 25
+              };
+            });
+          setOpportunities(fallbackList);
+        }
+      }
+    };
+
+    oppsSrc.addEventListener('raw_opportunities', (e) => {
       try {
         const data = JSON.parse(e.data);
         if (Array.isArray(data)) {
-          const mapped = data.map((item, idx) => ({
-            id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
-            baseExchange: item.base_exchange || 'UPBIT',
-            foreignExchange: item.foreign_exchange || 'COINBASE',
-            baseSymbol: item.base_symbol || 'BTC-KRW',
-            foreignSymbol: item.foreign_symbol || 'BTC-USD',
-            basePriceUsd: Number(item.base_price_usd || 0),
-            foreignPriceUsd: Number(item.foreign_price_usd || 0),
-            premiumPct: Number(item.premium_pct || 0) * 100,
-            predictedPct:
-              typeof item.predicted_premium_pct === 'number'
-                ? item.predicted_premium_pct * 100
-                : Number(item.premium_pct || 0) * 65,
-            expectedMarginPct: Number(item.expected_margin || item.premium_pct || 0) * 100,
-            strategy:
-              item.recommended_strategy ||
-              (Number(item.premium_pct || 0) >= 0.01 ? 'TRANSFER' : 'MARGIN_SPOT'),
-            targetWeightPct:
-              typeof item.target_weight === 'number' ? Math.round(item.target_weight * 100) : 35
-          }));
-          setOpportunities(mapped);
+          const nextMap = {};
+          data.forEach((item) => {
+            if (!item || !item.base_symbol) return;
+            if (!String(item.base_symbol).endsWith('-KRW')) return;
+            const coin = String(item.base_symbol).split('-')[0].toUpperCase();
+            nextMap[coin] = item;
+          });
+          rawMapRef.current = nextMap;
+          rebuildMergedList();
+        }
+      } catch {}
+    });
+
+    oppsSrc.addEventListener('filtered_opportunities', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (Array.isArray(data)) {
+          const nextAi = { ...aiMapRef.current };
+          data.forEach((item) => {
+            if (!item || !item.base_symbol) return;
+            if (Math.abs(Number(item.current_premium_pct || 0)) >= 80) return;
+            if (item.base_exchange === 'UPBIT' && !String(item.base_symbol).endsWith('-KRW')) return;
+            const coin = String(item.base_symbol).split('-')[0].toUpperCase();
+            const existing = nextAi[coin];
+            if (!existing || Number(item.expected_roi || -999) > Number(existing.expected_roi || -999)) {
+              nextAi[coin] = item;
+            }
+          });
+          aiMapRef.current = nextAi;
+          rebuildMergedList();
         }
       } catch {}
     });
