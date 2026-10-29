@@ -161,3 +161,17 @@ type SupportedExchange struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// EquitySnapshot records time-series snapshots of a user's total portfolio valuation (Paper or Live)
+// for the Coinbase-style Total Equity History chart.
+type EquitySnapshot struct {
+	ID                    uint      `gorm:"primaryKey" json:"id"`
+	UserID                uint      `gorm:"index:idx_user_mode_time,priority:1;not null" json:"user_id"`
+	IsPaper               bool      `gorm:"index:idx_user_mode_time,priority:2;default:true" json:"is_paper"`
+	TotalEquityUSD        float64   `json:"total_equity_usd"`
+	AvailableUSD          float64   `json:"available_usd"`
+	UnrealizedPnLUSD      float64   `json:"unrealized_pnl_usd"`
+	FXRateKRW             float64   `json:"fx_rate_krw"`
+	ExchangeBreakdownJSON string    `gorm:"type:text" json:"exchange_breakdown_json,omitempty"`
+	RecordedAt            time.Time `gorm:"index:idx_user_mode_time,priority:3" json:"recorded_at"`
+}

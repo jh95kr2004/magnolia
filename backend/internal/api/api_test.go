@@ -150,4 +150,21 @@ func TestDashboardSSESnapshotAndOpportunitiesSSE(t *testing.T) {
 	if parsed[0]["premium_pct"].(float64) < 3.4 {
 		t.Fatalf("expected premium_pct adjusted from 0.5%% to ~3.5%%, got %v", parsed[0]["premium_pct"])
 	}
+
+	// Test GET /api/portfolio/history returns time-series points and FX rate
+	reqHist := httptest.NewRequest(http.MethodGet, "/api/portfolio/history?mode=PAPER&range=24H", nil)
+	reqHist.Header.Set("Authorization", "Bearer "+token)
+	wHist := httptest.NewRecorder()
+	srv.AuthMiddleware(srv.handlePortfolioHistory)(wHist, reqHist)
+	if wHist.Code != http.StatusOK {
+		t.Fatalf("handlePortfolioHistory GET failed: %d %s", wHist.Code, wHist.Body.String())
+	}
+	var histResp map[string]interface{}
+	if err := json.Unmarshal(wHist.Body.Bytes(), &histResp); err != nil {
+		t.Fatalf("failed to decode portfolio history JSON: %v", err)
+	}
+	pts, ok := histResp["points"].([]interface{})
+	if !ok || len(pts) < 2 {
+		t.Fatalf("expected at least 2 baseline points in portfolio history, got: %v", histResp)
+	}
 }

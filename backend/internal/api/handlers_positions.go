@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/magnolia/backend/internal/db/postgres"
+	"github.com/magnolia/backend/internal/strategy"
 )
 
 // handleActivePositions lists all currently open positions for the authenticated user and requested mode (PAPER or LIVE)
@@ -179,4 +183,153 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte(`{"message": "Manual entry command dispatched to Strategy Engine"}`))
+}
+
+// handlePortfolioHistory returns chronological Total Equity snapshots for the Coinbase-style area chart.
+// Query params: ?mode=PAPER|LIVE&range=1H|24H|1W|1M|1Y|ALL
+func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserIDFromContext(r)
+	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
+	settings, _ := s.DB.GetUserSettings(userID)
+	if mode != "PAPER" && mode != "LIVE" {
+		if settings != nil && settings.ActiveViewMode != "" {
+			mode = strings.ToUpper(settings.ActiveViewMode)
+		} else {
+			mode = "PAPER"
+		}
+	}
+	isPaper := mode == "PAPER"
+
+	rangeParam := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("range")))
+	if rangeParam == "" {
+		rangeParam = "24H"
+	}
+
+	now := time.Now().UTC()
+	var since time.Time
+	switch rangeParam {
+	case "1H":
+		since = now.Add(-1 * time.Hour)
+	case "24H":
+		since = now.Add(-24 * time.Hour)
+	case "1W":
+		since = now.Add(-7 * 24 * time.Hour)
+	case "1M":
+		since = now.Add(-30 * 24 * time.Hour)
+	case "1Y":
+		since = now.Add(-365 * 24 * time.Hour)
+	case "ALL":
+		since = time.Time{}
+	default:
+		rangeParam = "24H"
+		since = now.Add(-24 * time.Hour)
+	}
+
+	fxRate := strategy.GetFXRate("KRW")
+	if fxRate <= 0 {
+		fxRate = 1400.0
+	}
+
+	snaps, err := s.DB.GetEquitySnapshots(userID, isPaper, since, 300)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If fewer than 2 points exist in the requested range, seed/synthesize a clean baseline so the chart always renders smoothly
+	if len(snaps) < 2 {
+		baselineUSD := 0.0
+		if len(snaps) == 1 && snaps[0].TotalEquityUSD > 0 {
+			baselineUSD = snaps[0].TotalEquityUSD
+		} else if isPaper {
+			upbitKRW := 50000000.0
+			cbUSD := 35000.0
+			if settings != nil {
+				if settings.PaperUpbitKRW > 0 {
+					upbitKRW = settings.PaperUpbitKRW
+				}
+				if settings.PaperCoinbaseUSD > 0 {
+					cbUSD = settings.PaperCoinbaseUSD
+				}
+			}
+			baselineUSD = (upbitKRW / fxRate) + cbUSD
+		}
+
+		startTime := since
+		if startTime.IsZero() {
+			startTime = now.Add(-24 * time.Hour)
+		}
+		if len(snaps) == 0 {
+			snaps = []postgres.EquitySnapshot{
+				{
+					UserID:           userID,
+					IsPaper:          isPaper,
+					TotalEquityUSD:   baselineUSD,
+					AvailableUSD:     baselineUSD,
+					UnrealizedPnLUSD: 0,
+					FXRateKRW:        fxRate,
+					RecordedAt:       startTime,
+				},
+				{
+					UserID:           userID,
+					IsPaper:          isPaper,
+					TotalEquityUSD:   baselineUSD,
+					AvailableUSD:     baselineUSD,
+					UnrealizedPnLUSD: 0,
+					FXRateKRW:        fxRate,
+					RecordedAt:       now,
+				},
+			}
+		} else if len(snaps) == 1 {
+			first := snaps[0]
+			snaps = []postgres.EquitySnapshot{
+				{
+					UserID:           userID,
+					IsPaper:          isPaper,
+					TotalEquityUSD:   first.TotalEquityUSD,
+					AvailableUSD:     first.AvailableUSD,
+					UnrealizedPnLUSD: first.UnrealizedPnLUSD,
+					FXRateKRW:        first.FXRateKRW,
+					RecordedAt:       first.RecordedAt.Add(-1 * time.Minute),
+				},
+				first,
+			}
+		}
+	}
+
+	type PointDTO struct {
+		Timestamp        string  `json:"timestamp"`
+		TotalEquityUSD   float64 `json:"total_equity_usd"`
+		AvailableUSD     float64 `json:"available_usd"`
+		UnrealizedPnLUSD float64 `json:"unrealized_pnl_usd"`
+		FXRateKRW        float64 `json:"fx_rate_krw"`
+	}
+
+	points := make([]PointDTO, 0, len(snaps))
+	for _, snap := range snaps {
+		rFX := snap.FXRateKRW
+		if rFX <= 0 {
+			rFX = fxRate
+		}
+		points = append(points, PointDTO{
+			Timestamp:        snap.RecordedAt.UTC().Format(time.RFC3339),
+			TotalEquityUSD:   snap.TotalEquityUSD,
+			AvailableUSD:     snap.AvailableUSD,
+			UnrealizedPnLUSD: snap.UnrealizedPnLUSD,
+			FXRateKRW:        rFX,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"mode":        mode,
+		"range":       rangeParam,
+		"fx_rate_krw": fxRate,
+		"points":      points,
+	})
 }

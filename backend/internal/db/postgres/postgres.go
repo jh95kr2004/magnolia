@@ -37,6 +37,7 @@ func NewDB(dsn string) (*DB, error) {
 		&ActivePosition{},
 		&LeaderLease{},
 		&SupportedExchange{},
+		&EquitySnapshot{},
 	)
 	_ = db.Exec("SELECT pg_advisory_unlock(99887766)")
 	if err != nil {
@@ -418,4 +419,66 @@ func (db *DB) PublishUserEvent(userID string, payload string) error {
 	// Quote the payload string for safe raw SQL execution
 	query := `SELECT pg_notify(?, ?)`
 	return db.conn.Exec(query, channel, payload).Error
+}
+
+// SaveEquitySnapshot inserts a new portfolio equity snapshot row.
+func (db *DB) SaveEquitySnapshot(snap *EquitySnapshot) error {
+	if snap.RecordedAt.IsZero() {
+		snap.RecordedAt = time.Now().UTC()
+	}
+	return db.conn.Create(snap).Error
+}
+
+// GetEquitySnapshots fetches chronological portfolio snapshots for a user and mode since a given timestamp.
+func (db *DB) GetEquitySnapshots(userID uint, isPaper bool, since time.Time, maxPoints int) ([]EquitySnapshot, error) {
+	var snaps []EquitySnapshot
+	q := db.conn.Where("user_id = ? AND is_paper = ?", userID, isPaper)
+	if !since.IsZero() {
+		q = q.Where("recorded_at >= ?", since)
+	}
+	err := q.Order("recorded_at ASC").Find(&snaps).Error
+	if err != nil {
+		return nil, err
+	}
+	if maxPoints > 0 && len(snaps) > maxPoints {
+		step := float64(len(snaps)-1) / float64(maxPoints-1)
+		downsampled := make([]EquitySnapshot, 0, maxPoints)
+		for i := 0; i < maxPoints-1; i++ {
+			idx := int(float64(i) * step)
+			downsampled = append(downsampled, snaps[idx])
+		}
+		downsampled = append(downsampled, snaps[len(snaps)-1])
+		return downsampled, nil
+	}
+	return snaps, nil
+}
+
+// ResetPaperEquitySnapshots clears old Paper Mode equity snapshots for a user and seeds a fresh initial baseline.
+func (db *DB) ResetPaperEquitySnapshots(userID uint, initialEquityUSD, fxRateKRW float64, breakdownJSON string) error {
+	if fxRateKRW <= 0 {
+		fxRateKRW = 1400.0
+	}
+	_ = db.conn.Where("user_id = ? AND is_paper = ?", userID, true).Delete(&EquitySnapshot{}).Error
+	now := time.Now().UTC()
+	// Seed two initial points (1 minute ago and now) so the chart immediately renders a clean baseline
+	_ = db.SaveEquitySnapshot(&EquitySnapshot{
+		UserID:                userID,
+		IsPaper:               true,
+		TotalEquityUSD:        initialEquityUSD,
+		AvailableUSD:          initialEquityUSD,
+		UnrealizedPnLUSD:      0,
+		FXRateKRW:             fxRateKRW,
+		ExchangeBreakdownJSON: breakdownJSON,
+		RecordedAt:            now.Add(-1 * time.Minute),
+	})
+	return db.SaveEquitySnapshot(&EquitySnapshot{
+		UserID:                userID,
+		IsPaper:               true,
+		TotalEquityUSD:        initialEquityUSD,
+		AvailableUSD:          initialEquityUSD,
+		UnrealizedPnLUSD:      0,
+		FXRateKRW:             fxRateKRW,
+		ExchangeBreakdownJSON: breakdownJSON,
+		RecordedAt:            now,
+	})
 }

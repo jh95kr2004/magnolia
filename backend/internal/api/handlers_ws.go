@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/magnolia/backend/internal/strategy"
 )
 
 // ActiveConnections tracks all open UI WebSockets
@@ -70,6 +72,11 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		activeBotStatus = paperBotStatus
 	}
 
+	fxRate := strategy.GetFXRate("KRW")
+	if fxRate <= 0 {
+		fxRate = 1400.0
+	}
+
 	portfolioPayload := map[string]interface{}{
 		"mode":                   mode,
 		"is_paper":               isPaper,
@@ -81,6 +88,7 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		"sim_status":             computeSimStatusFromSettings(settings),
 		"total_equity_usd":       capitalLimit,
 		"available_balance":      capitalLimit,
+		"fx_rate_krw":            fxRate,
 		"foreign_share":          0.50,
 		"rebalance_trigger_skew": triggerSkew,
 		"rebalance_target_skew":  targetSkew,
@@ -101,6 +109,9 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		}
 		if v, ok := stateMap["available_balance"]; ok {
 			portfolioPayload["available_balance"] = v
+		}
+		if v, ok := stateMap["fx_rate_krw"]; ok {
+			portfolioPayload["fx_rate_krw"] = v
 		}
 		if v, ok := stateMap["foreign_share"]; ok {
 			portfolioPayload["foreign_share"] = v

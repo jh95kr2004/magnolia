@@ -45,11 +45,12 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/settings/sim_offset", s.AuthMiddleware(s.handleSimOffset))                  // POST, GET
 	mux.HandleFunc("/api/settings/paper_reset", s.AuthMiddleware(s.handlePaperReset))                // POST
 
-	// 3. Trading & Positions Routes (Protected)
+	// 3. Trading, Positions & Portfolio Routes (Protected)
 	mux.HandleFunc("/api/positions/active", s.AuthMiddleware(s.handleActivePositions))        // GET
 	mux.HandleFunc("/api/positions/active/", s.AuthMiddleware(s.handleForceClose))            // DELETE REST ID
 	mux.HandleFunc("/api/positions/history", s.AuthMiddleware(s.handlePositionHistory))       // GET
 	mux.HandleFunc("/api/positions/force_enter", s.AuthMiddleware(s.handleForceEnter))        // POST
+	mux.HandleFunc("/api/portfolio/history", s.AuthMiddleware(s.handlePortfolioHistory))      // GET
 
 	// 4. WebSocket Steaming Endpoints
 	mux.HandleFunc("/api/ws/dashboard", s.WebSocketAuthMiddleware(s.handleDashboardWS))

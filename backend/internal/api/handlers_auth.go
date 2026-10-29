@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/magnolia/backend/internal/db/postgres"
+	"github.com/magnolia/backend/internal/strategy"
 )
 
 type ctxKeyUserID struct{}
@@ -122,6 +123,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create Default Strategy & Risk Thresholds
 	_ = s.DB.SaveThresholds(postgres.DefaultUserThreshold(user.ID, "PremiumStrategy"))
+
+	// Seed initial Paper Mode EquitySnapshot so the portfolio history chart starts with a clean baseline
+	fxRate := strategy.GetFXRate("KRW")
+	if fxRate <= 0 {
+		fxRate = 1400.0
+	}
+	initialPaperEquityUSD := (50000000.0 / fxRate) + 35000.0
+	_ = s.DB.ResetPaperEquitySnapshots(user.ID, initialPaperEquityUSD, fxRate, "")
 
 	// Push newly created user to the Dangling Queue so an Engine picks them up
 	if s.Redis != nil {

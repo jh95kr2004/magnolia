@@ -85,6 +85,10 @@ type Engine struct {
 	// Error logging throttle
 	lastErrorLogTime   map[string]time.Time
 	lastErrorLogTimeMu sync.Mutex
+
+	// Equity history snapshot cadence (every 60s or on key portfolio events)
+	lastSnapshotTime  time.Time
+	forceNextSnapshot bool
 }
 
 func (e *Engine) StartDraining() {
@@ -1365,6 +1369,8 @@ type UserCommand struct {
 	SimRampMinutes     float64 `json:"sim_ramp_minutes,omitempty"`
 	PaperUpbitKRW      float64 `json:"paper_upbit_krw,omitempty"`
 	PaperCoinbaseUSD   float64 `json:"paper_coinbase_usd,omitempty"`
+	UpbitKRW           float64 `json:"upbit_krw,omitempty"`
+	CoinbaseUSD        float64 `json:"coinbase_usd,omitempty"`
 }
 
 // ListenUserCommands subscribes to user:{id}:cmd so manual UI commands ("Force Enter", "Force Close", "Set Bot Status", "Set Sim Offset", "Reset Paper")
@@ -1462,9 +1468,15 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					_ = e.db.CloseAllActivePositionsByUserAndMode(e.userID, true)
 					upbitKRW := cmd.PaperUpbitKRW
 					if upbitKRW <= 0 {
+						upbitKRW = cmd.UpbitKRW
+					}
+					if upbitKRW <= 0 {
 						upbitKRW = 50000000.0
 					}
 					cbUSD := cmd.PaperCoinbaseUSD
+					if cbUSD <= 0 {
+						cbUSD = cmd.CoinbaseUSD
+					}
 					if cbUSD <= 0 {
 						cbUSD = 35000.0
 					}
@@ -1479,6 +1491,7 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					}
 					e.liveUnrealizedPnLs = make(map[string]float64)
 					e.persistPaperState()
+					e.forceNextSnapshot = true
 					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 						`{"action":"PAPER_ACCOUNT_RESET","mode":"PAPER","message":"Paper account reset to ₩%.0f KRW & $%.0f USD. All virtual positions cleared."}`,
 						upbitKRW, cbUSD,
@@ -1573,6 +1586,7 @@ type AIAccountState struct {
 	BotStatus            string                    `json:"bot_status"`
 	AvailableBalance     float64                   `json:"available_balance"`
 	TotalEquityUSD       float64                   `json:"total_equity_usd"`
+	FXRateKRW            float64                   `json:"fx_rate_krw"`
 	ExchangeBalances     []ExchangeBalanceSnapshot `json:"exchange_balances"`
 	ForeignShare         float64                   `json:"foreign_share"`
 	RebalanceTriggerSkew float64                   `json:"rebalance_trigger_skew"`
@@ -1713,6 +1727,23 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 	}
 
 	simEx, simCurr, simTarget, simRamp, simProg, simRem := e.GetSimStatus()
+	fxKRW := GetFXRate("KRW")
+
+	if e.db != nil && totalEquityUSD > 0 && (e.forceNextSnapshot || time.Since(e.lastSnapshotTime) >= 60*time.Second) {
+		e.lastSnapshotTime = time.Now().UTC()
+		e.forceNextSnapshot = false
+		breakdownBytes, _ := json.Marshal(exSnapshots)
+		_ = e.db.SaveEquitySnapshot(&postgres.EquitySnapshot{
+			UserID:                e.userID,
+			IsPaper:               e.isPaper,
+			TotalEquityUSD:        totalEquityUSD,
+			AvailableUSD:          totalLiquidUSD,
+			UnrealizedPnLUSD:      totalUnrealizedPnLUSD,
+			FXRateKRW:             fxKRW,
+			ExchangeBreakdownJSON: string(breakdownBytes),
+			RecordedAt:            e.lastSnapshotTime,
+		})
+	}
 
 	payload, err := json.Marshal(AIAccountState{
 		UserID:               e.userID,
@@ -1720,6 +1751,7 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		BotStatus:            e.botStatus,
 		AvailableBalance:     totalLiquidUSD,
 		TotalEquityUSD:       totalEquityUSD,
+		FXRateKRW:            fxKRW,
 		ExchangeBalances:     exSnapshots,
 		ForeignShare:         foreignShare,
 		RebalanceTriggerSkew: e.config.RebalanceTriggerSkew,
@@ -1759,6 +1791,7 @@ func (e *Engine) notifyPositionOpened(ctx context.Context, pos *postgres.ActiveP
 	e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 		`{"action":"POSITION_OPENED", "position_id":"%s"}`, pos.PositionID,
 	)))
+	e.forceNextSnapshot = true
 	e.publishAccountState(ctx)
 
 	e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
@@ -1771,6 +1804,7 @@ func (e *Engine) notifyPositionClosed(ctx context.Context, positionID string) {
 	e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 		`{"action":"POSITION_CLOSED", "position_id":"%s"}`, positionID,
 	)))
+	e.forceNextSnapshot = true
 	e.publishAccountState(ctx)
 
 	profitStr := "N/A"

@@ -10,6 +10,7 @@ import (
 
 	"github.com/magnolia/backend/internal/db/postgres"
 	"github.com/magnolia/backend/internal/exchange"
+	"github.com/magnolia/backend/internal/strategy"
 )
 
 // handleExchangeKeySubmit validates and saves the user API keys
@@ -566,12 +567,21 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	_ = s.DB.SaveUserSettings(settings)
 	_ = s.DB.CloseAllActivePositionsByUserAndMode(userID, true)
 
+	fxRate := strategy.GetFXRate("KRW")
+	if fxRate <= 0 {
+		fxRate = 1400.0
+	}
+	initialEquityUSD := (req.UpbitKRW / fxRate) + req.CoinbaseUSD
+	_ = s.DB.ResetPaperEquitySnapshots(userID, initialEquityUSD, fxRate, "")
+
 	if s.Redis != nil {
 		cmdPayload, _ := json.Marshal(map[string]interface{}{
-			"action":       "RESET_PAPER_ACCOUNT",
-			"mode":         "PAPER",
-			"upbit_krw":    req.UpbitKRW,
-			"coinbase_usd": req.CoinbaseUSD,
+			"action":             "RESET_PAPER_ACCOUNT",
+			"mode":               "PAPER",
+			"upbit_krw":          req.UpbitKRW,
+			"coinbase_usd":       req.CoinbaseUSD,
+			"paper_upbit_krw":    req.UpbitKRW,
+			"paper_coinbase_usd": req.CoinbaseUSD,
 		})
 		_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), cmdPayload)
 	}
