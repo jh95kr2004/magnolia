@@ -3,7 +3,9 @@ export const translations = {
     nav: {
       dashboard: '대시보드',
       market: '마켓 & 시뮬레이터',
-      settings: '설정 & 거래이력',
+      history: '거래 이력',
+      settings: '설정',
+      breadcrumbRoot: '메뉴 이동',
       paperMode: '모의매매',
       liveMode: '실매매',
       botRunning: '자동매매 가동 중',
@@ -21,7 +23,8 @@ export const translations = {
       totalEquity: '총 평가자산',
       upbitCash: '업비트 주문 가능 원화',
       coinbaseCash: '코인베이스 주문 가능 달러',
-      capitalBalance: '거래소 자본 비중 (업비트 : 코인베이스)',
+      capitalBalance: '거래소 자본 비중',
+      exchangeAvailableTitle: '거래소별 가용 통화',
       rebalanceActive: '역전송 리밸런싱 대상',
       rebalanceNormal: '균형 안정',
       webLendingAlertTitle: '업비트 웹 코인 대여 세션 연결이 필요합니다',
@@ -111,13 +114,34 @@ export const translations = {
       optCloseTitle: '즉시 모든 포지션 시장가 청산 후 봇 완전 정지',
       optCloseDesc: '현재 열려 있는 모든 포지션을 즉시 시장가로 정리하고 봇을 멈춥니다.',
       cancel: '취소'
+    },
+    tooltips: {
+      colAsset: '포지션이 진입된 코인 심볼과 기준(숏) 거래소 및 해외(롱) 거래소 경로입니다.',
+      colStrategy: '적용된 델타 중립 아비트라지 헤징 방식(마진·현물·선물·전송 차익)입니다.',
+      colInvested: '양쪽 거래소 롱·숏 포지션에 투입된 총 기준 자본금 규모입니다.',
+      colEntrySpread: '포지션 진입 시점에 포착된 기준 거래소와 해외 거래소 간의 가격 격차(%)입니다.',
+      colPnl: '실시간 양쪽 거래소 호가 및 환율을 반영한 미실현 평가손익과 수익률(%)입니다.',
+      colStatus: '현재 포지션의 생명주기 상태(델타 중립 헤징 중, 온체인 전송 중, 대여 상환 대기 등)입니다.',
+      colAction: '양쪽 거래소의 롱·숏 포지션을 동시에 시장가로 정리하는 즉시 청산 기능입니다.',
+      colPair: '아비트라지 대상 코인 심볼과 고평가(매도/숏) → 저평가(매수/롱) 거래소 방향입니다.',
+      colBasePrice: '기준 거래소(예: 업비트)의 실시간 원화/현지 통화 호가 및 미화(USD) 환산 가격입니다.',
+      colForeignPrice: '해외 거래소(예: 코인베이스)의 실시간 달러(USD) 기준 매수·매도 호가입니다.',
+      colSpread: '환율을 반영해 계산한 두 거래소 간 실시간 가격 격차(프리미엄 %)입니다.',
+      colAiForecast: '딥러닝 시계열 모델이 예측한 향후 8시간 동안의 프리미엄 변화 추이(1h / 4h / 8h)입니다.',
+      colRecommended: '현재 프리미엄·펀딩비·전송 속도를 종합해 AI가 선정한 최적 아비트라지 전략입니다.',
+      colNetMargin: '거래 수수료, 슬리피지, 대여 이자 및 전송 수수료를 차감한 뒤 기대되는 순수익률(%)입니다.',
+      colManual: 'AI 자동 진입을 기다리지 않고 현재 호가로 즉시 양방향 포지션에 수동 진입합니다.',
+      colOpenedAt: '해당 아비트라지 포지션에 최초 진입한 시각입니다.',
+      colRealizedPnl: '양쪽 거래소 포지션 청산 및 수수료 정산이 완료된 최종 확정 손익입니다.'
     }
   },
   en: {
     nav: {
       dashboard: 'Dashboard',
       market: 'Market & Simulator',
-      settings: 'Settings & History',
+      history: 'Trade History',
+      settings: 'Settings',
+      breadcrumbRoot: 'Navigate',
       paperMode: 'Paper Mode',
       liveMode: 'Live Mode',
       botRunning: 'Bot Running',
@@ -135,7 +159,8 @@ export const translations = {
       totalEquity: 'Total Equity',
       upbitCash: 'Upbit Available KRW',
       coinbaseCash: 'Coinbase Available USD',
-      capitalBalance: 'Capital Split (Upbit : Coinbase)',
+      capitalBalance: 'Exchange Capital Allocation',
+      exchangeAvailableTitle: 'Available Currency by Exchange',
       rebalanceActive: 'Rebalance Needed',
       rebalanceNormal: 'Balanced',
       webLendingAlertTitle: 'Upbit Web Lending Session Required',
@@ -225,6 +250,25 @@ export const translations = {
       optCloseTitle: 'Close All Positions at Market & Stop Immediately',
       optCloseDesc: 'Immediately unwinds all open positions and stops the bot.',
       cancel: 'Cancel'
+    },
+    tooltips: {
+      colAsset: 'Target crypto asset symbol and the Base (Short) ↔ Foreign (Long) exchange route.',
+      colStrategy: 'Active delta-neutral arbitrage hedging mode (Margin, Spot, Futures, or Transfer Loop).',
+      colInvested: 'Total capital deployed across both long and short exchange legs.',
+      colEntrySpread: 'Cross-exchange price premium (%) captured at the moment of position entry.',
+      colPnl: 'Real-time unrealized profit/loss and ROI (%) based on live orderbooks and FX rates.',
+      colStatus: 'Current lifecycle stage of the position (Hedged Open, Transferring On-Chain, Awaiting Loan Repay).',
+      colAction: 'Immediately unwind both long and short legs at market price.',
+      colPair: 'Crypto pair and execution direction from overpriced (Short) to underpriced (Long) exchange.',
+      colBasePrice: 'Real-time quote on the base exchange (e.g., Upbit KRW) and its USD-converted price.',
+      colForeignPrice: 'Real-time USD quote on the foreign exchange (e.g., Coinbase).',
+      colSpread: 'Live FX-adjusted price spread (premium %) between the base and foreign exchanges.',
+      colAiForecast: 'Deep-learning forecasted premium trajectory over the next 1h, 4h, and 8h horizons.',
+      colRecommended: 'Optimal arbitrage strategy selected by the AI given spread, funding rate, and transfer time.',
+      colNetMargin: 'Estimated net profit (%) after deducting trading fees, slippage, borrow interest, and withdrawal fees.',
+      colManual: 'Manually execute an atomic dual-leg entry right now at current market prices.',
+      colOpenedAt: 'Timestamp when the arbitrage position was initially opened.',
+      colRealizedPnl: 'Final settled net profit/loss after closing both legs and deducting fees.'
     }
   }
 };
