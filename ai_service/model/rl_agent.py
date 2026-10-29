@@ -251,11 +251,12 @@ class PortfolioRLAgent:
             mean_pred - spread,
             max(0.0, first_wave_edge),
         )
+        transfer_edge = spread if spread >= 0.0060 else 0.0
         narrow_edge = max(
             spread - min_pred,
             spread - mean_pred,
             max(0.0, -first_wave_edge),
-            max(0.0, spread),
+            transfer_edge,
         )
 
         if self.model is None:
@@ -327,11 +328,11 @@ class PortfolioRLAgent:
                     active_edge = narrow_edge
 
                 # Digital Twin Veto Manager: enter whenever expected directional move beats round-trip friction
-                if active_edge > friction_wall * 1.15:
+                if active_edge > friction_wall * 1.25:
                     action_type = 0
-                    edge_weight = min(0.85, max(0.20, active_edge / 0.020))
+                    edge_weight = min(0.85, max(0.25, active_edge / 0.018))
                     target_weight = float(
-                        np.clip(0.5 * target_weight + 0.5 * edge_weight, 0.20, 0.85)
+                        np.clip(0.5 * target_weight + 0.5 * edge_weight, 0.25, 0.85)
                     )
                     action_score = 8.5 if is_widening else 1.5
                 else:
@@ -340,15 +341,13 @@ class PortfolioRLAgent:
                     action_score = 5.0
             else:
                 # RL-Only Ablation (w/o Forecaster): rely on 24h SMA deviation & PPO output
-                sma_diff = sma_24h - spread
-                sma_edge = max(abs(sma_diff), max(0.0, spread))
-                if sma_edge > friction_wall * 1.25 and abs(spread) >= 0.006:
+                sma_edge = abs(spread - sma_24h)
+                if sma_edge > friction_wall * 1.25 and abs(spread) >= 0.0065:
                     action_type = 0
                     target_weight = float(
                         np.clip(0.5 * target_weight + 0.45, 0.30, 0.70)
                     )
-                    is_widening = sma_diff > 0 and spread < 0
-                    action_score = 8.5 if is_widening else 1.5
+                    action_score = 1.5 if spread >= 0 else 8.5
                 else:
                     action_type = 0
                     target_weight = 0.0
@@ -363,8 +362,9 @@ class PortfolioRLAgent:
                     action_score = 1.5
                 elif (
                     use_forecaster
-                    and first_wave_edge > friction_wall * 1.35
-                    and (max_pred - spread) > (spread - min_pred) * 1.4
+                    and first_wave_edge > friction_wall * 1.5
+                    and (max_pred - spread) > (spread - min_pred) * 1.6
+                    and unrealized_pnl > 20.0
                 ):
                     # Two-Wave Flip: Narrowing wave bottomed out and strong Widening wave starting
                     action_type = 0
@@ -372,9 +372,8 @@ class PortfolioRLAgent:
                     target_weight = float(edge_weight)
                     action_score = 8.5
                 elif (
-                    use_forecaster
-                    and unrealized_pnl > 25.0
-                    and spread <= mean_pred
+                    (spread <= 0.0010 and unrealized_pnl > 15.0)
+                    or (use_forecaster and unrealized_pnl > 30.0 and spread <= mean_pred)
                 ) or (not use_forecaster and spread <= 0.0012):
                     action_type = 2  # REPAY / EXIT
                     target_weight = 0.0
@@ -387,8 +386,9 @@ class PortfolioRLAgent:
                 # Holding Long Base / Short Foreign (Widening position)
                 if (
                     use_forecaster
-                    and (-first_wave_edge) > friction_wall * 1.35
-                    and (spread - min_pred) > (max_pred - spread) * 1.4
+                    and (-first_wave_edge) > friction_wall * 1.5
+                    and (spread - min_pred) > (max_pred - spread) * 1.6
+                    and unrealized_pnl > 20.0
                 ):
                     # Two-Wave Flip: Widening wave peaked and strong Narrowing reversion wave starting
                     action_type = 0
@@ -396,9 +396,8 @@ class PortfolioRLAgent:
                     target_weight = float(edge_weight)
                     action_score = 1.5
                 elif (
-                    use_forecaster
-                    and unrealized_pnl > 25.0
-                    and spread >= mean_pred
+                    (spread >= -0.0010 and unrealized_pnl > 15.0)
+                    or (use_forecaster and unrealized_pnl > 30.0 and (spread >= mean_pred or (max_pred - spread) <= friction_wall * 0.5))
                 ) or (not use_forecaster and spread >= -0.0012):
                     action_type = 2  # EXIT
                     target_weight = 0.0
