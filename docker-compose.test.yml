@@ -1,0 +1,91 @@
+services:
+  test-postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: magnolia_test
+      POSTGRES_PASSWORD: magnolia_test
+      POSTGRES_DB: magnolia_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U magnolia_test -d magnolia_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  test-redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  test-browser:
+    image: selenium/standalone-chromium:latest
+    environment:
+      TZ: Asia/Seoul
+      SE_VNC_NO_PASSWORD: "1"
+      SE_NODE_MAX_SESSIONS: "2"
+    shm_size: "1gb"
+
+  test-ai:
+    image: ubuntu:latest
+    working_dir: /app
+    command: ["/home/jh95kr2004/miniconda3/envs/torch_env/bin/python", "-u", "app.py"]
+    environment:
+      REDIS_URL: "redis://test-redis:6379/0"
+      AI_MIN_WARMUP_STEPS: "2"
+    volumes:
+      - ./ai_service:/app
+      - /home/jh95kr2004/miniconda3:/home/jh95kr2004/miniconda3:ro
+    depends_on:
+      test-redis:
+        condition: service_healthy
+
+  test-feed:
+    image: magnolia_master:latest
+    command: ["/app/feed"]
+    environment:
+      REDIS_URL: "redis://test-redis:6379/0"
+      ACTIVE_EXCHANGES: "upbit,coinbase"
+      TARGET_COINS: "BTC,ETH"
+    depends_on:
+      test-redis:
+        condition: service_healthy
+
+  test-engine:
+    image: magnolia_master:latest
+    command: ["/app/engine"]
+    environment:
+      NODE_ID: "engine-test-1"
+      ENGINE_REGION: "kr"
+      POSTGRES_DSN: "host=test-postgres user=magnolia_test password=magnolia_test dbname=magnolia_test port=5432 sslmode=disable"
+      REDIS_URL: "redis://test-redis:6379/0"
+      TARGET_COINS: "BTC,ETH"
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
+
+  test-node:
+    image: magnolia_node:latest
+    command: ["/app/node"]
+    environment:
+      NODE_REGION: "kr"
+      ACTIVE_EXCHANGES: "upbit,coinbase"
+      STATIC_DIR: "/app/frontend/dist"
+      POSTGRES_DSN: "host=test-postgres user=magnolia_test password=magnolia_test dbname=magnolia_test port=5432 sslmode=disable"
+      REDIS_URL: "redis://test-redis:6379/0"
+    ports:
+      - "127.0.0.1:18081:8081"
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy

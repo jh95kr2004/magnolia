@@ -9,6 +9,7 @@
 #   ./magnolia.sh logs [service]    # Tail logs (e.g. './magnolia.sh logs', './magnolia.sh logs ai')
 #   ./magnolia.sh ssl [domain]      # Issue/attach Let's Encrypt HTTPS cert via Certbot
 #   ./magnolia.sh reset             # Stop & wipe all database volumes (clean factory reset)
+#   ./magnolia.sh test [target]     # Run tests: all (default) | ai | backend | frontend | e2e
 # ==============================================================================
 
 set -euo pipefail
@@ -408,6 +409,114 @@ cmd_reset() {
     fi
 }
 
+cleanup_test_stack() {
+    log_info "Tearing down isolated test stack (magnolia_test)..."
+    docker compose -p magnolia_test -f "$ROOT_DIR/docker-compose.test.yml" down -v --remove-orphans >/dev/null 2>&1 || true
+}
+
+run_test_ai() {
+    echo "------------------------------------------------------------------"
+    log_info "🧠 [1/4] Running AI Service Unit Tests (pytest)..."
+    echo "------------------------------------------------------------------"
+    (
+        cd "$ROOT_DIR/ai_service"
+        "$PYTHON_BIN" -m pytest -v tests/
+    )
+    log_ok "AI Service Unit Tests PASSED!"
+}
+
+run_test_backend() {
+    echo "------------------------------------------------------------------"
+    log_info "⚙️  [2/4] Running Go Backend Unit & DB/Redis Integration Tests..."
+    echo "------------------------------------------------------------------"
+    docker compose -p magnolia_test -f "$ROOT_DIR/docker-compose.test.yml" up -d --wait test-postgres test-redis
+    docker run --rm \
+        --network magnolia_test_default \
+        -v "$ROOT_DIR/backend:/app" \
+        -v magnolia_gocache:/go/pkg/mod \
+        -v magnolia_gobuild:/root/.cache/go-build \
+        -w /app \
+        -e TEST_POSTGRES_DSN="host=test-postgres user=magnolia_test password=magnolia_test dbname=magnolia_test port=5432 sslmode=disable" \
+        -e TEST_REDIS_URL="redis://test-redis:6379/0" \
+        golang:1.25-alpine \
+        go test -p 1 -v ./internal/exchange ./internal/strategy ./internal/db/postgres ./internal/api
+    log_ok "Go Backend Unit & Integration Tests PASSED!"
+}
+
+run_test_frontend() {
+    echo "------------------------------------------------------------------"
+    log_info "🎨 [3/4] Running Frontend Component & SSE Unit Tests (Vitest)..."
+    echo "------------------------------------------------------------------"
+    docker run --rm \
+        -v "$ROOT_DIR/frontend:/app" \
+        -w /app \
+        node:20-alpine \
+        npm test
+    log_ok "Frontend Component & SSE Unit Tests PASSED!"
+}
+
+run_test_e2e() {
+    echo "------------------------------------------------------------------"
+    log_info "🌐 [4/4] Running Full-Stack & Headless Chromium Browser E2E Suite..."
+    echo "------------------------------------------------------------------"
+    log_info "Starting isolated magnolia_test stack (Postgres, Redis, Chromium, AI, Feed, Engine, Node)..."
+    docker compose -p magnolia_test -f "$ROOT_DIR/docker-compose.test.yml" up -d
+    log_info "Waiting for test-node (http://127.0.0.1:18081) and test-browser WebDriver to become ready..."
+    for _ in $(seq 1 30); do
+        if curl -fsS "http://127.0.0.1:18081/" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    sleep 3
+    if ! docker run --rm \
+        --network magnolia_test_default \
+        -v "$ROOT_DIR/frontend:/app" \
+        -w /app \
+        -e E2E_BASE_URL="http://test-node:8081" \
+        -e E2E_WEBDRIVER_URL="http://test-browser:4444/wd/hub" \
+        node:20-alpine \
+        node e2e/full_lifecycle.e2e.mjs; then
+        log_err "E2E failed! Dumping test-engine and test-node logs:"
+        docker compose -p magnolia_test -f "$ROOT_DIR/docker-compose.test.yml" logs --tail=60 test-engine test-node || true
+        return 1
+    fi
+    log_ok "Full-Stack & Headless Chromium Browser E2E Tests PASSED!"
+}
+
+cmd_test() {
+    local target="${1:-all}"
+    trap cleanup_test_stack EXIT
+
+    case "$target" in
+        ai)
+            run_test_ai
+            ;;
+        backend|go)
+            run_test_backend
+            ;;
+        frontend|ui)
+            run_test_frontend
+            ;;
+        e2e)
+            run_test_e2e
+            ;;
+        all|"")
+            run_test_ai
+            run_test_backend
+            run_test_frontend
+            run_test_e2e
+            echo "=================================================================="
+            log_ok "🎉 ALL PHASE 12 TEST SUITES (AI + BACKEND + FRONTEND + E2E) PASSED!"
+            echo "=================================================================="
+            ;;
+        *)
+            log_err "Unknown test target '${target}'. Choose from: all | ai | backend | frontend | e2e"
+            exit 1
+            ;;
+    esac
+}
+
 ACTION="${1:-help}"
 shift || true
 
@@ -434,8 +543,11 @@ case "$ACTION" in
     reset|clean)
         cmd_reset
         ;;
+    test|tests)
+        cmd_test "${1:-all}"
+        ;;
     *)
-        echo "Usage: ./magnolia.sh {start [domain]|stop|restart [domain]|status|logs [service|ai]|ssl [domain]|reset}"
+        echo "Usage: ./magnolia.sh {start [domain]|stop|restart [domain]|status|logs [service|ai]|ssl [domain]|reset|test [all|ai|backend|frontend|e2e]}"
         exit 1
         ;;
 esac
