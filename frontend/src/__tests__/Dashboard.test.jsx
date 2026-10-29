@@ -1,14 +1,30 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { Dashboard } from '../pages/Dashboard/Dashboard';
 import { LanguageProvider } from '../contexts/LanguageContext';
+import { CurrencyProvider } from '../contexts/CurrencyContext';
 import { MockEventSource } from './setup';
 
 vi.mock('../services/api', () => ({
   apiClient: {
-    get: vi.fn().mockResolvedValue({ data: [] }),
+    get: vi.fn((url) => {
+      if (String(url).startsWith('/portfolio/history')) {
+        return Promise.resolve({
+          data: {
+            mode: 'PAPER',
+            range: '24H',
+            fx_rate_krw: 1400,
+            points: [
+              { timestamp: '2026-10-29T00:00:00Z', total_equity_usd: 118000, fx_rate_krw: 1400 },
+              { timestamp: '2026-10-29T12:00:00Z', total_equity_usd: 120000, fx_rate_krw: 1400 }
+            ]
+          }
+        });
+      }
+      return Promise.resolve({ data: [] });
+    }),
     delete: vi.fn().mockResolvedValue({ data: {} })
   }
 }));
@@ -25,18 +41,21 @@ vi.mock('../contexts/ToastContext', () => ({
   })
 }));
 
-describe('Dashboard dynamic multi-exchange balances & positions', () => {
+describe('Dashboard Equity Chart, Currency Switcher, Exchange Pie/List & Column Tooltips', () => {
   beforeEach(() => {
     MockEventSource.reset();
     localStorage.setItem('magnolia_lang', 'ko');
+    localStorage.setItem('magnolia_currency', 'USD');
   });
 
-  it('dynamically renders N exchange balance cards from SSE portfolio event', async () => {
+  it('dynamically renders N exchanges in pie chart and available currency list, and converts USD <-> KRW', async () => {
     render(
       <LanguageProvider>
-        <MemoryRouter>
-          <Dashboard />
-        </MemoryRouter>
+        <CurrencyProvider>
+          <MemoryRouter>
+            <Dashboard />
+          </MemoryRouter>
+        </CurrencyProvider>
       </LanguageProvider>
     );
 
@@ -47,32 +66,43 @@ describe('Dashboard dynamic multi-exchange balances & positions', () => {
       sse.emit('portfolio', {
         total_equity_usd: 120000,
         available_balance: 120000,
+        fx_rate_krw: 1400,
         foreign_share: 0.6,
         rebalance_trigger_skew: 0.2,
         rebalance_target_skew: 0.5,
         exchange_balances: [
-          { name: 'UPBIT', quote_currency: 'KRW', available_native: 65000000, available_usd: 48000, percent: 40 },
+          { name: 'UPBIT', quote_currency: 'KRW', available_native: 67200000, available_usd: 48000, percent: 40 },
           { name: 'COINBASE', quote_currency: 'USD', available_native: 36000, available_usd: 36000, percent: 30 },
           { name: 'BINANCE', quote_currency: 'USDT', available_native: 36000, available_usd: 36000, percent: 30 }
         ]
       });
     });
 
-    expect(screen.getByText('UPBIT 가용 원화 (KRW)')).toBeInTheDocument();
-    expect(screen.getByText('COINBASE 가용 달러 (USD)')).toBeInTheDocument();
-    expect(screen.getByText('BINANCE 가용 달러 (USDT)')).toBeInTheDocument();
+    expect(screen.getByTestId('equity-area-chart')).toBeInTheDocument();
+    expect(screen.getByTestId('exchange-pie-chart')).toBeInTheDocument();
+    expect(screen.getByTestId('exchange-row-UPBIT')).toBeInTheDocument();
+    expect(screen.getByTestId('exchange-row-COINBASE')).toBeInTheDocument();
+    expect(screen.getByTestId('exchange-row-BINANCE')).toBeInTheDocument();
+
+    // Verify USD total equity first
+    expect(screen.getByTestId('total-equity-value').textContent).toBe('$120,000.00');
+
+    // Switch currency to KRW (₩) and verify converted valuation (120,000 * 1400 = ₩168,000,000)
+    fireEvent.click(screen.getByTestId('currency-btn-KRW'));
+    expect(screen.getByTestId('total-equity-value').textContent).toBe('₩168,000,000');
   });
 
-  it('renders active positions received via SSE positions event', async () => {
+  it('renders active positions and shows column explanation popup on header hover', async () => {
     render(
       <LanguageProvider>
-        <MemoryRouter>
-          <Dashboard />
-        </MemoryRouter>
+        <CurrencyProvider>
+          <MemoryRouter>
+            <Dashboard />
+          </MemoryRouter>
+        </CurrencyProvider>
       </LanguageProvider>
     );
 
-    // Wait for initial apiClient.get('/positions/active').then(...) chain to settle
     await act(async () => {
       await new Promise((r) => setTimeout(r, 10));
     });
@@ -102,5 +132,11 @@ describe('Dashboard dynamic multi-exchange balances & positions', () => {
     expect(screen.getByText('BTC')).toBeInTheDocument();
     expect(screen.getByText('UPBIT → COINBASE')).toBeInTheDocument();
     expect(screen.getAllByText('+$145.50').length).toBeGreaterThanOrEqual(2);
+
+    // Hover over the first column header trigger and verify tooltip popup appears
+    const triggers = screen.getAllByTestId('column-tooltip-trigger');
+    expect(triggers.length).toBeGreaterThanOrEqual(5);
+    fireEvent.mouseEnter(triggers[0]);
+    expect(screen.getByTestId('column-tooltip-popup')).toBeInTheDocument();
   });
 });

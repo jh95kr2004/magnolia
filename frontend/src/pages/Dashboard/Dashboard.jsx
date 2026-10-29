@@ -4,13 +4,18 @@ import { ArrowRight, ExternalLink, AlertTriangle } from 'lucide-react';
 import { apiClient } from '../../services/api';
 import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
 import { useI18n } from '../../contexts/LanguageContext';
+import { useCurrency } from '../../contexts/CurrencyContext';
 import { formatStrategyLabel, formatPositionStatus } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
+import { EquityChart } from '../../components/dashboard/EquityChart';
+import { ExchangeAllocationCard } from '../../components/dashboard/ExchangeAllocationCard';
+import { ColumnTooltipHeader } from '../../components/common/ColumnTooltipHeader';
 
 export const Dashboard = () => {
   const navigate = useNavigate();
   const { viewMode, setBotStatuses } = useAuth();
   const { lang, t } = useI18n();
+  const { formatMoney, updateFxRate } = useCurrency();
   const { showToast, requestConfirm } = useToast();
 
   const [sseConnected, setSseConnected] = useState(false);
@@ -20,7 +25,7 @@ export const Dashboard = () => {
     foreignShare: 0.5,
     rebalanceTriggerSkew: 0.2,
     webLendingSessions: {},
-    exchanges: []
+    exchanges: [],
   });
   const [activePositions, setActivePositions] = useState([]);
 
@@ -41,7 +46,7 @@ export const Dashboard = () => {
           : Number(p.RealizedProfitUSD || 0),
       currentPnlPct: typeof p.CurrentPnLPct === 'number' ? p.CurrentPnLPct : 0,
       status: p.Status || 'OPEN',
-      openedAt: p.OpenedAt
+      openedAt: p.OpenedAt,
     }));
   };
 
@@ -55,7 +60,7 @@ export const Dashboard = () => {
       .catch(() => {});
 
     const dashboardSrc = new EventSource(buildSseUrl('/api/ws/dashboard', viewMode), {
-      withCredentials: true
+      withCredentials: true,
     });
 
     dashboardSrc.onopen = () => setSseConnected(true);
@@ -65,6 +70,10 @@ export const Dashboard = () => {
       try {
         const data = JSON.parse(e.data);
         if (!data) return;
+
+        if (data.fx_rate_krw) {
+          updateFxRate('KRW', data.fx_rate_krw);
+        }
 
         const rawEx = Array.isArray(data.exchange_balances)
           ? data.exchange_balances
@@ -85,7 +94,7 @@ export const Dashboard = () => {
             nativeBalance: Number(ex.available_native ?? ex.nativeBalance ?? 0),
             usdValue: Number(ex.available_usd ?? ex.usdValue ?? 0),
             percent: Number(ex.percent || 0),
-            webLendingOk: ex.web_lending_ok
+            webLendingOk: ex.web_lending_ok,
           };
         });
 
@@ -95,13 +104,13 @@ export const Dashboard = () => {
           foreignShare: typeof data.foreign_share === 'number' ? data.foreign_share : 0.5,
           rebalanceTriggerSkew: Number(data.rebalance_trigger_skew || 0.2),
           webLendingSessions: data.web_lending_sessions || {},
-          exchanges: mappedEx
+          exchanges: mappedEx,
         });
 
         if (data.paper_bot_status || data.live_bot_status) {
           setBotStatuses({
             PAPER: data.paper_bot_status || 'RUNNING',
-            LIVE: data.live_bot_status || 'STOPPED'
+            LIVE: data.live_bot_status || 'STOPPED',
           });
         }
         setSseConnected(true);
@@ -143,7 +152,7 @@ export const Dashboard = () => {
         } catch (err) {
           showToast(err.response?.data?.error || err.message, 'error');
         }
-      }
+      },
     });
   };
 
@@ -156,15 +165,15 @@ export const Dashboard = () => {
             quoteCurrency: 'KRW',
             nativeBalance: viewMode === 'PAPER' ? 50000000 : 0,
             usdValue: viewMode === 'PAPER' ? 36000 : 0,
-            percent: 50
+            percent: 50,
           },
           {
             name: 'COINBASE',
             quoteCurrency: 'USD',
             nativeBalance: viewMode === 'PAPER' ? 35000 : 0,
             usdValue: viewMode === 'PAPER' ? 35000 : 0,
-            percent: 50
-          }
+            percent: 50,
+          },
         ];
 
   const sumExchangeUsd = displayExchanges.reduce((acc, ex) => acc + (ex.usdValue || 0), 0);
@@ -172,12 +181,10 @@ export const Dashboard = () => {
   const displayTotalUsd =
     portfolio.totalUsd > 0 ? portfolio.totalUsd : sumExchangeUsd + totalUnrealizedPnl;
 
-  const foreignPct = Math.round((portfolio.foreignShare || 0.5) * 100);
-  const domesticPct = Math.max(0, 100 - foreignPct);
-  const isSkewLow = (portfolio.foreignShare || 0.5) <= (portfolio.rebalanceTriggerSkew || 0.2);
-
   const isUpbitLendingDisconnected =
     viewMode === 'LIVE' && portfolio.webLendingSessions?.UPBIT === false;
+
+  const tooltips = t.tooltips || {};
 
   return (
     <>
@@ -194,7 +201,15 @@ export const Dashboard = () => {
 
         <span className={`badge ${sseConnected ? 'badge-emerald' : 'badge-amber'}`}>
           <span className={`status-dot ${sseConnected ? 'running' : 'draining'}`} />
-          <span>{sseConnected ? (lang === 'ko' ? '실시간 연동 중' : 'Live Stream') : (lang === 'ko' ? '연결 중...' : 'Connecting...')}</span>
+          <span>
+            {sseConnected
+              ? lang === 'ko'
+                ? '실시간 연동 중'
+                : 'Live Stream'
+              : lang === 'ko'
+                ? '연결 중...'
+                : 'Connecting...'}
+          </span>
         </span>
       </div>
 
@@ -209,7 +224,7 @@ export const Dashboard = () => {
             padding: '18px 24px',
             borderRadius: 'var(--radius-md)',
             background: 'var(--rose-soft)',
-            border: '1px solid rgba(244, 63, 94, 0.35)'
+            border: '1px solid rgba(244, 63, 94, 0.35)',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
@@ -234,101 +249,24 @@ export const Dashboard = () => {
         </div>
       )}
 
-      {/* 2. Flat 4-Column Hero Metric Strip */}
-      <section className="metric-strip">
-        <div className="metric-item">
-          <div className="metric-label">
-            <span>{t.dashboard.totalEquity}</span>
-            <span className={`badge ${viewMode === 'PAPER' ? 'badge-amber' : 'badge-emerald'}`}>
-              {viewMode === 'PAPER' ? t.nav.paperMode : t.nav.liveMode}
-            </span>
-          </div>
-          <div className="metric-value mono">
-            ${displayTotalUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </div>
-          <div className="metric-sub mono">
-            <span>{lang === 'ko' ? '열린 포지션 손익' : 'Open PnL'}:</span>
-            <span
-              style={{
-                fontWeight: 700,
-                color:
-                  totalUnrealizedPnl > 0
-                    ? 'var(--emerald)'
-                    : totalUnrealizedPnl < 0
-                      ? 'var(--rose)'
-                      : 'var(--text-secondary)'
-              }}
-            >
-              {totalUnrealizedPnl >= 0 ? '+' : ''}${totalUnrealizedPnl.toFixed(2)}
-            </span>
-          </div>
-        </div>
+      {/* 2. Coinbase-Style 2-Column Top Grid:
+             Left (~65%): Total Equity Hero + Currency Switcher + Time-Series Area Chart
+             Right (~35%): Exchange Capital Share Pie/Donut Chart + Available Currency List */}
+      <section className="dashboard-top-grid">
+        <EquityChart
+          viewMode={viewMode}
+          currentTotalUsd={displayTotalUsd}
+          totalUnrealizedPnlUsd={totalUnrealizedPnl}
+        />
 
-        {displayExchanges.map((ex) => {
-          const isKrw = ex.quoteCurrency === 'KRW';
-          return (
-            <div key={ex.name} className="metric-item">
-              <div className="metric-label">
-                <span>
-                  {isKrw
-                    ? lang === 'ko'
-                      ? `${ex.name} 가용 원화 (KRW)`
-                      : `${ex.name} Available (KRW)`
-                    : lang === 'ko'
-                      ? `${ex.name} 가용 달러 (${ex.quoteCurrency || 'USD'})`
-                      : `${ex.name} Available (${ex.quoteCurrency || 'USD'})`}
-                </span>
-                <span className="mono" style={{ color: 'var(--text-muted)' }}>
-                  {ex.name}
-                </span>
-              </div>
-              <div className="metric-value mono">
-                {isKrw
-                  ? `₩${Math.round(ex.nativeBalance || 0).toLocaleString()}`
-                  : `$${Number(ex.usdValue || ex.nativeBalance || 0).toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2
-                    })}`}
-              </div>
-              <div className="metric-sub mono">
-                {isKrw
-                  ? `≈ $${Number(ex.usdValue || 0).toLocaleString(undefined, {
-                      minimumFractionDigits: 0,
-                      maximumFractionDigits: 0
-                    })} USD (${Math.round(ex.percent || 0)}%)`
-                  : lang === 'ko'
-                    ? `비중 ${Math.round(ex.percent || 0)}% · 롱/숏 증거금 및 매수 자금`
-                    : `Share ${Math.round(ex.percent || 0)}% · Quote & margin liquidity`}
-              </div>
-            </div>
-          );
-        })}
-
-        <div className="metric-item">
-          <div className="metric-label">
-            <span>{t.dashboard.capitalBalance}</span>
-            <span className={`badge ${isSkewLow ? 'badge-amber' : 'badge-emerald'}`}>
-              {isSkewLow ? t.dashboard.rebalanceActive : t.dashboard.rebalanceNormal}
-            </span>
-          </div>
-          <div className="metric-value mono" style={{ fontSize: '22px' }}>
-            {domesticPct}% : {foreignPct}%
-          </div>
-          <div>
-            <div className="balance-ratio-track">
-              <div
-                className="balance-ratio-fill"
-                style={{
-                  width: `${foreignPct}%`,
-                  background: isSkewLow ? 'var(--amber)' : 'var(--emerald)'
-                }}
-              />
-            </div>
-          </div>
-        </div>
+        <ExchangeAllocationCard
+          exchanges={displayExchanges}
+          foreignShare={portfolio.foreignShare}
+          rebalanceTriggerSkew={portfolio.rebalanceTriggerSkew}
+        />
       </section>
 
-      {/* 3. Active Arbitrage Positions Table */}
+      {/* 3. Active Arbitrage Positions Table (with Column Header Hover Tooltips) */}
       <section className="section-block">
         <div className="section-header">
           <h2 className="section-title">
@@ -368,13 +306,49 @@ export const Dashboard = () => {
             <table className="clean-table">
               <thead>
                 <tr>
-                  <th>{t.dashboard.colAsset}</th>
-                  <th>{t.dashboard.colStrategy}</th>
-                  <th>{t.dashboard.colInvested}</th>
-                  <th>{t.dashboard.colEntrySpread}</th>
-                  <th>{t.dashboard.colPnl}</th>
-                  <th>{t.dashboard.colStatus}</th>
-                  <th style={{ textAlign: 'right' }}>{t.dashboard.colAction}</th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colAsset}
+                      tooltip={tooltips.colAsset}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colStrategy}
+                      tooltip={tooltips.colStrategy}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colInvested}
+                      tooltip={tooltips.colInvested}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colEntrySpread}
+                      tooltip={tooltips.colEntrySpread}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colPnl}
+                      tooltip={tooltips.colPnl}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colStatus}
+                      tooltip={tooltips.colStatus}
+                    />
+                  </th>
+                  <th style={{ textAlign: 'right' }}>
+                    <ColumnTooltipHeader
+                      label={t.dashboard.colAction}
+                      tooltip={tooltips.colAction}
+                      align="right"
+                    />
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -387,7 +361,13 @@ export const Dashboard = () => {
                         <div style={{ fontWeight: 700, fontSize: '16px' }} className="mono">
                           {coin}
                         </div>
-                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                        <div
+                          style={{
+                            fontSize: '13px',
+                            color: 'var(--text-secondary)',
+                            marginTop: '2px',
+                          }}
+                        >
                           {pos.baseExchange} → {pos.foreignExchange}
                         </div>
                       </td>
@@ -395,7 +375,7 @@ export const Dashboard = () => {
                         {formatStrategyLabel(pos.strategy, lang)}
                       </td>
                       <td className="mono" style={{ fontWeight: 600 }}>
-                        ${pos.investedUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {formatMoney(pos.investedUsd)}
                       </td>
                       <td className="mono">
                         {pos.entrySpreadPct >= 0 ? '+' : ''}
@@ -405,13 +385,14 @@ export const Dashboard = () => {
                         <div
                           style={{
                             fontWeight: 700,
-                            color: isPosPnl ? 'var(--emerald)' : 'var(--rose)'
+                            color: isPosPnl ? 'var(--emerald)' : 'var(--rose)',
                           }}
                         >
-                          {isPosPnl ? '+' : ''}${pos.currentPnlUsd.toFixed(2)}
+                          {formatMoney(pos.currentPnlUsd, { signed: true })}
                         </div>
                         <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                          ({pos.currentPnlPct >= 0 ? '+' : ''}{pos.currentPnlPct.toFixed(2)}%)
+                          ({pos.currentPnlPct >= 0 ? '+' : ''}
+                          {pos.currentPnlPct.toFixed(2)}%)
                         </div>
                       </td>
                       <td>

@@ -6,6 +6,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { useI18n } from '../../contexts/LanguageContext';
 import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
+import { ColumnTooltipHeader } from '../../components/common/ColumnTooltipHeader';
 
 export const Settings = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -114,6 +115,14 @@ export const Settings = () => {
       }
     } catch {}
   };
+
+  useEffect(() => {
+    const qTab = searchParams.get('tab') || 'exchange';
+    const nextTab = qTab === 'risk' ? 'params' : qTab;
+    if (nextTab !== activeTab) {
+      setActiveTab(nextTab);
+    }
+  }, [searchParams]);
 
   useEffect(() => {
     loadSettingsData();
@@ -640,13 +649,48 @@ export const Settings = () => {
               <table className="clean-table">
                 <thead>
                   <tr>
-                    <th>{t.dashboard.colAsset}</th>
-                    <th>{t.dashboard.colStrategy}</th>
-                    <th>{t.dashboard.colInvested}</th>
-                    <th>{t.dashboard.colEntrySpread}</th>
-                    <th>{t.settings.colRealizedPnl}</th>
-                    <th>{t.settings.colOpenedAt}</th>
-                    <th>{t.settings.colClosedAt}</th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.dashboard.colAsset}
+                        tooltip={t.tooltips?.colAsset}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.dashboard.colStrategy}
+                        tooltip={t.tooltips?.colStrategy}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.dashboard.colInvested}
+                        tooltip={t.tooltips?.colInvested}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.dashboard.colEntrySpread}
+                        tooltip={t.tooltips?.colEntrySpread}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.settings.colRealizedPnl}
+                        tooltip={t.tooltips?.colRealizedPnl}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.settings.colOpenedAt}
+                        tooltip={t.tooltips?.colOpenedAt}
+                      />
+                    </th>
+                    <th>
+                      <ColumnTooltipHeader
+                        label={t.settings.colClosedAt}
+                        tooltip={t.tooltips?.colClosedAt}
+                      />
+                    </th>
                   </tr>
                 </thead>
                 <tbody>

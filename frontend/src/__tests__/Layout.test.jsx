@@ -35,7 +35,7 @@ vi.mock('../contexts/ToastContext', () => ({
   })
 }));
 
-describe('Layout unified header & global controls', () => {
+describe('Layout Coinbase-style left sidebar, mobile breadcrumb & global controls', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.setItem('magnolia_lang', 'ko');
@@ -48,7 +48,7 @@ describe('Layout unified header & global controls', () => {
     };
   });
 
-  it('renders 3 top navigation tabs and switches language between KO and EN', () => {
+  it('renders left sidebar with 4 navigation items, opens mobile breadcrumb menu, and switches language between KO and EN', () => {
     render(
       <LanguageProvider>
         <MemoryRouter initialEntries={['/dashboard']}>
@@ -59,14 +59,23 @@ describe('Layout unified header & global controls', () => {
       </LanguageProvider>
     );
 
-    expect(screen.getByText('대시보드')).toBeInTheDocument();
+    expect(screen.getByTestId('left-sidebar')).toBeInTheDocument();
+    expect(screen.getAllByText('대시보드').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('마켓 & 시뮬레이터')).toBeInTheDocument();
-    expect(screen.getByText('설정 & 거래이력')).toBeInTheDocument();
+    expect(screen.getByText('거래 이력')).toBeInTheDocument();
+    expect(screen.getByText('설정')).toBeInTheDocument();
 
+    // Open mobile breadcrumb dropdown
+    const bcTrigger = screen.getByTestId('mobile-breadcrumb-trigger');
+    fireEvent.click(bcTrigger);
+    expect(screen.getByTestId('mobile-breadcrumb-menu')).toBeInTheDocument();
+
+    // Switch language to EN
     fireEvent.click(screen.getByText('KO'));
-    expect(screen.getByText('Dashboard')).toBeInTheDocument();
-    expect(screen.getByText('Market & Simulator')).toBeInTheDocument();
-    expect(screen.getByText('Settings & History')).toBeInTheDocument();
+    expect(screen.getAllByText('Dashboard').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Market & Simulator').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Trade History').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Settings').length).toBeGreaterThanOrEqual(1);
   });
 
   it('opens 3-option Drain/Stop confirmation modal when stopping bot with open positions', async () => {

@@ -5,6 +5,7 @@ import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
 import { useI18n } from '../../contexts/LanguageContext';
 import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
+import { ColumnTooltipHeader } from '../../components/common/ColumnTooltipHeader';
 
 const normalizeStrategyCode = (raw) => {
   const s = String(raw || '').toUpperCase();
@@ -410,14 +411,55 @@ export const Opportunities = () => {
             <table className="clean-table">
               <thead>
                 <tr>
-                  <th>{t.market.colPair}</th>
-                  <th>{t.market.colBasePrice}</th>
-                  <th>{t.market.colForeignPrice}</th>
-                  <th>{t.market.colSpread}</th>
-                  <th>{t.market.colAiForecast}</th>
-                  <th>{t.market.colRecommended}</th>
-                  <th>{t.market.colNetMargin}</th>
-                  <th style={{ textAlign: 'right' }}>{t.market.colManual}</th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colPair}
+                      tooltip={t.tooltips?.colPair}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colBasePrice}
+                      tooltip={t.tooltips?.colBasePrice}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colForeignPrice}
+                      tooltip={t.tooltips?.colForeignPrice}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colSpread}
+                      tooltip={t.tooltips?.colSpread}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colAiForecast}
+                      tooltip={t.tooltips?.colAiForecast}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colRecommended}
+                      tooltip={t.tooltips?.colRecommended}
+                    />
+                  </th>
+                  <th>
+                    <ColumnTooltipHeader
+                      label={t.market.colNetMargin}
+                      tooltip={t.tooltips?.colNetMargin}
+                    />
+                  </th>
+                  <th style={{ textAlign: 'right' }}>
+                    <ColumnTooltipHeader
+                      label={t.market.colManual}
+                      tooltip={t.tooltips?.colManual}
+                      align="right"
+                    />
+                  </th>
                 </tr>
               </thead>
               <tbody>
