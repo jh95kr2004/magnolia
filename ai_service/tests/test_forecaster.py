@@ -6,7 +6,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model.predictor import PremiumForecaster, predict_reversion
+from model.predictor import PremiumForecaster, predict_reversion, extract_trajectory_metrics
 
 
 def test_forecaster_forward_shape_and_ou_reversion():
@@ -65,3 +65,17 @@ def test_predict_reversion_with_pretrained_weights():
         assert np.isfinite([mean_p, max_p, min_p]).all()
     finally:
         os.chdir(cwd)
+
+
+def test_extract_trajectory_metrics_two_wave_detection():
+    # Wave 1: starts at +0.2% (0.002), spikes to +2.8% (0.028) at 60m, then reverts to +0.1% (0.001) at 120m
+    traj = np.full(480, 0.001, dtype=np.float32)
+    traj[:60] = np.linspace(0.002, 0.028, 60)
+    traj[60:120] = np.linspace(0.028, 0.001, 60)
+
+    metrics = extract_trajectory_metrics(current_spread=0.002, premium_traj=traj, friction_threshold=0.0025)
+    assert abs(metrics["max"] - 0.028) < 1e-4
+    assert metrics["max_offset_min"] == 60
+    assert metrics["first_wave_edge"] > 0.020
+    assert metrics["first_wave_offset_min"] == 60
+    assert len(metrics["traj_delta"]) == 480

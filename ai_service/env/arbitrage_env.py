@@ -9,7 +9,12 @@ class ArbitrageEnv(gym.Env):
     OpenAI Gym Environment for Magnolia DRL Portfolio Manager.
     Simulates bidirectional target exposure with dynamic 2x2 matrix execution costs
     matching the Go backend heuristics (Digital Twin architecture).
+    Observation vector (506 dims): 26 scalar state/inflection features + 480 1-minute forecast trajectory deltas.
     """
+
+    SCALAR_DIM = 26
+    TRAJ_DIM = 480
+    OBS_DIM = 506
 
     def __init__(
         self,
@@ -24,6 +29,7 @@ class ArbitrageEnv(gym.Env):
     ):
         super(ArbitrageEnv, self).__init__()
 
+        raw_attrs = getattr(df, "attrs", {})
         self.df = df.reset_index(drop=True)
 
         self.df["sma_1h"] = (
@@ -50,7 +56,81 @@ class ArbitrageEnv(gym.Env):
         ema_26 = self.df["exchange_premium_spread"].ewm(span=26, adjust=False).mean()
         self.df["macd"] = ema_12 - ema_26
 
+        if "predicted_spread" not in self.df.columns:
+            self.df["predicted_spread"] = self.df["exchange_premium_spread"]
+        if "predicted_spread_max" not in self.df.columns:
+            self.df["predicted_spread_max"] = self.df["exchange_premium_spread"] + 0.005
+        if "predicted_spread_min" not in self.df.columns:
+            self.df["predicted_spread_min"] = self.df["exchange_premium_spread"] - 0.005
+        if "time_to_max" not in self.df.columns:
+            self.df["time_to_max"] = 0.25
+        if "time_to_min" not in self.df.columns:
+            self.df["time_to_min"] = 0.50
+        if "first_wave_edge" not in self.df.columns:
+            up_e = self.df["predicted_spread_max"] - self.df["exchange_premium_spread"]
+            dn_e = self.df["exchange_premium_spread"] - self.df["predicted_spread_min"]
+            self.df["first_wave_edge"] = np.where(up_e >= dn_e, up_e, -dn_e)
+        if "first_wave_time" not in self.df.columns:
+            self.df["first_wave_time"] = np.where(
+                self.df["first_wave_edge"] >= 0, self.df["time_to_max"], self.df["time_to_min"]
+            )
+
         self.df.fillna(0, inplace=True)
+
+        # Pre-extract contiguous NumPy arrays for 50x faster step() and _get_obs() (no pandas .iloc overhead)
+        self._col_spread = self.df["exchange_premium_spread"].values.astype(np.float32)
+        self._col_sma_1h = self.df["sma_1h"].values.astype(np.float32)
+        self._col_sma_24h = self.df["sma_24h"].values.astype(np.float32)
+        self._col_z_score = self.df["z_score"].values.astype(np.float32)
+        self._col_pred_mean = self.df["predicted_spread"].values.astype(np.float32)
+        self._col_pred_max = self.df["predicted_spread_max"].values.astype(np.float32)
+        self._col_pred_min = self.df["predicted_spread_min"].values.astype(np.float32)
+        self._col_t_max = self.df["time_to_max"].values.astype(np.float32)
+        self._col_t_min = self.df["time_to_min"].values.astype(np.float32)
+        self._col_fw_edge = self.df["first_wave_edge"].values.astype(np.float32)
+        self._col_fw_time = self.df["first_wave_time"].values.astype(np.float32)
+        self._col_base_fund = self.df["base_funding_rate"].values.astype(np.float32)
+        self._col_for_fund = self.df["foreign_funding_rate"].values.astype(np.float32)
+        self._col_bb_width = self.df["bb_width"].values.astype(np.float32)
+        self._col_macd = self.df["macd"].values.astype(np.float32)
+        if "borrow_rate_pct" in self.df.columns:
+            self._col_borrow = self.df["borrow_rate_pct"].values.astype(np.float32)
+        else:
+            self._col_borrow = np.full(len(self.df), 0.0041, dtype=np.float32)
+
+        self._static_market_features = np.column_stack(
+            [
+                self._col_spread,
+                self._col_sma_1h,
+                self._col_sma_24h,
+                self._col_z_score,
+                self._col_pred_mean,
+                self._col_pred_max,
+                self._col_pred_min,
+                self._col_t_max,
+                self._col_t_min,
+                self._col_fw_edge,
+                self._col_fw_time,
+                self._col_base_fund,
+                self._col_for_fund,
+                self._col_bb_width,
+                self._col_macd,
+            ]
+        ).astype(np.float32)
+
+        if "full_traj_deltas" in raw_attrs and "_row_id" in self.df.columns:
+            row_ids = self.df["_row_id"].values.astype(np.int64)
+            self.traj_deltas = np.asarray(raw_attrs["full_traj_deltas"][row_ids], dtype=np.float32)
+        else:
+            # Synthesize smooth 480-step relative trajectory from summary columns
+            n_rows = len(self.df)
+            cur_s = self.df["exchange_premium_spread"].values.astype(np.float32)
+            mean_d = (self.df["predicted_spread"].values.astype(np.float32) - cur_s)[:, None]
+            fw_d = self.df["first_wave_edge"].values.astype(np.float32)[:, None]
+            t_grid = np.linspace(1.0 / self.TRAJ_DIM, 1.0, self.TRAJ_DIM, dtype=np.float32)[None, :]
+            wave_pulse = fw_d * np.sin(np.pi * np.clip(t_grid * 2.0, 0.0, 1.0))
+            trend_line = mean_d * t_grid
+            self.traj_deltas = (0.5 * wave_pulse + 0.5 * trend_line).astype(np.float32)
 
         self.initial_balance = initial_balance
         self.base_fee_rate_default = base_fee_rate
@@ -79,9 +159,9 @@ class ArbitrageEnv(gym.Env):
             dtype=np.float32
         )
 
-        # State Space: 22 features (18 original + 4 One-hot State Machine features)
+        # State Space: 506 features (26 scalar state/inflection features + 480 1-minute forecast trajectory deltas)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(22,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.OBS_DIM,), dtype=np.float32
         )
 
     def reset(self, seed=None, options=None):
@@ -121,43 +201,21 @@ class ArbitrageEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        row = self.df.iloc[self.current_step]
-        
-        # One-hot state variables
-        state_neutral = 1.0 if self.state == self.STATE_NEUTRAL else 0.0
-        state_holding = 1.0 if self.state == self.STATE_HOLDING_LEG else 0.0
-        state_transferring = 1.0 if self.state == self.STATE_TRANSFERRING else 0.0
-        state_repaying = 1.0 if self.state == self.STATE_REPAYING else 0.0
-
-        obs = np.array(
-            [
-                row["exchange_premium_spread"],
-                row["sma_1h"],
-                row["sma_24h"],
-                row["z_score"],
-                row.get("predicted_spread", 0.0),  # Mean
-                row.get("predicted_spread_max", 0.0),
-                row.get("predicted_spread_min", 0.0),
-                row["base_funding_rate"],
-                row["foreign_funding_rate"],
-                row["bb_width"],  # New Feature 1
-                row["macd"],  # New Feature 2
-                self.exposure,
-                self.balance,
-                self._get_unrealized_pnl(row["exchange_premium_spread"]),
-                self.current_base_fee_rate,
-                self.current_foreign_fee_rate,
-                self.current_slippage,
-                # Explicit Friction: Sum of base and foreign fees + overall slippage
-                (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage,
-                # One-hot state representations
-                state_neutral,
-                state_holding,
-                state_transferring,
-                state_repaying,
-            ],
-            dtype=np.float32,
-        )
+        idx = self.current_step
+        obs = np.empty(self.OBS_DIM, dtype=np.float32)
+        obs[:15] = self._static_market_features[idx]
+        obs[15] = self.exposure
+        obs[16] = self.balance
+        obs[17] = self._get_unrealized_pnl(float(self._col_spread[idx]))
+        obs[18] = self.current_base_fee_rate
+        obs[19] = self.current_foreign_fee_rate
+        obs[20] = self.current_slippage
+        obs[21] = (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage
+        obs[22] = 1.0 if self.state == self.STATE_NEUTRAL else 0.0
+        obs[23] = 1.0 if self.state == self.STATE_HOLDING_LEG else 0.0
+        obs[24] = 1.0 if self.state == self.STATE_TRANSFERRING else 0.0
+        obs[25] = 1.0 if self.state == self.STATE_REPAYING else 0.0
+        obs[26:] = self.traj_deltas[idx]
         return obs
 
     def _get_unrealized_pnl(self, current_spread):
@@ -188,17 +246,17 @@ class ArbitrageEnv(gym.Env):
         else:
             action_type = 0  # TRADE / HOLD
 
-        row = self.df.iloc[self.current_step]
-        current_spread = float(row["exchange_premium_spread"])
-        base_funding = float(row["base_funding_rate"])
-        foreign_funding = float(row["foreign_funding_rate"])
+        idx = self.current_step
+        current_spread = float(self._col_spread[idx])
+        base_funding = float(self._col_base_fund[idx])
+        foreign_funding = float(self._col_for_fund[idx])
 
         # 2. Calculate Previous Equity
         unrealized_pnl_prev = self._get_unrealized_pnl(current_spread)
         total_equity_prev = self.balance + unrealized_pnl_prev
 
         # 3. Dynamic Cost Variables
-        borrow_rate_pct = float(row.get("borrow_rate_pct", 0.0041))  # Default roughly 0.0041% hourly
+        borrow_rate_pct = float(self._col_borrow[idx])  # Default roughly 0.0041% hourly
         borrow_rate = borrow_rate_pct / 100.0
 
         prev_state = self.state
@@ -323,16 +381,18 @@ class ArbitrageEnv(gym.Env):
             optimal_round_trip_fee = optimal_round_trip_fee - self.current_slippage + actual_slippage
 
             if target_exposure > 0:
-                # Long Base / Short Foreign: profits when spread widens (or reverts up from negative reverse premium)
-                forecast_widening = float(row.get("predicted_spread_max", current_spread)) - current_spread
-                mean_reversion_up = float(row.get("sma_24h", 0.0)) - current_spread
-                predicted_jump = max(forecast_widening, mean_reversion_up * 0.6)
+                # Long Base / Short Foreign: profits when spread widens (regardless of current spread sign!)
+                forecast_widening = float(self._col_pred_max[idx]) - current_spread
+                first_wave_up = max(0.0, float(self._col_fw_edge[idx]))
+                mean_reversion_up = float(self._col_sma_24h[idx]) - current_spread
+                predicted_jump = max(forecast_widening, first_wave_up, mean_reversion_up * 0.6)
             else:
-                # Short Base / Long Foreign: profits from spread convergence OR instant transfer spread
-                convergence_jump = current_spread - float(row.get("predicted_spread_min", current_spread))
-                mean_reversion_down = current_spread - float(row.get("sma_24h", 0.0))
+                # Short Base / Long Foreign: profits from spread narrowing OR instant transfer spread
+                convergence_jump = current_spread - float(self._col_pred_min[idx])
+                first_wave_dn = max(0.0, -float(self._col_fw_edge[idx]))
+                mean_reversion_down = current_spread - float(self._col_sma_24h[idx])
                 transfer_spread = max(0.0, current_spread)
-                predicted_jump = max(convergence_jump, mean_reversion_down * 0.6, transfer_spread)
+                predicted_jump = max(convergence_jump, first_wave_dn, mean_reversion_down * 0.6, transfer_spread)
 
             fee_percentage_wall = optimal_round_trip_fee
             if predicted_jump < fee_percentage_wall:
@@ -419,7 +479,7 @@ class ArbitrageEnv(gym.Env):
         if done:
             next_spread = current_spread
         else:
-            next_spread = float(self.df.iloc[self.current_step]["exchange_premium_spread"])
+            next_spread = float(self._col_spread[self.current_step])
 
         unrealized_pnl_curr = self._get_unrealized_pnl(next_spread)
         total_equity_curr = self.balance + unrealized_pnl_curr

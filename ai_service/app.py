@@ -4,12 +4,13 @@ import json
 import logging
 import redis
 import collections
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
 import threading
 from dotenv import load_dotenv
 
-from model.predictor import predict_reversion
+from model.predictor import predict_reversion, extract_trajectory_metrics
 from model.rl_agent import PortfolioRLAgent
 from data.influx_client import MarketDataFetcher
 
@@ -27,8 +28,10 @@ WINDOW_SIZE = int(os.getenv("AI_WINDOW_SIZE", "1440"))        # 1440 1-minute ca
 PRED_LEN = int(os.getenv("AI_PRED_LEN", "480"))              # 480 1-minute steps = 8 hours (1 full funding cycle)
 MIN_WARMUP_STEPS = int(os.getenv("AI_MIN_WARMUP_STEPS", "10")) # Minimum steps before starting live inference
 
+
 def get_redis_client():
     return redis.from_url(REDIS_URL, decode_responses=True)
+
 
 class FXCache:
     def __init__(self, r):
@@ -45,7 +48,6 @@ class FXCache:
                     try:
                         channel = msg["channel"]
                         rate = float(msg["data"])
-                        # e.g., channel="fx:USD-KRW"
                         quote = channel.split("-")[-1]
                         with self.lock:
                             self.fx_rates[quote] = rate
@@ -57,6 +59,7 @@ class FXCache:
     def get_rate(self, quote: str):
         with self.lock:
             return self.fx_rates.get(quote.upper(), 1.0)
+
 
 class UserAccountCache:
     def __init__(self, r):
@@ -95,6 +98,95 @@ class UserAccountCache:
         with self.lock:
             return list(self.users.keys())
 
+
+def build_chart_payload(
+    pair_key: tuple,
+    history_deque,
+    metrics: dict,
+    current_spread: float,
+    now_ts: float = None,
+) -> dict:
+    """
+    Constructs the unified historical (actual + past AI forecast) and future 8-hour
+    forecast trajectory payload for Redis storage and Frontend chart rendering.
+    """
+    if now_ts is None:
+        now_ts = time.time()
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+
+    history_points = []
+    for item in history_deque:
+        mb = int(item.get("minute_bucket", int(now_ts // 60)))
+        ts_iso = item.get("timestamp_iso")
+        if not ts_iso:
+            ts_iso = datetime.fromtimestamp(mb * 60, tz=timezone.utc).isoformat()
+        act_spread = float(item.get("exchange_premium_spread", 0.0))
+        past_pred_spread = float(item.get("ai_past_pred_spread", act_spread))
+        history_points.append({
+            "timestamp": ts_iso,
+            "minute_bucket": mb,
+            "actual_pct": round(act_spread * 100.0, 4),
+            "ai_past_pred_pct": round(past_pred_spread * 100.0, 4),
+        })
+
+    # Ensure the final history point matches the live current spread at NOW
+    if history_points:
+        history_points[-1]["actual_pct"] = round(current_spread * 100.0, 4)
+        history_points[-1]["timestamp"] = now_dt.isoformat()
+
+    traj = metrics.get("traj", [])
+    pred_len = len(traj)
+    sample_offsets = set(range(5, pred_len + 1, 5))
+    sample_offsets.add(1)
+    sample_offsets.add(int(metrics.get("max_offset_min", 1)))
+    sample_offsets.add(int(metrics.get("min_offset_min", 1)))
+    sample_offsets.add(int(metrics.get("first_wave_offset_min", 1)))
+
+    forecast_points = [
+        {
+            "timestamp": now_dt.isoformat(),
+            "offset_min": 0,
+            "predicted_pct": round(current_spread * 100.0, 4),
+        }
+    ]
+    for offset in sorted(o for o in sample_offsets if 1 <= o <= pred_len):
+        fut_dt = now_dt + timedelta(minutes=int(offset))
+        val = float(traj[offset - 1])
+        forecast_points.append({
+            "timestamp": fut_dt.isoformat(),
+            "offset_min": int(offset),
+            "predicted_pct": round(val * 100.0, 4),
+        })
+
+    fw_edge = float(metrics.get("first_wave_edge", 0.0))
+    direction = "WIDENING" if fw_edge > 0 else "NARROWING"
+    target_spread = float(metrics.get("first_wave_target", metrics.get("mean", current_spread)))
+    target_offset_min = int(metrics.get("first_wave_offset_min", 60))
+
+    return {
+        "base_exchange": pair_key[0],
+        "base_symbol": pair_key[1],
+        "foreign_exchange": pair_key[2],
+        "foreign_symbol": pair_key[3],
+        "updated_at": now_ts,
+        "summary": {
+            "current_pct": round(current_spread * 100.0, 4),
+            "target_pct": round(target_spread * 100.0, 4),
+            "target_offset_min": target_offset_min,
+            "mean_8h_pct": round(float(metrics.get("mean", current_spread)) * 100.0, 4),
+            "max_8h_pct": round(float(metrics.get("max", current_spread)) * 100.0, 4),
+            "max_offset_min": int(metrics.get("max_offset_min", 60)),
+            "min_8h_pct": round(float(metrics.get("min", current_spread)) * 100.0, 4),
+            "min_offset_min": int(metrics.get("min_offset_min", 60)),
+            "first_wave_pct": round(float(metrics.get("first_wave_target", current_spread)) * 100.0, 4),
+            "first_wave_offset_min": int(metrics.get("first_wave_offset_min", 60)),
+            "direction": direction,
+        },
+        "history": history_points,
+        "forecast": forecast_points,
+    }
+
+
 def run_daemon():
     logger.info(f"Starting GPU AI Inference Daemon. Connected to Redis: {REDIS_URL}")
     r = get_redis_client()
@@ -109,7 +201,9 @@ def run_daemon():
     
     # In-memory sliding window cache (1-minute candle buckets, maxlen=1440 for 24h context).
     history_cache = collections.defaultdict(lambda: collections.deque(maxlen=WINDOW_SIZE))
-    forecast_minute_cache = {}  # key: pair_key -> {"minute": int, "mean": float, "max": float, "min": float}
+    forecast_minute_cache = {}  # key: pair_key -> {"minute": int, "anchor_spread": float, "traj": list}
+    future_pred_lookup = collections.defaultdict(dict)  # key: pair_key -> {minute_bucket: predicted_spread}
+    last_chart_publish = {}  # key: pair_key -> timestamp
     feature_cache = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.deque(maxlen=rl_agent.n_stack)))
     
     fetcher = None
@@ -164,12 +258,29 @@ def run_daemon():
                                 window_hours=25
                             )
                             if df is not None and not df.empty:
+                                spreads_s = df["exchange_premium_spread"].astype(float)
+                                # Compute historical 15-minute ahead OU + momentum forecast for past AI overlay line
+                                past_origin = spreads_s.shift(15).bfill()
+                                past_mean = spreads_s.rolling(240, min_periods=1).mean().shift(15).bfill()
+                                past_mom = (spreads_s.shift(15) - spreads_s.shift(30)).fillna(0.0) * 0.25
+                                past_ai_preds = past_origin + (1.0 - np.exp(-0.35)) * (past_mean - past_origin) + past_mom
+
                                 for idx, row in df.iterrows():
                                     row_ts = row.get("_time", None)
-                                    minute_bucket = int(pd.Timestamp(row_ts).timestamp() // 60) if row_ts is not None else int(time.time() // 60) - len(df) + idx
+                                    if row_ts is not None:
+                                        ts_obj = pd.Timestamp(row_ts)
+                                        if ts_obj.tzinfo is None:
+                                            ts_obj = ts_obj.tz_localize(timezone.utc)
+                                        minute_bucket = int(ts_obj.timestamp() // 60)
+                                        ts_iso = ts_obj.isoformat()
+                                    else:
+                                        minute_bucket = int(time.time() // 60) - len(df) + idx
+                                        ts_iso = datetime.fromtimestamp(minute_bucket * 60, tz=timezone.utc).isoformat()
                                     tick_data = {
                                         "minute_bucket": minute_bucket,
+                                        "timestamp_iso": ts_iso,
                                         "exchange_premium_spread": float(row["exchange_premium_spread"]),
+                                        "ai_past_pred_spread": float(past_ai_preds.loc[idx]),
                                         "local_price": float(row["local_price"]),
                                         "foreign_price": float(row["foreign_price"]),
                                         "fx_rate": float(row["fx_rate"]),
@@ -188,10 +299,23 @@ def run_daemon():
                         except Exception as e:
                             logger.warning(f"Failed to lazy warmup cache for {pair_key}: {e}")
 
-                current_minute_bucket = int(time.time() // 60)
+                now_ts = time.time()
+                current_minute_bucket = int(now_ts // 60)
+                current_spread = opp.get("premium_pct", 0.0) / 100.0
+
+                # Retrieve what the AI previously forecasted for this minute bucket (if available)
+                past_pred_for_now = future_pred_lookup[pair_key].get(current_minute_bucket)
+                if past_pred_for_now is None:
+                    if len(history_cache[pair_key]) > 0:
+                        past_pred_for_now = history_cache[pair_key][-1].get("ai_past_pred_spread", current_spread)
+                    else:
+                        past_pred_for_now = current_spread
+
                 tick_data = {
                     "minute_bucket": current_minute_bucket,
-                    "exchange_premium_spread": opp.get("premium_pct", 0.0) / 100.0,
+                    "timestamp_iso": datetime.fromtimestamp(current_minute_bucket * 60, tz=timezone.utc).isoformat(),
+                    "exchange_premium_spread": current_spread,
+                    "ai_past_pred_spread": float(past_pred_for_now),
                     "local_price": opp.get("base_price_usd", 0.0) * fx_rate, 
                     "foreign_price": opp.get("foreign_price_usd", 0.0),
                     "fx_rate": fx_rate,
@@ -205,8 +329,6 @@ def run_daemon():
                     "user_balance": 10000.0,
                     "user_pnl": 0.0
                 }
-                # Maintain 1-minute step resolution once initial warmup threshold is met:
-                # update the current minute candle in-place on 1-second ticks, and append when a new minute starts.
                 if (
                     len(history_cache[pair_key]) >= MIN_WARMUP_STEPS
                     and history_cache[pair_key][-1].get("minute_bucket") == current_minute_bucket
@@ -224,19 +346,67 @@ def run_daemon():
 
                 context_df = pd.DataFrame(history_cache[pair_key])
                 cached_fc = forecast_minute_cache.get(pair_key)
-                if cached_fc is None or cached_fc["minute"] != current_minute_bucket:
-                    mean_pred, max_pred, min_pred, _ = predict_reversion(context_df, pred_len=PRED_LEN, device="cpu")
+                if (
+                    cached_fc is None
+                    or cached_fc["minute"] != current_minute_bucket
+                    or abs(current_spread - cached_fc.get("anchor_spread", current_spread)) > 0.0015
+                ):
+                    _, _, _, raw_traj = predict_reversion(context_df, pred_len=PRED_LEN, device="cpu")
                     forecast_minute_cache[pair_key] = {
                         "minute": current_minute_bucket,
-                        "mean": mean_pred,
-                        "max": max_pred,
-                        "min": min_pred,
+                        "anchor_spread": current_spread,
+                        "traj": raw_traj,
                     }
+                    # Record future predictions in lookup table so future minutes know what AI predicted for them
+                    if raw_traj:
+                        for offset_m in range(1, min(60, len(raw_traj) + 1)):
+                            target_mb = current_minute_bucket + offset_m
+                            # Keep 15-minute ahead prediction as primary reference or set if not yet populated
+                            if offset_m == 15 or target_mb not in future_pred_lookup[pair_key]:
+                                future_pred_lookup[pair_key][target_mb] = float(raw_traj[offset_m - 1])
+                        # Prune old keys
+                        old_keys = [k for k in future_pred_lookup[pair_key] if k < current_minute_bucket - 5]
+                        for k in old_keys:
+                            future_pred_lookup[pair_key].pop(k, None)
                 else:
-                    mean_pred = cached_fc["mean"]
-                    max_pred = cached_fc["max"]
-                    min_pred = cached_fc["min"]
-                
+                    raw_traj = cached_fc["traj"]
+
+                base_fee_pair = float(opp.get("base_fee_rate", 0.0005))
+                foreign_fee_pair = float(opp.get("foreign_fee_rate", 0.002))
+                slippage_pair = float(opp.get("slippage", 0.0005))
+                friction_thresh = max(0.0020, base_fee_pair + foreign_fee_pair + slippage_pair)
+
+                # Anchor trajectory smoothly to live 1-second current_spread
+                if raw_traj:
+                    anchor_diff = current_spread - float(forecast_minute_cache[pair_key].get("anchor_spread", current_spread))
+                    decay = np.exp(-0.35 * np.linspace(1.0 / PRED_LEN, 1.0, len(raw_traj), dtype=np.float32))
+                    live_traj = (np.asarray(raw_traj, dtype=np.float32) + anchor_diff * decay).tolist()
+                else:
+                    live_traj = []
+
+                metrics = extract_trajectory_metrics(
+                    current_spread=current_spread,
+                    premium_traj=live_traj,
+                    friction_threshold=friction_thresh,
+                    pred_len=PRED_LEN,
+                )
+
+                # Publish chart payload to Redis at most once every 2 seconds per pair
+                if now_ts - last_chart_publish.get(pair_key, 0.0) >= 2.0:
+                    chart_payload = build_chart_payload(
+                        pair_key=pair_key,
+                        history_deque=history_cache[pair_key],
+                        metrics=metrics,
+                        current_spread=current_spread,
+                        now_ts=now_ts,
+                    )
+                    chart_key = f"market:premium_chart:{pair_key[0]}:{pair_key[1]}:{pair_key[2]}:{pair_key[3]}"
+                    try:
+                        r.set(chart_key, json.dumps(chart_payload), ex=3600)
+                        last_chart_publish[pair_key] = now_ts
+                    except Exception as e:
+                        logger.warning(f"Failed to write chart payload to Redis: {e}")
+
                 # Compute rolling features on 1-minute steps (60 = 1h, 1440 = 24h)
                 context_df["sma_1h"] = context_df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
                 context_df["sma_24h"] = context_df["exchange_premium_spread"].rolling(1440, min_periods=1).mean()
@@ -253,22 +423,30 @@ def run_daemon():
                 
                 last_row = context_df.iloc[-1]
                 global_forecasts[pair_key] = {
-                    "mean": mean_pred,
-                    "max": max_pred,
-                    "min": min_pred,
+                    "mean": metrics["mean"],
+                    "max": metrics["max"],
+                    "min": metrics["min"],
+                    "max_offset_min": metrics["max_offset_min"],
+                    "min_offset_min": metrics["min_offset_min"],
+                    "time_to_max": metrics["time_to_max"],
+                    "time_to_min": metrics["time_to_min"],
+                    "first_wave_edge": metrics["first_wave_edge"],
+                    "first_wave_time": metrics["first_wave_time"],
+                    "first_wave_offset_min": metrics["first_wave_offset_min"],
+                    "first_wave_target": metrics["first_wave_target"],
+                    "traj_delta": metrics["traj_delta"],
                     "sma_1h": float(last_row.get("sma_1h", 0.0)),
                     "sma_24h": float(last_row.get("sma_24h", 0.0)),
                     "z_score": float(last_row.get("z_score", 0.0)),
                     "bb_width": float(last_row.get("bb_width", 0.0)),
                     "macd": float(last_row.get("macd", 0.0)),
-                    "current_spread": opp.get("premium_pct", 0.0) / 100.0,
+                    "current_spread": current_spread,
                     "base_fund": opp.get("base_funding_rate_pct", 0.0) / 100.0,
                     "foreign_fund": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
                     "fx_rate": fx_rate
                 }
 
             # --- [User Specific DRL Inference Step] ---
-            # Loop over all active users in the system and execute customized DRL portfolio decisions.
             active_users = user_cache.get_all_users()
             if not active_users:
                 active_users = ["0"]  # Default system user fallback
@@ -278,7 +456,6 @@ def run_daemon():
                 available_balance = float(acc_state.get("available_balance", 10000.0))
                 fallback_user_state = int(acc_state.get("state", 0))
                 
-                # Exposures, PnLs, and per-pair state maps: e.g., "UPBIT|KRW-BTC"
                 current_exposures = acc_state.get("current_exposures", {})
                 unrealized_pnls = acc_state.get("unrealized_pnls", {})
                 pair_states = acc_state.get("pair_states", {})
@@ -290,7 +467,6 @@ def run_daemon():
                         
                     m_data = global_forecasts[pair_key]
                     
-                    # Extract user exposure, unrealized PnL, and state specific to this cross-market pair
                     key_str = f"{opp['base_exchange']}|{opp['base_symbol']}"
                     user_exposure = float(current_exposures.get(key_str, 0.0))
                     user_pnl = float(unrealized_pnls.get(key_str, 0.0))
@@ -305,7 +481,7 @@ def run_daemon():
                     state_transferring = 1.0 if pair_state == 2 else 0.0
                     state_repaying = 1.0 if pair_state == 3 else 0.0
 
-                    state_vector = np.array([
+                    scalar_26 = np.array([
                         m_data["current_spread"],
                         m_data["sma_1h"],
                         m_data["sma_24h"],
@@ -313,6 +489,10 @@ def run_daemon():
                         m_data["mean"],
                         m_data["max"],
                         m_data["min"],
+                        m_data["time_to_max"],
+                        m_data["time_to_min"],
+                        m_data["first_wave_edge"],
+                        m_data["first_wave_time"],
                         m_data["base_fund"],
                         m_data["foreign_fund"],
                         m_data["bb_width"],
@@ -330,13 +510,36 @@ def run_daemon():
                         state_repaying
                     ], dtype=np.float32)
 
-                    feature_cache[user_id][pair_key].append(state_vector)
+                    state_vector_506 = np.concatenate([scalar_26, m_data["traj_delta"]], axis=0).astype(np.float32)
+                    feature_cache[user_id][pair_key].append(state_vector_506)
                     
                     if len(feature_cache[user_id][pair_key]) < rl_agent.n_stack:
                         continue
                         
                     stacked_obs = np.concatenate(list(feature_cache[user_id][pair_key]), axis=-1).reshape(1, -1)
                     action_score, target_weight, action_type = rl_agent.predict(stacked_obs)
+
+                    # Determine directional target spread and arrival time for Go Engine & UI
+                    if action_score > 5.0:
+                        direction = "WIDENING"
+                        if m_data["first_wave_edge"] > 0:
+                            target_spread = m_data["first_wave_target"]
+                            target_offset_min = m_data["first_wave_offset_min"]
+                        else:
+                            target_spread = m_data["max"]
+                            target_offset_min = m_data["max_offset_min"]
+                    elif action_score < 5.0:
+                        direction = "TRANSFER" if action_type == 1 else "NARROWING"
+                        if m_data["first_wave_edge"] < 0:
+                            target_spread = m_data["first_wave_target"]
+                            target_offset_min = m_data["first_wave_offset_min"]
+                        else:
+                            target_spread = m_data["min"]
+                            target_offset_min = m_data["min_offset_min"]
+                    else:
+                        direction = "WIDENING" if m_data["first_wave_edge"] > 0 else "NARROWING"
+                        target_spread = m_data["first_wave_target"]
+                        target_offset_min = m_data["first_wave_offset_min"]
                     
                     ai_predictions.append({
                         "user_id": int(user_id),
@@ -348,7 +551,14 @@ def run_daemon():
                         "target_weight": float(target_weight),
                         "action_type": int(action_type),
                         "premium_pct": float(m_data["current_spread"]),
-                        "predicted_premium_pct": float(m_data["mean"]),
+                        "predicted_premium_pct": float(target_spread),
+                        "mean_premium_pct": float(m_data["mean"]),
+                        "max_premium_pct": float(m_data["max"]),
+                        "min_premium_pct": float(m_data["min"]),
+                        "target_offset_min": int(target_offset_min),
+                        "max_offset_min": int(m_data["max_offset_min"]),
+                        "min_offset_min": int(m_data["min_offset_min"]),
+                        "direction": direction,
                         "timestamp": time.time()
                     })
             
@@ -356,7 +566,6 @@ def run_daemon():
             if ai_predictions:
                 r.publish("broadcast:opportunities:ai_predicted", json.dumps(ai_predictions))
                 
-                # Logging throttle
                 if time.time() - last_log_time > 10.0:
                     logger.info(f"Published {len(ai_predictions)} AI predictions to Go Engine via Redis PubSub.")
                     last_log_time = time.time()

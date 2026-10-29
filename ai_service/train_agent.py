@@ -8,6 +8,7 @@ from stable_baselines3.common.vec_env import VecNormalize, VecFrameStack
 from stable_baselines3.common.callbacks import EvalCallback
 
 from env.arbitrage_env import ArbitrageEnv
+from model.rl_agent import TrajectoryStateExtractor
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -66,7 +67,7 @@ def train_agent(csv_path: str, total_timesteps: int = 500_000, n_stack: int = 15
 
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx]
-    eval_df = df.iloc[split_idx:]
+    eval_df = df.iloc[split_idx : min(len(df), split_idx + 2000)]
 
     # Inject domain randomizations natively into the Train Env pushing robust adaptation logic
     env_kwargs_train = {
@@ -104,12 +105,21 @@ def train_agent(csv_path: str, total_timesteps: int = 500_000, n_stack: int = 15
         "MlpPolicy",
         train_env,
         verbose=1,
-        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
+        policy_kwargs=dict(
+            features_extractor_class=TrajectoryStateExtractor,
+            features_extractor_kwargs=dict(
+                features_dim=128,
+                n_stack=n_stack,
+                scalar_dim=ArbitrageEnv.SCALAR_DIM,
+                traj_dim=ArbitrageEnv.TRAJ_DIM,
+            ),
+            net_arch=dict(pi=[128, 128], vf=[128, 128]),
+        ),
         learning_rate=linear_schedule(1e-4),
         clip_range=linear_schedule(0.2),
-        n_steps=4096,
-        batch_size=1024,
-        gamma=0.999,  # Expanded temporal vision to look deeply for Forecaster 5-Hour extremas
+        n_steps=2048,
+        batch_size=512,
+        gamma=0.999,  # Expanded temporal vision to look deeply for Forecaster 8-Hour extremas
         ent_coef=0.0,  # CRITICAL: Continuous actions must have 0.0 entropy coeff to allow stddev to anneal!
         max_grad_norm=0.5,
         device="cpu",
@@ -123,6 +133,7 @@ def train_agent(csv_path: str, total_timesteps: int = 500_000, n_stack: int = 15
         best_model_save_path="./model/weights/",
         log_path="./logs/",
         eval_freq=10000,
+        n_eval_episodes=1,
         deterministic=True,
         render=False,
     )

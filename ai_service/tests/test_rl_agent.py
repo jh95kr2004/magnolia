@@ -7,8 +7,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model.rl_agent import PortfolioRLAgent
 
 
-def _build_stacked_obs(spread=0.03, mean_pred=0.005, min_pred=0.001, max_pred=0.035, state_idx=0, n_stack=15):
-    frame = np.zeros(22, dtype=np.float32)
+def _build_stacked_obs(
+    spread=0.03,
+    mean_pred=0.005,
+    min_pred=0.001,
+    max_pred=0.035,
+    first_wave_edge=None,
+    state_idx=0,
+    cur_exposure=None,
+    n_stack=15,
+):
+    frame = np.zeros(506, dtype=np.float32)
     frame[0] = spread
     frame[1] = spread * 0.8
     frame[2] = 0.005
@@ -16,13 +25,22 @@ def _build_stacked_obs(spread=0.03, mean_pred=0.005, min_pred=0.001, max_pred=0.
     frame[4] = mean_pred
     frame[5] = max_pred
     frame[6] = min_pred
-    frame[11] = -0.35 if state_idx > 0 else 0.0
-    frame[12] = 10000.0
-    frame[14] = 0.0005
-    frame[15] = 0.0020
-    frame[16] = 0.0005
-    frame[17] = 0.0030
-    frame[18 + state_idx] = 1.0  # One-hot state
+    frame[7] = 0.20  # time_to_max
+    frame[8] = 0.50  # time_to_min
+    if first_wave_edge is None:
+        up_e = max_pred - spread
+        dn_e = spread - min_pred
+        first_wave_edge = up_e if up_e > dn_e else -dn_e
+    frame[9] = first_wave_edge
+    frame[10] = 0.20 if first_wave_edge >= 0 else 0.50
+    frame[15] = cur_exposure if cur_exposure is not None else (-0.35 if state_idx > 0 else 0.0)
+    frame[16] = 10000.0
+    frame[18] = 0.0005
+    frame[19] = 0.0020
+    frame[20] = 0.0005
+    frame[21] = 0.0030
+    frame[22 + state_idx] = 1.0  # One-hot state
+    frame[26:] = np.linspace(0.0, first_wave_edge, 480, dtype=np.float32)
     return np.tile(frame, (1, n_stack))
 
 
@@ -31,18 +49,31 @@ def test_agent_fallback_heuristic():
     assert agent.model is None
 
     # 1. Tiny spread below friction wall -> flat (target_weight = 0.0)
-    obs_flat = _build_stacked_obs(spread=0.0005, mean_pred=0.0004)
+    obs_flat = _build_stacked_obs(
+        spread=0.0005, mean_pred=0.0004, min_pred=0.0003, max_pred=0.0006, first_wave_edge=-0.0001
+    )
     score_f, weight_f, act_f = agent.predict(obs_flat)
     assert score_f == 5.0
     assert weight_f == 0.0
     assert act_f == 0
 
-    # 2. High 3% spread -> trade entry with positive weight
-    obs_edge = _build_stacked_obs(spread=0.03, mean_pred=0.005)
+    # 2. High 3% spread with narrowing forecast -> Short Base / Long Foreign (score < 5.0)
+    obs_edge = _build_stacked_obs(
+        spread=0.03, mean_pred=0.005, min_pred=0.001, max_pred=0.031, first_wave_edge=-0.025
+    )
     score_e, weight_e, act_e = agent.predict(obs_edge)
     assert score_e == 2.0
     assert 0.15 <= weight_e <= 0.50
     assert act_e == 0
+
+    # 3. Positive spread (+0.2%) expected to WIDEN to +2.8% in 1h -> Long Base / Short Foreign (score > 5.0)
+    obs_widen = _build_stacked_obs(
+        spread=0.002, mean_pred=0.008, min_pred=0.001, max_pred=0.028, first_wave_edge=0.026
+    )
+    score_w, weight_w, act_w = agent.predict(obs_widen)
+    assert score_w == 8.0
+    assert weight_w >= 0.20
+    assert act_w == 0
 
 
 def test_agent_trained_ppo_inference_across_all_4_states():

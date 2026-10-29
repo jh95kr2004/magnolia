@@ -37,7 +37,7 @@ def test_env_initialization(sample_dataframe):
     env = ArbitrageEnv(df=sample_dataframe, initial_balance=10000.0, is_eval=True)
     obs, info = env.reset()
 
-    assert obs.shape == (22,)
+    assert obs.shape == (506,)
     assert env.balance == 10000.0
     assert env.exposure == 0.0
     assert env.state == env.STATE_NEUTRAL
@@ -55,7 +55,7 @@ def test_env_step_trade_entry(sample_dataframe):
     assert env.state == env.STATE_HOLDING_LEG
     assert abs(env.exposure - (-0.5)) < 1e-6
     assert abs(env.entry_spread - 0.03) < 1e-6
-    assert obs[19] == 1.0  # state_holding one-hot
+    assert obs[23] == 1.0  # state_holding one-hot (index 23 in 26-scalar block)
 
 
 def test_env_full_4state_fsm_transfer_and_repay():

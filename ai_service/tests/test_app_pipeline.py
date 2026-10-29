@@ -5,7 +5,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import FXCache, UserAccountCache
+from app import FXCache, UserAccountCache, build_chart_payload
+from model.predictor import extract_trajectory_metrics
 from model.rl_agent import PortfolioRLAgent
 
 
@@ -37,39 +38,49 @@ def test_fx_cache_and_user_account_cache():
     assert u1["pair_states"]["UPBIT|BTC-KRW"] == 1
 
 
-def test_ai_prediction_payload_schema_generation():
+def test_ai_prediction_payload_and_chart_schema():
     ai_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     weights_path = os.path.join(ai_dir, "model", "weights", "ppo_arbitrage_final.zip")
     rl_agent = PortfolioRLAgent(model_path=weights_path, device="cpu", n_stack=15)
 
     feature_deque = collections.deque(maxlen=rl_agent.n_stack)
-    for i in range(rl_agent.n_stack):
-        state_vec = np.array([
+    for _ in range(rl_agent.n_stack):
+        scalar_26 = np.array([
             0.028, 0.020, 0.010, 1.8, 0.008, 0.032, 0.002,
+            0.15, 0.50, -0.026, 0.50,
             0.0001, 0.0001, 0.15, 0.002, 0.0, 50000.0, 0.0,
             0.0005, 0.002, 0.0005, 0.003,
             1.0, 0.0, 0.0, 0.0
         ], dtype=np.float32)
+        traj_480 = np.linspace(0.0, -0.026, 480, dtype=np.float32)
+        state_vec = np.concatenate([scalar_26, traj_480], axis=0)
         feature_deque.append(state_vec)
 
     stacked_obs = np.concatenate(list(feature_deque), axis=-1).reshape(1, -1)
-    assert stacked_obs.shape == (1, 330)
+    assert stacked_obs.shape == (1, 506 * 15)
 
     action_score, target_weight, action_type = rl_agent.predict(stacked_obs)
-    payload = {
-        "user_id": 1,
-        "base_exchange": "UPBIT",
-        "foreign_exchange": "COINBASE",
-        "base_symbol": "BTC-KRW",
-        "foreign_symbol": "BTC-USD",
-        "action_score": float(action_score),
-        "target_weight": float(target_weight),
-        "action_type": int(action_type),
-        "premium_pct": 0.028,
-        "predicted_premium_pct": 0.008,
-    }
+    assert 0.0 <= target_weight <= 1.0
+    assert action_type in (0, 1, 2)
 
-    assert payload["base_exchange"] == "UPBIT"
-    assert payload["foreign_exchange"] == "COINBASE"
-    assert 0.0 <= payload["target_weight"] <= 1.0
-    assert payload["action_type"] in (0, 1, 2)
+    # Verify chart payload builder
+    history_deque = collections.deque(maxlen=1440)
+    history_deque.append({
+        "minute_bucket": 1000,
+        "timestamp_iso": "2026-10-30T00:00:00+00:00",
+        "exchange_premium_spread": 0.0027,
+        "ai_past_pred_spread": 0.0024,
+    })
+    traj = np.linspace(0.0027, 0.028, 480, dtype=np.float32)
+    metrics = extract_trajectory_metrics(0.0027, traj, friction_threshold=0.0025)
+    chart = build_chart_payload(
+        pair_key=("UPBIT", "BTC-KRW", "COINBASE", "BTC-USD"),
+        history_deque=history_deque,
+        metrics=metrics,
+        current_spread=0.0027,
+    )
+    assert chart["base_exchange"] == "UPBIT"
+    assert len(chart["history"]) == 1
+    assert "ai_past_pred_pct" in chart["history"][0]
+    assert len(chart["forecast"]) >= 96
+    assert chart["summary"]["direction"] == "WIDENING"
