@@ -79,6 +79,8 @@ type Engine struct {
 
 	// Live unrealized PnL USD cache per "Exchange|Symbol" updated by RunPositionMonitor
 	liveUnrealizedPnLs map[string]float64
+	rawQuotes          map[string]exchange.PriceUpdate
+	latestQuotes       map[string]exchange.PriceUpdate
 
 	// Error logging throttle
 	lastErrorLogTime   map[string]time.Time
@@ -216,6 +218,8 @@ func NewEngine(
 		isDraining:         botStatus != "RUNNING",
 		walletProxy:        walletProxy,
 		liveUnrealizedPnLs: make(map[string]float64),
+		rawQuotes:          make(map[string]exchange.PriceUpdate),
+		latestQuotes:       make(map[string]exchange.PriceUpdate),
 		lastErrorLogTime:   make(map[string]time.Time),
 	}
 	e.strategies = strats
@@ -528,10 +532,6 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 	go e.ListenUserCommands(ctx)
 	e.publishAccountState(ctx)
 
-	// Cache to hold the latest seen prices per symbol, since positions need both Base and Foreign
-	// quotes
-	latestQuotes := make(map[string]exchange.PriceUpdate)
-
 	ticker := time.NewTicker(2 * time.Second) // Fallback timer for Expiration checks
 	defer ticker.Stop()
 
@@ -544,27 +544,35 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 			if quote.FXRate > 0 && quote.QuoteCurrency != "" {
 				SetFXRate(string(quote.QuoteCurrency), quote.FXRate)
 			}
-			adjQuote := e.applySimOffsetToQuote(quote)
-			latestQuotes[string(adjQuote.Symbol)] = adjQuote
 
 			e.mu.Lock()
-			e.evaluateAllOpenPositions(ctx, latestQuotes)
+			if e.rawQuotes == nil {
+				e.rawQuotes = make(map[string]exchange.PriceUpdate)
+			}
+			if e.latestQuotes == nil {
+				e.latestQuotes = make(map[string]exchange.PriceUpdate)
+			}
+			e.rawQuotes[string(quote.Symbol)] = quote
+			adjQuote := e.applySimOffsetToQuote(quote)
+			e.latestQuotes[string(adjQuote.Symbol)] = adjQuote
+
+			e.evaluateAllOpenPositions(ctx, e.latestQuotes)
 			if !e.isDraining && e.botStatus == "RUNNING" {
-				e.evaluateRebalancing(ctx, latestQuotes)
+				e.evaluateRebalancing(ctx, e.latestQuotes)
 			}
 			e.publishAccountState(ctx)
 			e.mu.Unlock()
 		case <-ticker.C:
 			e.mu.Lock()
-			// Re-apply gradual offset interpolation on cached quotes as ramp time progresses
-			if e.isPaper {
-				for sym, q := range latestQuotes {
-					latestQuotes[sym] = e.applySimOffsetToQuote(q)
+			// Re-apply gradual offset interpolation on raw quotes (never compounding!) as ramp time progresses
+			if e.rawQuotes != nil {
+				for sym, rawQ := range e.rawQuotes {
+					e.latestQuotes[sym] = e.applySimOffsetToQuote(rawQ)
 				}
 			}
-			e.evaluateAllOpenPositions(ctx, latestQuotes)
+			e.evaluateAllOpenPositions(ctx, e.latestQuotes)
 			if !e.isDraining && e.botStatus == "RUNNING" {
-				e.evaluateRebalancing(ctx, latestQuotes)
+				e.evaluateRebalancing(ctx, e.latestQuotes)
 			}
 			e.publishAccountState(ctx)
 			e.mu.Unlock()
@@ -1438,6 +1446,11 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					e.simTargetOffsetPct = cmd.SimTargetOffsetPct
 					e.simRampMinutes = cmd.SimRampMinutes
 					e.simStartedAt = time.Now().Unix()
+					if e.rawQuotes != nil {
+						for sym, rawQ := range e.rawQuotes {
+							e.latestQuotes[sym] = e.applySimOffsetToQuote(rawQ)
+						}
+					}
 					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 						`{"action":"SIM_OFFSET_UPDATED","mode":"PAPER","message":"Paper Simulator: %s price ramping from %.2f%% to %.2f%% over %.1f min."}`,
 						e.simExchange, e.simStartOffsetPct, e.simTargetOffsetPct, e.simRampMinutes,

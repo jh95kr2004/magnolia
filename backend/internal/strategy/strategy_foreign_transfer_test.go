@@ -187,6 +187,7 @@ func TestExecuteHedgedRebalanceDeltaNeutral(t *testing.T) {
 
 	strat := &ForeignTransferStrategy{}
 	exec := execution.NewExecutor(false)
+	exec.WithdrawPollInterval = 10 * time.Millisecond
 
 	rebalanceUSD := 10000.0
 	if err := strat.ExecuteHedgedRebalance(context.Background(), exec, reversePair, rebalanceUSD, nil); err != nil {

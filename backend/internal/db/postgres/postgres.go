@@ -24,9 +24,9 @@ func NewDB(dsn string) (*DB, error) {
 		return nil, err
 	}
 
-	// db.AutoMigrate automatically creates or updates the relational database schema (tables, columns) 
-	// to match the latest defined Go structs (UserAPIKey, WalletWhitelist, etc.)
-	// This ensures our PostgreSQL database is always in sync with our code without the need to run manual SQL scripts.
+	// Serialize schema migration across concurrent processes (e.g. engine + node starting simultaneously)
+	// using a PostgreSQL advisory lock so concurrent CREATE TABLE statements never collide.
+	_ = db.Exec("SELECT pg_advisory_lock(99887766)")
 	err = db.AutoMigrate(
 		&User{},
 		&UserAPIKey{},
@@ -38,6 +38,7 @@ func NewDB(dsn string) (*DB, error) {
 		&LeaderLease{},
 		&SupportedExchange{},
 	)
+	_ = db.Exec("SELECT pg_advisory_unlock(99887766)")
 	if err != nil {
 		log.Printf("Migration failed: %v", err)
 		return nil, err
@@ -139,13 +140,11 @@ func (db *DB) CleanOrphanedUsers() ([]User, error) {
 	return orphanedUsers, nil
 }
 
-// GetUserSettings fetches global settings and webhooks for a user.
+// GetUserSettings fetches global settings and webhooks for a user, auto-seeding defaults if none exist yet.
 func (db *DB) GetUserSettings(userID uint) (*UserSettings, error) {
 	var settings UserSettings
 	err := db.conn.Where("user_id = ?", userID).First(&settings).Error
-	if err != nil {
-		return &settings, err
-	}
+	settings.UserID = userID
 	if settings.ActiveViewMode == "" {
 		settings.ActiveViewMode = "PAPER"
 	}
@@ -163,6 +162,10 @@ func (db *DB) GetUserSettings(userID uint) (*UserSettings, error) {
 	}
 	if settings.SimExchange == "" {
 		settings.SimExchange = "UPBIT"
+	}
+	if err != nil {
+		_ = db.conn.Create(&settings).Error
+		return &settings, nil
 	}
 	return &settings, nil
 }

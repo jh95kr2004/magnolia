@@ -49,7 +49,8 @@ type TransferAction struct {
 // Executor coordinates complex multi-exchange trade execution and handles rollbacks.
 // It is designed as a lightweight utility meant to be invoked by ArbitrageStrategy instances.
 type Executor struct {
-	retryOnFailure bool
+	retryOnFailure       bool
+	WithdrawPollInterval time.Duration
 }
 
 // NewExecutor creates a new pure orchestration utility.
@@ -199,7 +200,10 @@ func (e *Executor) ExecutePipeline(ctx context.Context, actions []*TransferActio
 			log.Printf("⏳ [Executor] Step %d Withdrawal %s Initiated. Polling network...", i+1, withdrawRes.WithdrawID)
 
 			// Poll for withdrawal success
-			pollInterval := 15 * time.Second
+			pollInterval := e.WithdrawPollInterval
+			if pollInterval <= 0 {
+				pollInterval = 15 * time.Second
+			}
 			ticker := time.NewTicker(pollInterval)
 			defer ticker.Stop()
 
@@ -330,6 +334,16 @@ func (e *Executor) CheckPreflightBalance(ctx context.Context, client exchange.Cl
 	}
 
 	baseCur, quoteCur := exchange.ParseSymbol(req.Symbol)
+
+	// If selling and the account already holds sufficient baseCur (including already-borrowed coins),
+	// selling baseCur for quoteCur requires no additional quoteCur balance.
+	if req.Side == exchange.SellOrder {
+		for _, b := range balances {
+			if string(b.Currency) == string(baseCur) && b.Available >= req.Amount {
+				return nil
+			}
+		}
+	}
 
 	isMarginShort := req.Side == exchange.SellOrder && client.SupportsMargin()
 

@@ -357,6 +357,7 @@ func (s *Server) handleBotStatus(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Mode           string `json:"mode"`             // "PAPER" | "LIVE"
 		SubAction      string `json:"sub_action"`       // "RUN" | "DRAIN" | "STOP_AND_CLOSE" | "VIEW_ONLY"
+		Action         string `json:"action"`           // Alias for sub_action
 		ActiveViewMode string `json:"active_view_mode"` // Optional UI view mode switch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -366,6 +367,9 @@ func (s *Server) handleBotStatus(w http.ResponseWriter, r *http.Request) {
 
 	mode := strings.ToUpper(strings.TrimSpace(req.Mode))
 	subAction := strings.ToUpper(strings.TrimSpace(req.SubAction))
+	if subAction == "" {
+		subAction = strings.ToUpper(strings.TrimSpace(req.Action))
+	}
 	viewMode := strings.ToUpper(strings.TrimSpace(req.ActiveViewMode))
 
 	if viewMode == "PAPER" || viewMode == "LIVE" {
@@ -512,11 +516,14 @@ func (s *Server) handleSimOffset(w http.ResponseWriter, r *http.Request) {
 
 	if s.Redis != nil {
 		cmdPayload, _ := json.Marshal(map[string]interface{}{
-			"action":            "SET_SIM_OFFSET",
-			"mode":              "PAPER",
-			"exchange":          ex,
-			"target_offset_pct": req.TargetOffsetPct,
-			"ramp_minutes":      req.RampMinutes,
+			"action":                "SET_SIM_OFFSET",
+			"mode":                  "PAPER",
+			"exchange":              ex,
+			"sim_exchange":          ex,
+			"target_offset_pct":     req.TargetOffsetPct,
+			"sim_target_offset_pct": req.TargetOffsetPct,
+			"ramp_minutes":          req.RampMinutes,
+			"sim_ramp_minutes":      req.RampMinutes,
 		})
 		_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), cmdPayload)
 	}
