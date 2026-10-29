@@ -176,35 +176,35 @@ func (r *GlobalRawRanker) EvaluateAllCache(ctx context.Context, pairs []CrossMar
 		baseUpdate := baseVal.(*exchange.PriceUpdate)
 		foreignUpdate := foreignVal.(*exchange.PriceUpdate)
 
-		fxRate := 1.0
-		if p.BaseMarketInfo.QuoteCurrency != "USD" {
-			if p.BaseMarketInfo.QuoteCurrency == "KRW" {
-				fxRate = krwRate
-			} else {
-				fxRate = krwRate // Default fallback for MVP
-			}
+		baseFX := 1.0
+		if p.BaseMarketInfo.QuoteCurrency == "KRW" {
+			baseFX = krwRate
+		}
+		foreignFX := 1.0
+		if p.ForeignMarketInfo.QuoteCurrency == "KRW" {
+			foreignFX = krwRate
 		}
 
 		// Retrieve normalized USD Prices. Preference for Bid/Ask order.
 		baseUSD := baseUpdate.BidUSD
 		if baseUSD == 0 && baseUpdate.RawBid > 0 {
-			baseUSD = baseUpdate.RawBid / fxRate
+			baseUSD = baseUpdate.RawBid / baseFX
 		}
 
 		foreignUSD := foreignUpdate.AskUSD
 		if foreignUSD == 0 && foreignUpdate.RawAsk > 0 {
-			foreignUSD = foreignUpdate.RawAsk
+			foreignUSD = foreignUpdate.RawAsk / foreignFX
 		}
 
 		// Calculate future prices
 		baseFutureUSD := baseUpdate.BidFutureUSD
 		if baseFutureUSD == 0 && baseUpdate.RawFutureBid > 0 {
-			baseFutureUSD = baseUpdate.RawFutureBid / fxRate
+			baseFutureUSD = baseUpdate.RawFutureBid / baseFX
 		}
 
 		foreignFutureUSD := foreignUpdate.AskFutureUSD
 		if foreignFutureUSD == 0 && foreignUpdate.RawFutureAsk > 0 {
-			foreignFutureUSD = foreignUpdate.RawFutureAsk
+			foreignFutureUSD = foreignUpdate.RawFutureAsk / foreignFX
 		}
 
 		if baseUSD <= 0 || foreignUSD <= 0 {

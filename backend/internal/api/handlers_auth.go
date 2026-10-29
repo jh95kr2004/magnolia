@@ -120,6 +120,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create Default Strategy & Risk Thresholds
+	_ = s.DB.SaveThresholds(postgres.DefaultUserThreshold(user.ID, "PremiumStrategy"))
+
 	// Push newly created user to the Dangling Queue so an Engine picks them up
 	if s.Redis != nil {
 		if pushErr := s.Redis.PushDanglingClient(context.Background(), user.Region, fmt.Sprint(user.ID)); pushErr != nil {

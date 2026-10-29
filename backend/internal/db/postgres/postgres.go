@@ -210,11 +210,48 @@ func (db *DB) UpdateAPIKeyStatus(userID uint, exchangeName string, isActive bool
 	return db.conn.Model(&UserAPIKey{}).Where("user_id = ? AND exchange = ?", userID, exchangeName).Update("is_active", isActive).Error
 }
 
-// LoadThresholds retrieves the strategy settings threshold.
+// DefaultUserThreshold returns the standard recommended strategy & risk configuration for a user.
+func DefaultUserThreshold(userID uint, strategyName string) *UserThreshold {
+	if strategyName == "" {
+		strategyName = "PremiumStrategy"
+	}
+	return &UserThreshold{
+		UserID:                 userID,
+		StrategyName:           strategyName,
+		Enabled:                true,
+		MinTargetProfit:        1.5,
+		MaxStopLoss:            -5.0,
+		MinTargetProfitPercent: 1.5,
+		MaxStopLossPercent:     -5.0,
+		UsePercentParams:       true,
+		MaxAcceptableSpread:    0.5,
+		CapitalLimitUsd:        50000.0,
+		PerPositionLimitUsd:    10000.0,
+		MaxRiskScore:           80.0,
+		RiskMultiplier:         1.0,
+		BalanceSkewThreshold:   0.15,
+		RebalanceTriggerSkew:   0.20,
+		RebalanceTargetSkew:    0.50,
+		RebalanceMaxPremium:    0.0,
+		RetryOnFailure:         true,
+	}
+}
+
+// LoadThresholds retrieves the strategy settings threshold, auto-seeding defaults if none exist yet.
 func (db *DB) LoadThresholds(userID uint, strategyName string) (*UserThreshold, error) {
+	if strategyName == "" {
+		strategyName = "PremiumStrategy"
+	}
 	var threshold UserThreshold
 	err := db.conn.Where("user_id = ? AND strategy_name = ?", userID, strategyName).First(&threshold).Error
-	return &threshold, err
+	if err != nil {
+		def := DefaultUserThreshold(userID, strategyName)
+		if saveErr := db.conn.Create(def).Error; saveErr == nil {
+			return def, nil
+		}
+		return def, nil
+	}
+	return &threshold, nil
 }
 
 // SaveThresholds updates or creates a strategy tuning configuration.

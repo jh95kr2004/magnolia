@@ -169,7 +169,7 @@ func (c *CoinbaseClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 						var pubMarkets []MarketInfo
 						for _, p := range pubProducts {
 							quoteCur := toUnifiedCurrencyFromCoinbase(p.QuoteCurrency)
-							if quoteCur != "USD" && quoteCur != "USDC" && quoteCur != "USDT" {
+							if quoteCur != "USD" {
 								continue
 							}
 							pubMarkets = append(pubMarkets, MarketInfo{

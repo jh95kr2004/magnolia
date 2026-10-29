@@ -234,8 +234,8 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 			isTradingEnabled = isTradingEnabled && (p.MarketState == "active")
 		}
 
-		// Filtering directly at the client level: we only care about specific markets for arbitrage
-		supportedQuotes := []Currency{"KRW", "USDT"}
+		// Filtering directly at the client level: we only care about KRW fiat markets on Upbit for cross-exchange arbitrage
+		supportedQuotes := []Currency{"KRW"}
 		isSupported := false
 		for _, sq := range supportedQuotes {
 			if quoteCurrency == sq {

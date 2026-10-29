@@ -135,11 +135,18 @@ func (p *PubSubClient) PopDanglingClient(ctx context.Context, region string) (st
 
 // PublishRawOpportunities broadcasts raw opportunity calculations from the Global Ranker.
 func (p *PubSubClient) PublishRawOpportunities(ctx context.Context, payload []byte) error {
+	_ = p.client.Set(ctx, "broadcast:opportunities:raw:latest", payload, 2*time.Minute).Err()
 	return p.client.Publish(ctx, "broadcast:opportunities:raw", payload).Err()
 }
 
 // SubscribeRawOpportunities listens for global raw opportunity data broadcasts.
 func (p *PubSubClient) SubscribeRawOpportunities(ctx context.Context, outCh chan<- []byte) {
+	if cached, err := p.client.Get(ctx, "broadcast:opportunities:raw:latest").Bytes(); err == nil && len(cached) > 0 {
+		select {
+		case outCh <- cached:
+		default:
+		}
+	}
 	pubsub := p.client.Subscribe(ctx, "broadcast:opportunities:raw")
 	defer pubsub.Close()
 	ch := pubsub.Channel()

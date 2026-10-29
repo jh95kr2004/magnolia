@@ -366,10 +366,21 @@ func (s *Server) applySimOffsetToRawOpps(rawData []byte, userID uint) []byte {
 		deltaPct := 0.0
 		if strings.EqualFold(baseEx, simEx) {
 			deltaPct = currOffsetPct
+			if bp, ok := opp["base_price_usd"].(float64); ok && bp > 0 {
+				opp["base_price_usd"] = bp * (1.0 + currOffsetPct/100.0)
+			}
 		} else if strings.EqualFold(foreignEx, simEx) {
 			deltaPct = -currOffsetPct
+			if fp, ok := opp["foreign_price_usd"].(float64); ok && fp > 0 {
+				opp["foreign_price_usd"] = fp * (1.0 + currOffsetPct/100.0)
+			}
 		}
 		if math.Abs(deltaPct) > 1e-6 {
+			if premPct, ok := opp["premium_pct"].(float64); ok {
+				newPremPct := premPct + deltaPct
+				opp["premium_pct"] = newPremPct
+				opp["expected_margin"] = math.Abs(newPremPct)
+			}
 			if roi, ok := opp["expected_roi"].(float64); ok {
 				opp["expected_roi"] = roi + (deltaPct / 100.0)
 			}
