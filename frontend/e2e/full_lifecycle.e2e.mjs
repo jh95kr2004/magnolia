@@ -199,6 +199,15 @@ async function runFullLifecycleE2E() {
     `  ✅ Dashboard SSE 'portfolio' event received: total_equity_usd=$${portfolioEvt.total_equity_usd}, exchanges=${portfolioEvt.exchange_balances.map((e) => `${e.name}(${e.quote_currency})`).join(', ')}`
   );
 
+  const eqHistRes = await apiRequest('/api/portfolio/history?mode=PAPER&range=24H', { token });
+  assert(
+    eqHistRes.status === 200 && Array.isArray(eqHistRes.data?.points) && eqHistRes.data.points.length >= 2,
+    `Expected >= 2 equity history points from /api/portfolio/history, got: ${JSON.stringify(eqHistRes)}`
+  );
+  console.log(
+    `  ✅ Portfolio Equity History verified (/api/portfolio/history): ${eqHistRes.data.points.length} points, fx_rate_krw=${eqHistRes.data.fx_rate_krw}`
+  );
+
   // 4. Verify Opportunities SSE & Price Offset Simulator (+4.0% on UPBIT)
   console.log('\n[Step 4] Applying +4.0% Price Offset Simulator on UPBIT & verifying /api/ws/opportunities SSE');
   const simRes = await apiRequest('/api/settings/sim_offset', {
@@ -297,11 +306,48 @@ async function runFullLifecycleE2E() {
     );
 
     await browser.navigate(`${BASE_URL}/dashboard`);
-    await browser.waitForText('UPBIT 가용 원화 (KRW)');
-    await browser.waitForText('COINBASE 가용 달러 (USD)');
+    await browser.waitForText('거래소별 가용 통화');
+    await browser.waitForText('UPBIT');
+    await browser.waitForText('COINBASE');
     await browser.waitForText('BTC');
     await browser.waitForText('UPBIT → COINBASE');
-    console.log('  ✅ [Chromium DOM] /dashboard rendered dynamic exchange balances & active BTC position!');
+
+    // Verify Phase 13 UI components: Left Sidebar, Equity Area Chart, Exchange Pie Chart, Currency Switcher (USD <-> KRW), and Column Tooltip
+    const initialDom = await browser.execute(`
+      const sidebar = !!document.querySelector('[data-testid="left-sidebar"]');
+      const areaChart = !!document.querySelector('[data-testid="equity-area-chart"]');
+      const pieChart = !!document.querySelector('[data-testid="exchange-pie-chart"]');
+      const exList = !!document.querySelector('[data-testid="exchange-currency-list"]');
+      const usdVal = document.querySelector('[data-testid="total-equity-value"]')?.textContent || '';
+      const krwBtn = document.querySelector('[data-testid="currency-btn-KRW"]');
+      if (krwBtn) krwBtn.click();
+      const tooltipTrigger = document.querySelector('[data-testid="column-tooltip-trigger"]');
+      if (tooltipTrigger) tooltipTrigger.click();
+      return { sidebar, areaChart, pieChart, exList, usdVal };
+    `);
+    await sleep(200);
+    const afterClickDom = await browser.execute(`
+      const krwVal = document.querySelector('[data-testid="total-equity-value"]')?.textContent || '';
+      const tooltipPopup = !!document.querySelector('[data-testid="column-tooltip-popup"]');
+      const usdBtn = document.querySelector('[data-testid="currency-btn-USD"]');
+      if (usdBtn) usdBtn.click();
+      return { krwVal, tooltipPopup };
+    `);
+    await sleep(150);
+    const phase13DomCheck = { ...initialDom, ...afterClickDom };
+    assert(
+      phase13DomCheck.sidebar &&
+        phase13DomCheck.areaChart &&
+        phase13DomCheck.pieChart &&
+        phase13DomCheck.exList &&
+        phase13DomCheck.usdVal.startsWith('$') &&
+        phase13DomCheck.krwVal.startsWith('₩') &&
+        phase13DomCheck.tooltipPopup,
+      `Phase 13 DOM check failed: ${JSON.stringify(phase13DomCheck)}`
+    );
+    console.log(
+      `  ✅ [Chromium DOM] /dashboard verified: Left Sidebar, Equity Area Chart (${phase13DomCheck.usdVal} ↔ ${phase13DomCheck.krwVal}), Pie Chart, Exchange List & Column Tooltip!`
+    );
 
     // 7b. Verify KO -> EN -> KO language switch in Chromium DOM
     await browser.execute(
