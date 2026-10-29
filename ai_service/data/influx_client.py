@@ -146,11 +146,14 @@ class MarketDataFetcher:
             # Forward fill and drop NaNs
             merged = merged.ffill().dropna()
 
-            # Calculate dynamic premium
-            # Spread = (Local Price) / (Foreign Price * FX Rate) - 1.0
+            # Calculate dynamic premium (both local_price and foreign_price from ask_usd/bid_usd are in USD)
             merged["exchange_premium_spread"] = (
-                merged["local_price"] / (merged["foreign_price"] * merged["fx_rate"])
+                merged["local_price"] / merged["foreign_price"]
             ) - 1.0
+
+            # Convert local_price from USD to native quote currency (e.g. KRW) to match feature_scaler and live ticks
+            if local_symbol.upper().endswith("KRW"):
+                merged["local_price"] = merged["local_price"] * merged["fx_rate"]
 
             # The resulting dataframe contains [exchange_premium_spread, local_price, foreign_price, fx_rate, base_funding_rate, foreign_funding_rate]
             return merged
