@@ -105,7 +105,8 @@ class PremiumForecaster(nn.Module):
         impulse_med = (t_grid / tau_med) * torch.exp(1.0 - t_grid / tau_med) * (0.40 * med_vel)
         momentum_wave = impulse_fast + impulse_med
 
-        # (c) Empirical spectral harmonics from winsorized recent window (captures 1h-4h cyclical waves)
+        # (c) Multi-band empirical spectral harmonics from winsorized recent window
+        #     Captures macro (1.5h-3h), meso (30m-60m), and micro (10m-25m) cyclical market structure
         w_spec = min(seq_len, 360)
         if w_spec >= 16:
             recent_win = target_seq[:, -w_spec:, :]
@@ -113,12 +114,12 @@ class PremiumForecaster(nn.Module):
             tau_hist = torch.linspace(0.0, 1.0, w_spec, device=x.device, dtype=x.dtype).view(1, w_spec, 1)
             chord = recent_win[:, :1, :] + (recent_win[:, -1:, :] - recent_win[:, :1, :]) * tau_hist
             detrended = recent_win - chord
-            # Winsorize outlier flash spikes to +/- 1.5 sigma so harmonic projection stays clean
+            # Winsorize extreme outlier flash spikes to +/- 1.8 sigma while preserving microstructure texture
             local_std = detrended.std(dim=1, keepdim=True).clamp(min=1e-5)
-            detrended_clean = torch.clamp(detrended, -1.5 * local_std, 1.5 * local_std)
+            detrended_clean = torch.clamp(detrended, -1.8 * local_std, 1.8 * local_std)
 
             spec = torch.fft.rfft(detrended_clean, dim=1)  # [batch, w_spec//2 + 1, 3]
-            max_k = min(spec.size(1) - 1, 6)
+            max_k = min(spec.size(1) - 1, 36)
             m_steps = torch.arange(1, self.pred_len + 1, device=x.device, dtype=x.dtype).view(1, self.pred_len, 1)
             harmonic_sum = torch.zeros((x.size(0), self.pred_len, self.output_size), device=x.device, dtype=x.dtype)
 
@@ -132,13 +133,16 @@ class PremiumForecaster(nn.Module):
                 phase_m = omega_k * m_steps
                 # Zero-anchored at m=0 so there is zero discontinuity at NOW
                 wave_k = 2.0 * (real_end * (torch.cos(phase_m) - 1.0) - imag_end * torch.sin(phase_m))
-                harmonic_sum = harmonic_sum + wave_k / np.sqrt(float(k - 1))
+                # Higher frequency modes decay slightly faster over the 8h horizon as phase uncertainty grows
+                freq_decay = torch.exp(-0.035 * float(k - 2) * t_grid)
+                scale_w = 1.0 / (float(k - 1) ** 0.35)
+                harmonic_sum = harmonic_sum + wave_k * scale_w * freq_decay
 
             # Gate harmonic amplitude by GRU attention context and damp smoothly over 8h horizon
             ctx_gate = 1.0 + 0.25 * torch.tanh(context.mean(dim=1, keepdim=True).unsqueeze(1))
-            spectral_damping = torch.exp(-1.15 * t_grid) * (1.0 - torch.exp(-12.0 * t_grid))
-            spectral_wave = 0.55 * harmonic_sum * spectral_damping * ctx_gate
-            spectral_wave = torch.clamp(spectral_wave, -1.25 * local_std, 1.25 * local_std)
+            spectral_damping = torch.exp(-0.75 * t_grid) * (1.0 - torch.exp(-18.0 * t_grid))
+            spectral_wave = 0.62 * harmonic_sum * spectral_damping * ctx_gate
+            spectral_wave = torch.clamp(spectral_wave, -1.6 * local_std, 1.6 * local_std)
         else:
             spectral_wave = 0.0
 

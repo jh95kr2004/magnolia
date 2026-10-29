@@ -113,7 +113,7 @@ export const Opportunities = () => {
                   : 20;
 
             return {
-              id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+              id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}`,
               coin,
               baseExchange: item.base_exchange || 'UPBIT',
               foreignExchange: item.foreign_exchange || 'COINBASE',
@@ -130,14 +130,15 @@ export const Opportunities = () => {
               strategy: strategyCode,
               targetWeightPct
             };
-          });
+          })
+          .sort((a, b) => a.coin.localeCompare(b.coin));
         setOpportunities(merged);
       } else {
         const aiEntries = Object.values(aiByCoin);
         if (aiEntries.length > 0) {
           const fallbackList = aiEntries
             .filter((a) => Math.abs(Number(a.current_premium_pct || 0)) < 80)
-            .map((item, idx) => {
+            .map((item) => {
               const coin = String(item.base_symbol || 'BTC-KRW').split('-')[0].toUpperCase();
               const curPct = Number(item.current_premium_pct || 0);
               const predPct = Number(item.predicted_premium_pct ?? curPct * 0.65);
@@ -145,7 +146,7 @@ export const Opportunities = () => {
               const targetOffsetMin = Number(item.target_offset_min || 60);
               const direction = item.direction || (predPct > curPct ? 'WIDENING' : 'NARROWING');
               return {
-                id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+                id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}`,
                 coin,
                 baseExchange: item.base_exchange || 'UPBIT',
                 foreignExchange: item.foreign_exchange || 'COINBASE',
@@ -165,7 +166,8 @@ export const Opportunities = () => {
                     ? Math.round(item.target_weight * 100)
                     : 25
               };
-            });
+            })
+            .sort((a, b) => a.coin.localeCompare(b.coin));
           setOpportunities(fallbackList);
         }
       }
@@ -175,7 +177,7 @@ export const Opportunities = () => {
       try {
         const data = JSON.parse(e.data);
         if (Array.isArray(data)) {
-          const nextMap = {};
+          const nextMap = { ...rawMapRef.current };
           data.forEach((item) => {
             if (!item || !item.base_symbol) return;
             if (!String(item.base_symbol).endsWith('-KRW')) return;
@@ -645,6 +647,7 @@ export const Opportunities = () => {
                         <tr>
                           <td colSpan={8} style={{ padding: 0 }}>
                             <PremiumTrajectoryChart
+                              key={opp.id}
                               baseExchange={opp.baseExchange}
                               baseSymbol={opp.baseSymbol}
                               foreignExchange={opp.foreignExchange}
