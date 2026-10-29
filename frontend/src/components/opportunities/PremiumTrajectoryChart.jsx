@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { apiClient } from '../../services/api';
 
 const RANGE_OPTIONS = ['1H', '6H', '24H'];
@@ -23,7 +23,30 @@ export const PremiumTrajectoryChart = ({
 }) => {
   const [range, setRange] = useState('6H');
   const [chartData, setChartData] = useState(null);
-  const [hoverIdx, setHoverIdx] = useState(null);
+  const [hoverX, setHoverX] = useState(null);
+  const containerRef = useRef(null);
+  const [containerWidth, setContainerWidth] = useState(1240);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      if (el.clientWidth && el.clientWidth > 200) {
+        setContainerWidth(el.clientWidth);
+      }
+    };
+    measure();
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(measure);
+      ro.observe(el);
+    }
+    window.addEventListener('resize', measure);
+    return () => {
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -105,14 +128,17 @@ export const PremiumTrajectoryChart = ({
           })
         : Array.from({ length: 49 }, (_, i) => {
             const offMin = i * 10;
+            const t = offMin / 480.0;
+            const wave = Math.sin(offMin / 28.0) * 0.08 * Math.exp(-1.1 * t);
             return {
               timestamp: new Date(Date.now() + offMin * 60000).toISOString(),
               offset_min: offMin,
-              predicted_pct: curPct * Math.exp((-0.35 * offMin) / 480.0)
+              predicted_pct: curPct * Math.exp((-0.35 * offMin) / 480.0) + wave
             };
           });
 
-    // Identify MAX and MIN on the future forecast curve (excluding index 0)
+    // Identify MAX and MIN on the future forecast curve, preferring genuine interior turning points
+    // beyond the immediate NOW origin (offset_min >= 15) when index 1 is merely the starting boundary.
     let maxIdx = 1;
     let minIdx = 1;
     for (let i = 1; i < forecast.length; i++) {
@@ -121,6 +147,70 @@ export const PremiumTrajectoryChart = ({
       }
       if (forecast[i].predicted_pct < (forecast[minIdx]?.predicted_pct ?? Infinity)) {
         minIdx = i;
+      }
+    }
+
+    if (Number(forecast[maxIdx]?.offset_min ?? 0) <= 6 && forecast.length > 6) {
+      let bestLocalPeak = -1;
+      for (let i = 2; i < forecast.length - 1; i++) {
+        if (
+          Number(forecast[i].offset_min) >= 15 &&
+          forecast[i].predicted_pct >= forecast[i - 1].predicted_pct &&
+          forecast[i].predicted_pct >= forecast[i + 1].predicted_pct
+        ) {
+          if (
+            bestLocalPeak === -1 ||
+            forecast[i].predicted_pct > forecast[bestLocalPeak].predicted_pct
+          ) {
+            bestLocalPeak = i;
+          }
+        }
+      }
+      if (bestLocalPeak !== -1) {
+        maxIdx = bestLocalPeak;
+      } else {
+        for (let i = 1; i < forecast.length; i++) {
+          if (Number(forecast[i].offset_min) >= 15) {
+            if (
+              Number(forecast[maxIdx]?.offset_min ?? 0) < 15 ||
+              forecast[i].predicted_pct > forecast[maxIdx].predicted_pct
+            ) {
+              maxIdx = i;
+            }
+          }
+        }
+      }
+    }
+
+    if (Number(forecast[minIdx]?.offset_min ?? 0) <= 6 && forecast.length > 6) {
+      let bestLocalTrough = -1;
+      for (let i = 2; i < forecast.length - 1; i++) {
+        if (
+          Number(forecast[i].offset_min) >= 15 &&
+          forecast[i].predicted_pct <= forecast[i - 1].predicted_pct &&
+          forecast[i].predicted_pct <= forecast[i + 1].predicted_pct
+        ) {
+          if (
+            bestLocalTrough === -1 ||
+            forecast[i].predicted_pct < forecast[bestLocalTrough].predicted_pct
+          ) {
+            bestLocalTrough = i;
+          }
+        }
+      }
+      if (bestLocalTrough !== -1) {
+        minIdx = bestLocalTrough;
+      } else {
+        for (let i = 1; i < forecast.length; i++) {
+          if (Number(forecast[i].offset_min) >= 15) {
+            if (
+              Number(forecast[minIdx]?.offset_min ?? 0) < 15 ||
+              forecast[i].predicted_pct < forecast[minIdx].predicted_pct
+            ) {
+              minIdx = i;
+            }
+          }
+        }
       }
     }
 
@@ -158,10 +248,10 @@ export const PremiumTrajectoryChart = ({
     };
   }, [chartData, livePremiumPct]);
 
-  const width = 920;
+  const width = Math.max(640, containerWidth);
   const height = 240;
-  const padLeft = 52;
-  const padRight = 24;
+  const padLeft = 48;
+  const padRight = 12;
   const padTop = 26;
   const padBottom = 30;
   const plotW = width - padLeft - padRight;
@@ -243,14 +333,53 @@ export const PremiumTrajectoryChart = ({
   const isWidening = processed.direction === 'WIDENING';
   const forecastColor = isWidening ? '#10b981' : '#f59e0b';
 
-  const combinedInteractive = [
-    ...histPoints.map((p) => ({ ...p, xPos: p.x })),
-    ...futPoints.slice(1).map((p) => ({ ...p, xPos: p.x }))
-  ];
-  const hoveredPoint =
-    hoverIdx !== null && combinedInteractive[hoverIdx]
-      ? combinedInteractive[hoverIdx]
-      : null;
+  // Compute exact cursor-locked hover state with linear segment interpolation
+  let hoveredPoint = null;
+  if (hoverX !== null) {
+    const clampedX = Math.min(width - padRight, Math.max(padLeft, hoverX));
+    if (clampedX <= nowX && histPoints.length > 0) {
+      let idx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < histPoints.length; i++) {
+        const d = Math.abs(histPoints[i].x - clampedX);
+        if (d < bestDist) {
+          bestDist = d;
+          idx = i;
+        }
+      }
+      const pt = histPoints[idx];
+      hoveredPoint = {
+        ...pt,
+        xPos: clampedX,
+        dotY: pt.yActual,
+        dotColor: '#38bdf8'
+      };
+    } else if (futPoints.length > 0) {
+      let p0 = futPoints[0];
+      let p1 = futPoints[futPoints.length - 1];
+      for (let i = 0; i < futPoints.length - 1; i++) {
+        if (clampedX >= futPoints[i].x && clampedX <= futPoints[i + 1].x) {
+          p0 = futPoints[i];
+          p1 = futPoints[i + 1];
+          break;
+        }
+      }
+      const segSpan = Math.max(1e-6, p1.x - p0.x);
+      const alpha = Math.min(1, Math.max(0, (clampedX - p0.x) / segSpan));
+      const interpPct = p0.predictedPct + alpha * (p1.predictedPct - p0.predictedPct);
+      const interpOffMin = p0.offsetMin + alpha * (p1.offsetMin - p0.offsetMin);
+      const interpY = toY(interpPct);
+      hoveredPoint = {
+        zone: 'FUTURE',
+        xPos: clampedX,
+        yPred: interpY,
+        dotY: interpY,
+        dotColor: forecastColor,
+        offsetMin: interpOffMin,
+        predictedPct: interpPct
+      };
+    }
+  }
 
   const yTicks = [
     processed.maxVal - (processed.maxVal - processed.minVal) * 0.1,
@@ -262,7 +391,7 @@ export const PremiumTrajectoryChart = ({
     <div
       data-testid="premium-trajectory-chart"
       style={{
-        padding: '18px 22px',
+        padding: '14px 12px',
         background: 'rgba(15, 23, 42, 0.72)',
         borderTop: '1px solid rgba(148, 163, 184, 0.14)',
         borderBottom: '1px solid rgba(148, 163, 184, 0.14)'
@@ -363,24 +492,16 @@ export const PremiumTrajectoryChart = ({
       </div>
 
       {/* SVG Trajectory Canvas */}
-      <div style={{ position: 'relative', width: '100%' }}>
+      <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          style={{ width: '100%', height: '230px', display: 'block', overflow: 'visible' }}
-          onMouseLeave={() => setHoverIdx(null)}
+          preserveAspectRatio="none"
+          style={{ width: '100%', height: `${height}px`, display: 'block', overflow: 'visible' }}
+          onMouseLeave={() => setHoverX(null)}
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
             const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
-            let bestIdx = 0;
-            let bestDist = Infinity;
-            combinedInteractive.forEach((pt, idx) => {
-              const d = Math.abs(pt.xPos - relX);
-              if (d < bestDist) {
-                bestDist = d;
-                bestIdx = idx;
-              }
-            });
-            setHoverIdx(bestIdx);
+            setHoverX(relX);
           }}
         >
           <defs>
@@ -587,16 +708,27 @@ export const PremiumTrajectoryChart = ({
             {lang === 'ko' ? '향후 +8시간 (480분) AI 예측 궤적 →' : 'Future +8H (480m) AI Forecast →'}
           </text>
 
-          {/* Hover Crosshair */}
+          {/* Hover Crosshair & Active Curve Tracking Dot */}
           {hoveredPoint && (
-            <line
-              x1={hoveredPoint.xPos}
-              y1={padTop}
-              x2={hoveredPoint.xPos}
-              y2={padTop + plotH}
-              stroke="rgba(255, 255, 255, 0.35)"
-              strokeDasharray="2 2"
-            />
+            <g>
+              <line
+                x1={hoveredPoint.xPos}
+                y1={padTop}
+                x2={hoveredPoint.xPos}
+                y2={padTop + plotH}
+                stroke="rgba(255, 255, 255, 0.45)"
+                strokeWidth="1.2"
+                strokeDasharray="3 3"
+              />
+              <circle
+                cx={hoveredPoint.xPos}
+                cy={hoveredPoint.dotY}
+                r="4.5"
+                fill={hoveredPoint.dotColor}
+                stroke="#0f172a"
+                strokeWidth="2"
+              />
+            </g>
           )}
         </svg>
 
@@ -605,17 +737,22 @@ export const PremiumTrajectoryChart = ({
           <div
             style={{
               position: 'absolute',
-              top: '8px',
-              right: '16px',
+              top: '6px',
+              left: `${Math.min(
+                Math.max(12, width - 260),
+                Math.max(padLeft + 4, hoveredPoint.xPos - 95)
+              )}px`,
               background: 'rgba(15, 23, 42, 0.94)',
-              border: '1px solid rgba(148, 163, 184, 0.25)',
+              border: '1px solid rgba(148, 163, 184, 0.28)',
               borderRadius: '8px',
-              padding: '6px 12px',
+              padding: '5px 11px',
               fontSize: '12px',
               display: 'flex',
               alignItems: 'center',
               gap: '12px',
-              pointerEvents: 'none'
+              pointerEvents: 'none',
+              whiteSpace: 'nowrap',
+              zIndex: 5
             }}
             className="mono"
           >

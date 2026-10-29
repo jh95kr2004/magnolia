@@ -64,17 +64,88 @@ class PremiumForecaster(nn.Module):
         flat_pred = self.fc_out(context)  # [batch, pred_len * output_size]
         delta_predictions = flat_pred.view(-1, self.pred_len, self.output_size)
 
-        # 2. Anchor at current origin x_t and apply damped Ornstein-Uhlenbeck mean reversion + learned residual delta
-        origin_anchor = x[:, -1:, [0, 4, 5]]
-        target_window_mean = window_mean[:, :, [0, 4, 5]]
-        local_deviation = target_window_mean - origin_anchor  # >0 when spread is below 24h mean, <0 when above
+        # 2. Multi-scale trajectory synthesis anchored at current origin x_t:
+        #    Combines (a) multi-horizon OU equilibrium reversion (1h / 4h / 24h),
+        #    (b) short-term microstructure momentum impulse & pullback (0-90m),
+        #    (c) phase-continuous damped empirical spectral harmonics (rFFT on winsorized local history),
+        #    and (d) GRU-Attention neural context residual.
+        target_seq = x[:, :, [0, 4, 5]]  # [batch, seq_len, 3]
+        seq_len = target_seq.size(1)
+        origin_anchor = target_seq[:, -1:, :]  # [batch, 1, 3]
 
-        t_grid = torch.linspace(1.0 / self.pred_len, 1.0, self.pred_len, device=x.device).view(1, self.pred_len, 1)
-        # Exponential OU reversion factor (1 - exp(-lambda * t/T)) + bounded neural trajectory refinement
-        ou_reversion = (1.0 - torch.exp(-0.35 * t_grid)) * local_deviation
+        w_1h = min(seq_len, 60)
+        w_4h = min(seq_len, 240)
+        w_15m = min(seq_len, 15)
+
+        mean_1h = target_seq[:, -w_1h:, :].mean(dim=1, keepdim=True)
+        mean_4h = target_seq[:, -w_4h:, :].mean(dim=1, keepdim=True)
+        mean_24h = window_mean[:, :, [0, 4, 5]]
+
+        dev_1h = mean_1h - origin_anchor
+        dev_4h = mean_4h - origin_anchor
+        dev_24h = mean_24h - origin_anchor
+
+        t_grid = torch.linspace(
+            1.0 / self.pred_len, 1.0, self.pred_len, device=x.device, dtype=x.dtype
+        ).view(1, self.pred_len, 1)
+
+        # (a) Multi-rate Ornstein-Uhlenbeck reversion across 1h, 4h, and 24h horizons
+        fast_pullback = (1.0 - torch.exp(-5.0 * t_grid)) * torch.exp(-2.2 * t_grid) * dev_1h
+        med_reversion = (1.0 - torch.exp(-1.4 * t_grid)) * 0.45 * dev_4h
+        macro_reversion = (1.0 - torch.exp(-0.45 * t_grid)) * 0.55 * dev_24h
+        ou_reversion = fast_pullback + med_reversion + macro_reversion
+
+        # (b) Short-term momentum impulse wave (captures 15m-60m continuation overshoot before reversion)
+        recent_15m_mean = target_seq[:, -w_15m:, :].mean(dim=1, keepdim=True)
+        short_vel = origin_anchor - recent_15m_mean
+        med_vel = recent_15m_mean - mean_1h
+        tau_fast = 0.065  # peaks around ~31 minutes
+        tau_med = 0.22    # peaks around ~105 minutes
+        impulse_fast = (t_grid / tau_fast) * torch.exp(1.0 - t_grid / tau_fast) * (0.65 * short_vel)
+        impulse_med = (t_grid / tau_med) * torch.exp(1.0 - t_grid / tau_med) * (0.40 * med_vel)
+        momentum_wave = impulse_fast + impulse_med
+
+        # (c) Empirical spectral harmonics from winsorized recent window (captures 1h-4h cyclical waves)
+        w_spec = min(seq_len, 360)
+        if w_spec >= 16:
+            recent_win = target_seq[:, -w_spec:, :]
+            # Linear chord detrending between start and end of recent_win
+            tau_hist = torch.linspace(0.0, 1.0, w_spec, device=x.device, dtype=x.dtype).view(1, w_spec, 1)
+            chord = recent_win[:, :1, :] + (recent_win[:, -1:, :] - recent_win[:, :1, :]) * tau_hist
+            detrended = recent_win - chord
+            # Winsorize outlier flash spikes to +/- 1.5 sigma so harmonic projection stays clean
+            local_std = detrended.std(dim=1, keepdim=True).clamp(min=1e-5)
+            detrended_clean = torch.clamp(detrended, -1.5 * local_std, 1.5 * local_std)
+
+            spec = torch.fft.rfft(detrended_clean, dim=1)  # [batch, w_spec//2 + 1, 3]
+            max_k = min(spec.size(1) - 1, 6)
+            m_steps = torch.arange(1, self.pred_len + 1, device=x.device, dtype=x.dtype).view(1, self.pred_len, 1)
+            harmonic_sum = torch.zeros((x.size(0), self.pred_len, self.output_size), device=x.device, dtype=x.dtype)
+
+            for k in range(2, max_k + 1):
+                ck = spec[:, k : k + 1, :] / float(w_spec)  # [batch, 1, 3]
+                omega_k = 2.0 * np.pi * float(k) / float(w_spec)
+                # Phase at the final historical step (n = w_spec - 1 == -1 mod w_spec)
+                theta_end = -omega_k
+                real_end = ck.real * np.cos(theta_end) - ck.imag * np.sin(theta_end)
+                imag_end = ck.real * np.sin(theta_end) + ck.imag * np.cos(theta_end)
+                phase_m = omega_k * m_steps
+                # Zero-anchored at m=0 so there is zero discontinuity at NOW
+                wave_k = 2.0 * (real_end * (torch.cos(phase_m) - 1.0) - imag_end * torch.sin(phase_m))
+                harmonic_sum = harmonic_sum + wave_k / np.sqrt(float(k - 1))
+
+            # Gate harmonic amplitude by GRU attention context and damp smoothly over 8h horizon
+            ctx_gate = 1.0 + 0.25 * torch.tanh(context.mean(dim=1, keepdim=True).unsqueeze(1))
+            spectral_damping = torch.exp(-1.15 * t_grid) * (1.0 - torch.exp(-12.0 * t_grid))
+            spectral_wave = 0.55 * harmonic_sum * spectral_damping * ctx_gate
+            spectral_wave = torch.clamp(spectral_wave, -1.25 * local_std, 1.25 * local_std)
+        else:
+            spectral_wave = 0.0
+
+        # (d) Learned GRU-Attention residual refinement
         neural_residual = 0.25 * torch.tanh(delta_predictions) * torch.sqrt(t_grid)
 
-        predictions = origin_anchor + ou_reversion + neural_residual
+        predictions = origin_anchor + ou_reversion + momentum_wave + spectral_wave + neural_residual
         return predictions
 
 

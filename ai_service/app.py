@@ -136,8 +136,10 @@ def build_chart_payload(
 
     traj = metrics.get("traj", [])
     pred_len = len(traj)
-    sample_offsets = set(range(5, pred_len + 1, 5))
+    sample_offsets = set(range(2, pred_len + 1, 2))
     sample_offsets.add(1)
+    if pred_len > 0:
+        sample_offsets.add(pred_len)
     sample_offsets.add(int(metrics.get("max_offset_min", 1)))
     sample_offsets.add(int(metrics.get("min_offset_min", 1)))
     sample_offsets.add(int(metrics.get("first_wave_offset_min", 1)))
