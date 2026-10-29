@@ -273,16 +273,23 @@ export const translations = {
   }
 };
 
-export const formatStrategyLabel = (rawType, lang = 'ko') => {
+export const formatStrategyLabel = (rawType, lang = 'ko', direction = '') => {
   const s = String(rawType || '').toUpperCase();
+  const dir = String(direction || '').toUpperCase();
   if (lang === 'en') {
-    if (s.includes('TRANSFER') || s.includes('(C)')) return 'Transfer Arbitrage (Spot → Transfer)';
-    if (s.includes('MARGIN_FUTURE') || s.includes('MARGIN-FUTURE') || s.includes('(B)')) return 'Margin Short + Futures Long';
-    if (s.includes('FUTURE_SPOT') || s.includes('FUTURE-SPOT') || s.includes('(D)')) return 'Futures Short + Spot Long';
-    if (s.includes('FUTURE_FUTURE') || s.includes('FUTURE-FUTURE') || s.includes('(E)')) return 'Futures Short + Futures Long';
-    return 'Margin Short + Spot Long';
+    if (s.includes('TRANSFER') || s.includes('(C)') || dir === 'TRANSFER') return 'Transfer Arbitrage (Spot → Transfer)';
+    const dirSuffix = dir === 'WIDENING' ? ' [Widening: Base Long / Foreign Short]' : ' [Narrowing: Base Short / Foreign Long]';
+    if (s.includes('MARGIN_FUTURE') || s.includes('MARGIN-FUTURE') || s.includes('(B)')) return `Margin + Futures Hedge${dirSuffix}`;
+    if (s.includes('FUTURE_SPOT') || s.includes('FUTURE-SPOT') || s.includes('(D)')) return `Futures + Spot Hedge${dirSuffix}`;
+    if (s.includes('FUTURE_FUTURE') || s.includes('FUTURE-FUTURE') || s.includes('(E)')) return `Dual Futures Hedge${dirSuffix}`;
+    return `Margin Short + Spot Long${dir ? dirSuffix : ''}`;
   }
-  if (s.includes('TRANSFER') || s.includes('(C)')) return '김프 전송 차익 (해외매수 → 국내전송)';
+  if (s.includes('TRANSFER') || s.includes('(C)') || dir === 'TRANSFER') return '김프 전송 차익 (해외매수 → 국내전송)';
+  if (dir === 'WIDENING') {
+    if (s.includes('MARGIN_FUTURE') || s.includes('MARGIN-FUTURE') || s.includes('(B)')) return '프리미엄 확대 헤징 (기준 롱 + 해외선물 숏)';
+    if (s.includes('FUTURE_FUTURE') || s.includes('FUTURE-FUTURE') || s.includes('(E)')) return '프리미엄 확대 양방향 선물 (기준 롱 + 해외 숏)';
+    return '프리미엄 확대 헤징 (기준 현물 롱 + 해외 마진 숏)';
+  }
   if (s.includes('MARGIN_FUTURE') || s.includes('MARGIN-FUTURE') || s.includes('(B)')) return '마진 숏 + 해외 선물 롱 헤징';
   if (s.includes('FUTURE_SPOT') || s.includes('FUTURE-SPOT') || s.includes('(D)')) return '선물 숏 + 해외 현물 롱 헤징';
   if (s.includes('FUTURE_FUTURE') || s.includes('FUTURE-FUTURE') || s.includes('(E)')) return '양방향 선물 롱·숏 수렴 헤징';

@@ -100,7 +100,8 @@ describe('Opportunities SSE raw_opportunities & filtered_opportunities rendering
     expect(screen.getByText('BTC')).toBeInTheDocument();
     expect(screen.getByText('ETH')).toBeInTheDocument();
     expect(screen.getByText('+2.78%')).toBeInTheDocument();
-    expect(screen.getByText('+0.95%')).toBeInTheDocument();
+    expect(screen.getByText(/1시간 뒤 최저 \+0\.95%/)).toBeInTheDocument();
+    expect(screen.getByTestId('premium-trajectory-chart')).toBeInTheDocument();
   });
 
   it('triggers /settings/sim_offset when preset button is clicked', async () => {

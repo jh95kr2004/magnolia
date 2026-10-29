@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { RotateCcw } from 'lucide-react';
+import { RotateCcw, ChevronDown, ChevronUp } from 'lucide-react';
 import { apiClient } from '../../services/api';
 import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
 import { useI18n } from '../../contexts/LanguageContext';
 import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
 import { ColumnTooltipHeader } from '../../components/common/ColumnTooltipHeader';
+import { PremiumTrajectoryChart } from '../../components/opportunities/PremiumTrajectoryChart';
 
 const normalizeStrategyCode = (raw) => {
   const s = String(raw || '').toUpperCase();
@@ -16,12 +17,22 @@ const normalizeStrategyCode = (raw) => {
   return 'MARGIN_SPOT';
 };
 
+const formatHorizonEta = (offsetMin, lang = 'ko') => {
+  const mins = Math.max(1, Math.round(Number(offsetMin || 60)));
+  if (mins < 60) {
+    return lang === 'ko' ? `${mins}분 뒤` : `in ${mins}m`;
+  }
+  const hrs = (mins / 60).toFixed(1).replace(/\.0$/, '');
+  return lang === 'ko' ? `${hrs}시간 뒤` : `in ${hrs}h`;
+};
+
 export const Opportunities = () => {
   const { viewMode } = useAuth();
   const { lang, t } = useI18n();
   const { showToast, requestConfirm } = useToast();
 
   const [opportunities, setOpportunities] = useState([]);
+  const [expandedCoin, setExpandedCoin] = useState('BTC');
   const rawMapRef = useRef({});
   const aiMapRef = useRef({});
   const [simStatus, setSimStatus] = useState({
@@ -71,24 +82,39 @@ export const Opportunities = () => {
               aiInfo && typeof aiInfo.predicted_premium_pct === 'number'
                 ? Number(aiInfo.predicted_premium_pct)
                 : livePremPct * 0.65;
+            const meanPct =
+              aiInfo && typeof aiInfo.mean_premium_pct === 'number'
+                ? Number(aiInfo.mean_premium_pct)
+                : predPct;
+            const targetOffsetMin =
+              aiInfo && Number(aiInfo.target_offset_min) > 0
+                ? Number(aiInfo.target_offset_min)
+                : 60;
+            const direction =
+              aiInfo?.direction ||
+              (predPct > livePremPct ? 'WIDENING' : 'NARROWING');
             const strategyCode = aiInfo?.strategy
               ? normalizeStrategyCode(aiInfo.strategy)
               : livePremPct >= 1.0
-              ? 'FOREIGN_TRANSFER'
-              : 'MARGIN_SPOT';
+                ? 'FOREIGN_TRANSFER'
+                : 'MARGIN_SPOT';
+
+            const directionalEdge = Math.abs(livePremPct - predPct);
             const expectedMarginPct =
               aiInfo && typeof aiInfo.expected_roi === 'number' && Math.abs(aiInfo.expected_roi) < 0.8
-                ? Math.max(Number(aiInfo.expected_roi) * 100, Math.abs(livePremPct) - 0.15)
-                : Number(item.expected_margin ?? Math.abs(livePremPct));
+                ? Math.max(Number(aiInfo.expected_roi) * 100, directionalEdge - 0.13)
+                : Math.max(directionalEdge - 0.13, Number(item.expected_margin ?? Math.abs(livePremPct)) - 0.13);
+
             const targetWeightPct =
               aiInfo && typeof aiInfo.target_weight === 'number' && aiInfo.target_weight > 0
                 ? Math.round(aiInfo.target_weight * 100)
                 : Math.abs(livePremPct) >= 1.5
-                ? 35
-                : 20;
+                  ? 35
+                  : 20;
 
             return {
               id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+              coin,
               baseExchange: item.base_exchange || 'UPBIT',
               foreignExchange: item.foreign_exchange || 'COINBASE',
               baseSymbol: item.base_symbol || `${coin}-KRW`,
@@ -97,6 +123,9 @@ export const Opportunities = () => {
               foreignPriceUsd: Number(item.foreign_price_usd || 0),
               premiumPct: livePremPct,
               predictedPct: predPct,
+              meanPct,
+              targetOffsetMin,
+              direction,
               expectedMarginPct,
               strategy: strategyCode,
               targetWeightPct
@@ -109,10 +138,15 @@ export const Opportunities = () => {
           const fallbackList = aiEntries
             .filter((a) => Math.abs(Number(a.current_premium_pct || 0)) < 80)
             .map((item, idx) => {
+              const coin = String(item.base_symbol || 'BTC-KRW').split('-')[0].toUpperCase();
               const curPct = Number(item.current_premium_pct || 0);
               const predPct = Number(item.predicted_premium_pct ?? curPct * 0.65);
+              const meanPct = Number(item.mean_premium_pct ?? predPct);
+              const targetOffsetMin = Number(item.target_offset_min || 60);
+              const direction = item.direction || (predPct > curPct ? 'WIDENING' : 'NARROWING');
               return {
                 id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+                coin,
                 baseExchange: item.base_exchange || 'UPBIT',
                 foreignExchange: item.foreign_exchange || 'COINBASE',
                 baseSymbol: item.base_symbol || 'BTC-KRW',
@@ -121,6 +155,9 @@ export const Opportunities = () => {
                 foreignPriceUsd: Number(item.foreign_price_usd || 0),
                 premiumPct: curPct,
                 predictedPct: predPct,
+                meanPct,
+                targetOffsetMin,
+                direction,
                 expectedMarginPct: Number(item.expected_roi || 0) * 100,
                 strategy: normalizeStrategyCode(item.strategy),
                 targetWeightPct:
@@ -216,14 +253,21 @@ export const Opportunities = () => {
     }
   };
 
-  const handleManualEnter = (opp) => {
+  const handleManualEnter = (opp, e) => {
+    if (e) e.stopPropagation();
     const coin = String(opp.baseSymbol).split('-')[0];
+    const isWidening = opp.direction === 'WIDENING';
+    const reqBaseEx = isWidening ? opp.foreignExchange : opp.baseExchange;
+    const reqForeignEx = isWidening ? opp.baseExchange : opp.foreignExchange;
+    const reqBaseSym = isWidening ? opp.foreignSymbol : opp.baseSymbol;
+    const reqForeignSym = isWidening ? opp.baseSymbol : opp.foreignSymbol;
+
     requestConfirm({
       title: lang === 'ko' ? `${coin} 수동 포지션 진입` : `Enter ${coin} Arbitrage Position`,
       message:
         lang === 'ko'
-          ? `경로: ${opp.baseExchange} (${opp.baseSymbol}) ↔ ${opp.foreignExchange} (${opp.foreignSymbol})\n현재 프리미엄: ${opp.premiumPct >= 0 ? '+' : ''}${opp.premiumPct.toFixed(2)}%\n전략: ${formatStrategyLabel(opp.strategy, lang)}\n\n즉시 델타 중립 양방향 주문을 실행하시겠습니까?`
-          : `Route: ${opp.baseExchange} ↔ ${opp.foreignExchange}\nSpread: ${opp.premiumPct.toFixed(2)}%\nExecute delta-neutral entry now?`,
+          ? `경로: ${reqBaseEx} (${reqBaseSym}) 숏 ↔ ${reqForeignEx} (${reqForeignSym}) 롱\n현재 프리미엄: ${opp.premiumPct >= 0 ? '+' : ''}${opp.premiumPct.toFixed(2)}% → 목표: ${opp.predictedPct >= 0 ? '+' : ''}${opp.predictedPct.toFixed(2)}%\n전략: ${formatStrategyLabel(opp.strategy, lang, opp.direction)}\n\n즉시 델타 중립 양방향 주문을 실행하시겠습니까?`
+          : `Route: ${reqBaseEx} (Short) ↔ ${reqForeignEx} (Long)\nSpread: ${opp.premiumPct.toFixed(2)}% → Target: ${opp.predictedPct.toFixed(2)}%\nExecute delta-neutral entry now?`,
       confirmText: t.market.enterBtn,
       cancelText: t.stopModal.cancel,
       onConfirm: async () => {
@@ -231,10 +275,10 @@ export const Opportunities = () => {
         try {
           await apiClient.post('/positions/force_enter', {
             mode: viewMode,
-            base_exchange: opp.baseExchange,
-            foreign_exchange: opp.foreignExchange,
-            base_symbol: opp.baseSymbol,
-            foreign_symbol: opp.foreignSymbol,
+            base_exchange: reqBaseEx,
+            foreign_exchange: reqForeignEx,
+            base_symbol: reqBaseSym,
+            foreign_symbol: reqForeignSym,
             strategy: opp.strategy,
             investment_usd: 2500
           });
@@ -393,13 +437,18 @@ export const Opportunities = () => {
         </section>
       )}
 
-      {/* 2. Live Cross-Exchange Opportunities Table */}
+      {/* 2. Live Cross-Exchange Opportunities Table with Expandable Trajectory Chart */}
       <section className="section-block">
         <div className="section-header">
           <h2 className="section-title">
             <span>{t.market.tableTitle}</span>
             <span className="badge badge-neutral mono">{opportunities.length}</span>
           </h2>
+          <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+            {lang === 'ko'
+              ? '행을 클릭하면 과거 프리미엄 추이와 향후 8시간 AI 예측 궤적 그래프를 볼 수 있습니다.'
+              : 'Click any row to inspect historical spread and the 8-hour AI forecast trajectory chart.'}
+          </span>
         </div>
 
         <div className="table-surface">
@@ -466,68 +515,148 @@ export const Opportunities = () => {
                 {opportunities.map((opp) => {
                   const coin = String(opp.baseSymbol).split('-')[0];
                   const isPosSpread = opp.premiumPct >= 0;
+                  const isExpanded = expandedCoin === coin;
+                  const isWidening = opp.direction === 'WIDENING';
+                  const etaText = formatHorizonEta(opp.targetOffsetMin, lang);
+                  const dirBadgeText =
+                    lang === 'ko'
+                      ? isWidening
+                        ? `${etaText} 최고`
+                        : `${etaText} 최저`
+                      : isWidening
+                        ? `Peak ${etaText}`
+                        : `Low ${etaText}`;
+
                   return (
-                    <tr key={opp.id}>
-                      <td>
-                        <div className="mono" style={{ fontWeight: 700, fontSize: '16px' }}>
-                          {coin}
-                        </div>
-                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                          {opp.baseExchange} ({opp.baseSymbol}) → {opp.foreignExchange} ({opp.foreignSymbol})
-                        </div>
-                      </td>
-                      <td className="mono">
-                        ${opp.basePriceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </td>
-                      <td className="mono">
-                        ${opp.foreignPriceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </td>
-                      <td className="mono">
-                        <span
-                          className={`badge ${
-                            opp.premiumPct >= 1.0
-                              ? 'badge-emerald'
-                              : opp.premiumPct <= -0.5
-                                ? 'badge-blue'
-                                : 'badge-neutral'
-                          }`}
-                          style={{ fontSize: '13px' }}
-                        >
-                          {isPosSpread ? '+' : ''}
-                          {opp.premiumPct.toFixed(2)}%
-                        </span>
-                      </td>
-                      <td className="mono" style={{ color: 'var(--text-secondary)' }}>
-                        {opp.predictedPct >= 0 ? '+' : ''}
-                        {opp.predictedPct.toFixed(2)}%
-                      </td>
-                      <td style={{ fontWeight: 500 }}>
-                        {formatStrategyLabel(opp.strategy, lang)}
-                      </td>
-                      <td
-                        className="mono"
+                    <React.Fragment key={opp.id}>
+                      <tr
+                        onClick={() => setExpandedCoin(isExpanded ? null : coin)}
                         style={{
-                          fontWeight: 700,
-                          color:
-                            opp.expectedMarginPct > 0.3
-                              ? 'var(--emerald)'
-                              : 'var(--text-secondary)'
+                          cursor: 'pointer',
+                          background: isExpanded ? 'rgba(56, 189, 248, 0.05)' : undefined
                         }}
                       >
-                        {opp.expectedMarginPct >= 0 ? '+' : ''}
-                        {opp.expectedMarginPct.toFixed(2)}%
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <button
-                          type="button"
-                          disabled={enteringKey === opp.id}
-                          onClick={() => handleManualEnter(opp)}
-                          className="btn btn-sm btn-ghost"
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="mono" style={{ fontWeight: 700, fontSize: '16px' }}>
+                              {coin}
+                            </span>
+                            {isExpanded ? (
+                              <ChevronUp size={15} style={{ color: 'var(--text-secondary)' }} />
+                            ) : (
+                              <ChevronDown size={15} style={{ color: 'var(--text-secondary)' }} />
+                            )}
+                          </div>
+                          <div
+                            style={{
+                              fontSize: '13px',
+                              color: 'var(--text-secondary)',
+                              marginTop: '2px'
+                            }}
+                          >
+                            {opp.baseExchange} ({opp.baseSymbol}) → {opp.foreignExchange} (
+                            {opp.foreignSymbol})
+                          </div>
+                        </td>
+                        <td className="mono">
+                          $
+                          {opp.basePriceUsd.toLocaleString(undefined, {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                          })}
+                        </td>
+                        <td className="mono">
+                          $
+                          {opp.foreignPriceUsd.toLocaleString(undefined, {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                          })}
+                        </td>
+                        <td className="mono">
+                          <span
+                            className={`badge ${
+                              opp.premiumPct >= 1.0
+                                ? 'badge-emerald'
+                                : opp.premiumPct <= -0.5
+                                  ? 'badge-blue'
+                                  : 'badge-neutral'
+                            }`}
+                            style={{ fontSize: '13px' }}
+                          >
+                            {isPosSpread ? '+' : ''}
+                            {opp.premiumPct.toFixed(2)}%
+                          </span>
+                        </td>
+                        <td>
+                          <div
+                            className="mono"
+                            style={{
+                              fontWeight: 700,
+                              color: isWidening ? '#10b981' : '#f59e0b',
+                              fontSize: '13.5px'
+                            }}
+                          >
+                            {dirBadgeText}{' '}
+                            {opp.predictedPct >= 0 ? '+' : ''}
+                            {opp.predictedPct.toFixed(2)}%
+                          </div>
+                          <div
+                            className="mono"
+                            style={{
+                              fontSize: '11.5px',
+                              color: 'var(--text-secondary)',
+                              marginTop: '2px'
+                            }}
+                          >
+                            {lang === 'ko' ? '8H 평균:' : '8H Mean:'}{' '}
+                            {(opp.meanPct ?? opp.predictedPct) >= 0 ? '+' : ''}
+                            {Number(opp.meanPct ?? opp.predictedPct).toFixed(2)}%
+                          </div>
+                        </td>
+                        <td style={{ fontWeight: 500 }}>
+                          {formatStrategyLabel(opp.strategy, lang, opp.direction)}
+                        </td>
+                        <td
+                          className="mono"
+                          style={{
+                            fontWeight: 700,
+                            color:
+                              opp.expectedMarginPct > 0.3
+                                ? 'var(--emerald)'
+                                : 'var(--text-secondary)'
+                          }}
                         >
-                          {t.market.enterBtn}
-                        </button>
-                      </td>
-                    </tr>
+                          {opp.expectedMarginPct >= 0 ? '+' : ''}
+                          {opp.expectedMarginPct.toFixed(2)}%
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          <button
+                            type="button"
+                            disabled={enteringKey === opp.id}
+                            onClick={(e) => handleManualEnter(opp, e)}
+                            className="btn btn-sm btn-ghost"
+                          >
+                            {t.market.enterBtn}
+                          </button>
+                        </td>
+                      </tr>
+
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={8} style={{ padding: 0 }}>
+                            <PremiumTrajectoryChart
+                              baseExchange={opp.baseExchange}
+                              baseSymbol={opp.baseSymbol}
+                              foreignExchange={opp.foreignExchange}
+                              foreignSymbol={opp.foreignSymbol}
+                              viewMode={viewMode}
+                              livePremiumPct={opp.premiumPct}
+                              lang={lang}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
