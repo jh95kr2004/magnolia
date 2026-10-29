@@ -13,7 +13,8 @@ export const Settings = () => {
   const { lang, t } = useI18n();
   const { showToast, requestConfirm } = useToast();
 
-  const initialTab = searchParams.get('tab') || 'exchange';
+  const rawTab = searchParams.get('tab') || 'exchange';
+  const initialTab = rawTab === 'risk' ? 'params' : rawTab;
   const [activeTab, setActiveTab] = useState(initialTab);
   const [saving, setSaving] = useState(false);
 

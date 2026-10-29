@@ -72,14 +72,22 @@ export const Dashboard = () => {
             ? data.portfolio
             : [];
 
-        const mappedEx = rawEx.map((ex) => ({
-          name: String(ex.name || '').toUpperCase(),
-          quote: ex.quote_currency || (String(ex.name || '').toUpperCase() === 'UPBIT' ? 'KRW' : 'USD'),
-          nativeBalance: Number(ex.available_native || 0),
-          usdValue: Number(ex.available_usd ?? ex.usdValue ?? 0),
-          percent: Number(ex.percent || 0),
-          webLendingOk: ex.web_lending_ok
-        }));
+        const mappedEx = rawEx.map((ex) => {
+          const qc =
+            ex.quote_currency ||
+            ex.quoteCurrency ||
+            ex.quote ||
+            (String(ex.name || '').toUpperCase() === 'UPBIT' ? 'KRW' : 'USD');
+          return {
+            name: String(ex.name || '').toUpperCase(),
+            quote: qc,
+            quoteCurrency: qc,
+            nativeBalance: Number(ex.available_native ?? ex.nativeBalance ?? 0),
+            usdValue: Number(ex.available_usd ?? ex.usdValue ?? 0),
+            percent: Number(ex.percent || 0),
+            webLendingOk: ex.web_lending_ok
+          };
+        });
 
         setPortfolio({
           totalUsd: Number(data.total_equity_usd || 0),
