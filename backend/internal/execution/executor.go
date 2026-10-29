@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"github.com/magnolia/backend/internal/exchange"
@@ -134,14 +135,18 @@ func (e *Executor) ExecuteAtomicDualTrade(ctx context.Context, baseReq, foreignR
 		// Rollback Case: One failed, one succeeded.
 		log.Printf("❌ [Executor] Partial Failure detected. Triggering Rollback.")
 		if baseRes != nil {
-			log.Printf("[Rollback] Canceling Base Order %s...", baseRes.OrderID)
-			if cancelErr := baseClient.CancelOrder(ctx, baseRes.OrderID, baseReq.Symbol); cancelErr != nil {
+			log.Printf("[Rollback] Canceling/Reversing Base Order %s...", baseRes.OrderID)
+			if baseRes.Status == "FILLED" && baseRes.Amount > 0 {
+				e.rollbackBaseOrder(ctx, baseReq, baseRes.Amount, baseClient)
+			} else if cancelErr := baseClient.CancelOrder(ctx, baseRes.OrderID, baseReq.Symbol); cancelErr != nil {
 				log.Printf("CRITICAL [Rollback] Failed to cancel Base Order! Directional Risk Exposed: %v", cancelErr)
 			}
 		}
 		if foreignRes != nil {
-			log.Printf("[Rollback] Canceling Foreign Order %s...", foreignRes.OrderID)
-			if cancelErr := foreignClient.CancelOrder(ctx, foreignRes.OrderID, foreignReq.Symbol); cancelErr != nil {
+			log.Printf("[Rollback] Canceling/Reversing Foreign Order %s...", foreignRes.OrderID)
+			if foreignRes.Status == "FILLED" && foreignRes.Amount > 0 {
+				e.rollbackBaseOrder(ctx, foreignReq, foreignRes.Amount, foreignClient)
+			} else if cancelErr := foreignClient.CancelOrder(ctx, foreignRes.OrderID, foreignReq.Symbol); cancelErr != nil {
 				log.Printf("CRITICAL [Rollback] Failed to cancel Foreign Order! Directional Risk Exposed: %v", cancelErr)
 			}
 		}
@@ -293,11 +298,15 @@ func (e *Executor) rollbackBaseOrder(ctx context.Context, originalReq exchange.O
 		rollbackSide = exchange.BuyOrder
 	}
 
-	// Create a Market order with the opposite direction
+	// Create a Market order with the opposite direction (preserving futures type if futures)
+	rollbackType := exchange.MarketOrder
+	if originalReq.Type == exchange.FuturesLong || originalReq.Type == exchange.FuturesShort {
+		rollbackType = originalReq.Type
+	}
 	rollbackReq := exchange.OrderRequest{
 		Symbol: originalReq.Symbol,
 		Side:   rollbackSide,
-		Type:   exchange.MarketOrder,
+		Type:   rollbackType,
 		Price:  0,
 		Amount: filledAmount,
 	}
@@ -338,8 +347,9 @@ func (e *Executor) CheckPreflightBalance(ctx context.Context, client exchange.Cl
 	// If selling and the account already holds sufficient baseCur (including already-borrowed coins),
 	// selling baseCur for quoteCur requires no additional quoteCur balance.
 	if req.Side == exchange.SellOrder {
+		eps := math.Max(1e-5, req.Amount*0.0005)
 		for _, b := range balances {
-			if string(b.Currency) == string(baseCur) && b.Available >= req.Amount {
+			if string(b.Currency) == string(baseCur) && b.Available+eps >= req.Amount {
 				return nil
 			}
 		}
@@ -359,11 +369,21 @@ func (e *Executor) CheckPreflightBalance(ctx context.Context, client exchange.Cl
 
 		// Estimate with a 1% buffer for slippage + taker fees
 		requiredQuote := req.Amount * price * 1.01
+		isBorrowedBuyback := false
+		if req.Side == exchange.BuyOrder {
+			if pc, ok := client.(*exchange.PaperClient); ok && pc.GetBorrowedAmount(baseCur) > 1e-9 {
+				isBorrowedBuyback = true
+			}
+		}
 
 		for _, b := range balances {
 			if string(b.Currency) == string(quoteCur) {
-				if b.Available < requiredQuote {
-					return fmt.Errorf("insufficient balance on %s: requires %f %s but have %f %s", client.GetName(), requiredQuote, quoteCur, b.Available, quoteCur)
+				usableQuote := b.Available
+				if isBorrowedBuyback {
+					usableQuote = b.Available + b.Locked
+				}
+				if usableQuote < requiredQuote {
+					return fmt.Errorf("insufficient balance on %s: requires %f %s but have %f %s", client.GetName(), requiredQuote, quoteCur, usableQuote, quoteCur)
 				}
 				return nil
 			}
@@ -372,9 +392,10 @@ func (e *Executor) CheckPreflightBalance(ctx context.Context, client exchange.Cl
 	} else {
 		// Selling Spot: Need base currency
 		requiredBase := req.Amount
+		eps := math.Max(1e-5, requiredBase*0.0005)
 		for _, b := range balances {
 			if string(b.Currency) == string(baseCur) {
-				if b.Available < requiredBase {
+				if b.Available+eps < requiredBase {
 					return fmt.Errorf("insufficient balance on %s: requires %f %s but have %f %s", client.GetName(), requiredBase, baseCur, b.Available, baseCur)
 				}
 				return nil

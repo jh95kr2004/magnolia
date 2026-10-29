@@ -25,20 +25,25 @@ export const EquityChart = ({
 
   useEffect(() => {
     let cancelled = false;
-    apiClient
-      .get(`/portfolio/history?mode=${viewMode}&range=${range}`)
-      .then((res) => {
-        if (cancelled || !res.data) return;
-        if (res.data.fx_rate_krw) {
-          updateFxRate('KRW', res.data.fx_rate_krw);
-        }
-        if (Array.isArray(res.data.points)) {
-          setHistoryPoints(res.data.points);
-        }
-      })
-      .catch(() => {});
+    const fetchHistory = () => {
+      apiClient
+        .get(`/portfolio/history?mode=${viewMode}&range=${range}`)
+        .then((res) => {
+          if (cancelled || !res.data) return;
+          if (res.data.fx_rate_krw) {
+            updateFxRate('KRW', res.data.fx_rate_krw);
+          }
+          if (Array.isArray(res.data.points)) {
+            setHistoryPoints(res.data.points);
+          }
+        })
+        .catch(() => {});
+    };
+    fetchHistory();
+    const timer = setInterval(fetchHistory, 30000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [viewMode, range, updateFxRate]);
 

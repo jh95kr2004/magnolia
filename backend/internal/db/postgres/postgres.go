@@ -44,6 +44,7 @@ func NewDB(dsn string) (*DB, error) {
 		log.Printf("Migration failed: %v", err)
 		return nil, err
 	}
+	_ = db.Exec("ALTER TABLE equity_snapshots ALTER COLUMN is_paper SET DEFAULT false")
 
 	// Seed supported exchanges
 	defaultExchanges := []string{"BINANCE", "BYBIT", "COINBASE", "KRAKEN", "UPBIT"}

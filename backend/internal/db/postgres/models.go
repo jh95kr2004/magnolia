@@ -167,7 +167,7 @@ type SupportedExchange struct {
 type EquitySnapshot struct {
 	ID                    uint      `gorm:"primaryKey" json:"id"`
 	UserID                uint      `gorm:"index:idx_user_mode_time,priority:1;not null" json:"user_id"`
-	IsPaper               bool      `gorm:"index:idx_user_mode_time,priority:2;default:true" json:"is_paper"`
+	IsPaper               bool      `gorm:"index:idx_user_mode_time,priority:2;not null;default:false" json:"is_paper"`
 	TotalEquityUSD        float64   `json:"total_equity_usd"`
 	AvailableUSD          float64   `json:"available_usd"`
 	UnrealizedPnLUSD      float64   `json:"unrealized_pnl_usd"`

@@ -268,19 +268,160 @@ func (p *PaperClient) GetFutureTicker(ctx context.Context, symbol Symbol) (float
 	return p.GetTicker(ctx, symbol)
 }
 
+func (p *PaperClient) nativeQuoteCurrency() string {
+	name := strings.ToUpper(p.GetName())
+	if name == "UPBIT" || name == "BITHUMB" {
+		return "KRW"
+	}
+	return "USD"
+}
+
+func (p *PaperClient) lookupMarkPriceUnlocked(baseCur, quoteCur string) (spotPrice, futurePrice float64) {
+	baseUpper := strings.ToUpper(baseCur)
+	quoteUpper := strings.ToUpper(quoteCur)
+	candidates := []Symbol{
+		Symbol(baseUpper + "-" + quoteUpper),
+		Symbol(baseUpper + "/" + quoteUpper),
+	}
+	for _, sym := range candidates {
+		if hint, ok := p.priceHints[sym]; ok && (hint.SpotPrice > 0 || hint.FuturePrice > 0) {
+			return hint.SpotPrice, hint.FuturePrice
+		}
+	}
+	for sym, hint := range p.priceHints {
+		b, q := ParseSymbol(sym)
+		if strings.EqualFold(string(b), baseUpper) && strings.EqualFold(string(q), quoteUpper) {
+			return hint.SpotPrice, hint.FuturePrice
+		}
+	}
+	return 0, 0
+}
+
+// GetBorrowedAmount returns the current margin-borrowed coin liability for a currency.
+func (p *PaperClient) GetBorrowedAmount(currency Currency) float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.borrowed[strings.ToUpper(string(currency))]
+}
+
+// GetAccountValuation computes the unencumbered available quote cash and the true mark-to-market
+// net equity (in native quote currency) for this PaperClient:
+// NetEquity = Cash_quote + sum((Spot_c - Borrowed_c) * MarkPrice_c) + sum(FuturesMarginLocked + FuturesUnrealizedPnL).
+func (p *PaperClient) GetAccountValuation(ctx context.Context) (quoteCur string, availableQuote float64, netEquityQuote float64) {
+	quoteCur = p.nativeQuoteCurrency()
+
+	p.mu.Lock()
+	cashQuote := p.balances[quoteCur]
+	assets := make(map[string]struct{})
+	for k := range p.balances {
+		assets[strings.ToUpper(k)] = struct{}{}
+	}
+	for k := range p.borrowed {
+		assets[strings.ToUpper(k)] = struct{}{}
+	}
+
+	type assetEntry struct {
+		cur       string
+		spot      float64
+		borrowed  float64
+		markPrice float64
+	}
+	var entries []assetEntry
+	for cur := range assets {
+		if cur == quoteCur || cur == "KRW" || cur == "USD" || cur == "USDT" || cur == "USDC" {
+			continue
+		}
+		spotAmt := p.balances[cur]
+		borrowedAmt := p.borrowed[cur]
+		if math.Abs(spotAmt) <= 1e-9 && math.Abs(borrowedAmt) <= 1e-9 {
+			continue
+		}
+		sp, _ := p.lookupMarkPriceUnlocked(cur, quoteCur)
+		entries = append(entries, assetEntry{
+			cur:       cur,
+			spot:      spotAmt,
+			borrowed:  borrowedAmt,
+			markPrice: sp,
+		})
+	}
+
+	var futuresEquity float64
+	for sym, fPos := range p.futures {
+		if fPos == nil || fPos.Amount <= 1e-9 {
+			continue
+		}
+		futPrice := fPos.EntryPrice
+		if hint, ok := p.priceHints[sym]; ok && hint.FuturePrice > 0 {
+			futPrice = hint.FuturePrice
+		} else if ok && hint.SpotPrice > 0 {
+			futPrice = hint.SpotPrice
+		}
+		var uPnL float64
+		if fPos.Side == BuyOrder {
+			uPnL = (futPrice - fPos.EntryPrice) * fPos.Amount
+		} else {
+			uPnL = (fPos.EntryPrice - futPrice) * fPos.Amount
+		}
+		futuresEquity += fPos.MarginLocked + uPnL
+	}
+	p.mu.Unlock()
+
+	var shortReserveQuote, netCryptoQuote float64
+	for _, e := range entries {
+		price := e.markPrice
+		if price <= 0 {
+			sym := Symbol(e.cur + "-" + quoteCur)
+			if p.GetName() == "BINANCE" || p.GetName() == "BYBIT" || p.GetName() == "OKX" || p.GetName() == "KRAKEN" {
+				sym = Symbol(e.cur + "/" + quoteCur)
+			}
+			if fetched, err := p.realClient.GetTicker(ctx, sym); err == nil && fetched > 0 {
+				price = fetched
+				p.SetPriceHint(sym, fetched, fetched)
+			}
+		}
+		if price > 0 {
+			netCryptoQuote += (e.spot - e.borrowed) * price
+			if e.borrowed > e.spot {
+				shortReserveQuote += (e.borrowed - e.spot) * price
+			}
+		}
+	}
+
+	netEquityQuote = cashQuote + netCryptoQuote + futuresEquity
+	if netEquityQuote < 0 {
+		netEquityQuote = 0
+	}
+	availableQuote = math.Max(0, cashQuote-shortReserveQuote)
+	return quoteCur, availableQuote, netEquityQuote
+}
+
 func (p *PaperClient) GetBalances(ctx context.Context) ([]Balance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	quoteCur := p.nativeQuoteCurrency()
 	lockedByQuote := make(map[string]float64)
 	for sym, fPos := range p.futures {
 		if fPos != nil && fPos.MarginLocked > 0 {
-			_, quoteCur := ParseSymbol(sym)
-			q := strings.ToUpper(string(quoteCur))
+			_, qCur := ParseSymbol(sym)
+			q := strings.ToUpper(string(qCur))
 			if q == "" {
-				q = "USD"
+				q = quoteCur
 			}
 			lockedByQuote[q] += fPos.MarginLocked
+		}
+	}
+
+	// Reserve short-sale proceeds for borrowed coins that were sold short so Available cash is never double-counted
+	var shortReserveQuote float64
+	for cur, borrowedAmt := range p.borrowed {
+		curUpper := strings.ToUpper(cur)
+		spotAmt := p.balances[curUpper]
+		if borrowedAmt > spotAmt+1e-9 {
+			sp, _ := p.lookupMarkPriceUnlocked(curUpper, quoteCur)
+			if sp > 0 {
+				shortReserveQuote += (borrowedAmt - spotAmt) * sp
+			}
 		}
 	}
 
@@ -289,10 +430,17 @@ func (p *PaperClient) GetBalances(ctx context.Context) ([]Balance, error) {
 	for k, v := range p.balances {
 		cur := strings.ToUpper(k)
 		seen[cur] = true
+		avail := v
+		locked := lockedByQuote[cur]
+		if cur == quoteCur && shortReserveQuote > 0 {
+			reserved := math.Min(avail, shortReserveQuote)
+			avail = math.Max(0, avail-reserved)
+			locked += reserved
+		}
 		res = append(res, Balance{
 			Currency:  Currency(cur),
-			Available: v,
-			Locked:    lockedByQuote[cur],
+			Available: avail,
+			Locked:    locked,
 		})
 	}
 	for cur, locked := range lockedByQuote {
@@ -418,8 +566,16 @@ func (p *PaperClient) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderR
 		p.balances[base] += tradeVolumeAssets
 	} else {
 		if p.balances[base] < tradeVolumeAssets {
-			return nil, fmt.Errorf("insufficient paper funds for sell order: requires %.6f %s but have %.6f %s",
-				tradeVolumeAssets, base, p.balances[base], base)
+			// Clamp tiny float64 representation drift (up to 0.05% or 1e-5) when closing a position
+			if p.balances[base] > 0 && (tradeVolumeAssets-p.balances[base]) <= math.Max(1e-5, tradeVolumeAssets*0.0005) {
+				tradeVolumeAssets = p.balances[base]
+				req.Amount = tradeVolumeAssets
+				tradeVolumeQuote = tradeVolumeAssets * price
+				feeAmountQuote = tradeVolumeQuote * feeRate
+			} else {
+				return nil, fmt.Errorf("insufficient paper funds for sell order: requires %.6f %s but have %.6f %s",
+					tradeVolumeAssets, base, p.balances[base], base)
+			}
 		}
 		p.balances[base] -= tradeVolumeAssets
 		netQuoteEarned := tradeVolumeQuote - feeAmountQuote

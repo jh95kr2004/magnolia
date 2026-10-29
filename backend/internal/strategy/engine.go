@@ -180,6 +180,12 @@ func NewEngine(
 	var simStartedAt int64
 
 	if db != nil {
+		if snaps, snapErr := db.GetEquitySnapshots(userID, true, time.Now().Add(-24*time.Hour), 10); snapErr == nil && len(snaps) > 0 {
+			lastFX := snaps[len(snaps)-1].FXRateKRW
+			if lastFX > 100 {
+				SetFXRate("KRW", lastFX)
+			}
+		}
 		if settings, sErr := db.GetUserSettings(userID); sErr == nil && settings != nil {
 			if isPaper {
 				if settings.PaperBotStatus != "" {
@@ -198,6 +204,22 @@ func NewEngine(
 			} else {
 				if settings.LiveBotStatus != "" {
 					botStatus = settings.LiveBotStatus
+				}
+			}
+		}
+		if isPaper {
+			if openPos, pErr := db.GetActivePositionsByUserAndMode(userID, true); pErr == nil {
+				for _, pos := range openPos {
+					for _, c := range clients {
+						if pc, ok := c.(*exchange.PaperClient); ok {
+							if strings.EqualFold(pc.GetName(), pos.BaseExchange) && pos.EntryBasePrice > 0 {
+								pc.SetPriceHint(exchange.Symbol(pos.BaseSymbol), pos.EntryBasePrice, pos.EntryBasePrice)
+							}
+							if strings.EqualFold(pc.GetName(), pos.ForeignExchange) && pos.EntryForeignPrice > 0 {
+								pc.SetPriceHint(exchange.Symbol(pos.ForeignSymbol), pos.EntryForeignPrice, pos.EntryForeignPrice)
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1663,6 +1685,7 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 	var exSnapshots []ExchangeBalanceSnapshot
 	webSessions := make(map[string]bool)
 	totalLiquidUSD := 0.0
+	totalPaperNetEquityUSD := 0.0
 	foreignUSD := 0.0
 
 	for _, client := range e.clients {
@@ -1678,22 +1701,37 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 			webSessions[exName] = lendingOK
 		}
 
-		bals, bErr := client.GetBalances(ctx)
 		var availNative, availUSD float64
 		quoteCur := "USD"
 		if exName == "UPBIT" || exName == "BITHUMB" {
 			quoteCur = "KRW"
 		}
-		if bErr == nil {
-			for _, b := range bals {
-				if string(b.Currency) == "KRW" {
-					quoteCur = "KRW"
-					availNative += b.Available
-					availUSD += (b.Available + b.Locked) / GetFXRate("KRW")
-				} else if string(b.Currency) == "USD" || string(b.Currency) == "USDT" || string(b.Currency) == "USDC" {
-					quoteCur = string(b.Currency)
-					availNative += b.Available
-					availUSD += (b.Available + b.Locked)
+
+		if pc, ok := client.(*exchange.PaperClient); ok {
+			qCur, availQuote, netEquityQuote := pc.GetAccountValuation(ctx)
+			quoteCur = qCur
+			availNative = availQuote
+			if quoteCur == "KRW" {
+				fx := GetFXRate("KRW")
+				availUSD = availQuote / fx
+				totalPaperNetEquityUSD += netEquityQuote / fx
+			} else {
+				availUSD = availQuote
+				totalPaperNetEquityUSD += netEquityQuote
+			}
+		} else {
+			bals, bErr := client.GetBalances(ctx)
+			if bErr == nil {
+				for _, b := range bals {
+					if string(b.Currency) == "KRW" {
+						quoteCur = "KRW"
+						availNative += b.Available
+						availUSD += (b.Available + b.Locked) / GetFXRate("KRW")
+					} else if string(b.Currency) == "USD" || string(b.Currency) == "USDT" || string(b.Currency) == "USDC" {
+						quoteCur = string(b.Currency)
+						availNative += b.Available
+						availUSD += (b.Available + b.Locked)
+					}
 				}
 			}
 		}
@@ -1720,16 +1758,18 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		foreignShare = foreignUSD / totalLiquidUSD
 	}
 
-	balance := math.Max(0.0, e.config.CapitalLimitUsd-totalInvestedUSD)
-	totalEquityUSD := totalLiquidUSD + totalInvestedUSD + totalUnrealizedPnLUSD
-	if totalEquityUSD <= 0 {
-		totalEquityUSD = balance + totalInvestedUSD + totalUnrealizedPnLUSD
+	var totalEquityUSD float64
+	if e.isPaper && totalPaperNetEquityUSD > 0 {
+		totalEquityUSD = totalPaperNetEquityUSD
+	} else {
+		totalEquityUSD = totalLiquidUSD + totalInvestedUSD + totalUnrealizedPnLUSD
 	}
 
 	simEx, simCurr, simTarget, simRamp, simProg, simRem := e.GetSimStatus()
 	fxKRW := GetFXRate("KRW")
 
-	if e.db != nil && totalEquityUSD > 0 && (e.forceNextSnapshot || time.Since(e.lastSnapshotTime) >= 60*time.Second) {
+	hasMarketData := len(e.rawQuotes) > 0 || e.forceNextSnapshot
+	if e.db != nil && totalEquityUSD > 0 && hasMarketData && (e.forceNextSnapshot || time.Since(e.lastSnapshotTime) >= 60*time.Second) {
 		e.lastSnapshotTime = time.Now().UTC()
 		e.forceNextSnapshot = false
 		breakdownBytes, _ := json.Marshal(exSnapshots)
