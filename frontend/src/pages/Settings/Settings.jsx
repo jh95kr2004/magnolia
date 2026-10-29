@@ -1,195 +1,193 @@
 import React, { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Save, Key, Sliders, Bell, AlertTriangle, AlertCircle, XCircle, Clock, X, Scale, FlaskConical, RotateCcw } from 'lucide-react';
-import { Toggle } from '../../components/ui/Toggle';
+import { ExternalLink, RotateCcw, Download, X, Trash2 } from 'lucide-react';
 import { apiClient } from '../../services/api';
+import { useAuth } from '../../contexts/AuthContext';
+import { useI18n } from '../../contexts/LanguageContext';
+import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
-import './Settings.css';
 
 export const Settings = () => {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { viewMode } = useAuth();
+  const { lang, t } = useI18n();
   const { showToast, requestConfirm } = useToast();
 
-  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'exchange');
-  const [loading, setLoading] = useState(true);
+  const initialTab = searchParams.get('tab') || 'exchange';
+  const [activeTab, setActiveTab] = useState(initialTab);
   const [saving, setSaving] = useState(false);
 
-  // Data State
+  // 1. Exchange Keys & noVNC
   const [registeredKeys, setRegisteredKeys] = useState([]);
-  const [supportedExchanges, setSupportedExchanges] = useState([]);
-  const [editMode, setEditMode] = useState(false);
-  const [popupConfig, setPopupConfig] = useState(null);
+  const [supportedExchanges, setSupportedExchanges] = useState(['UPBIT', 'COINBASE']);
+  const [apiKeys, setApiKeys] = useState({ exchange: 'UPBIT', access_key: '', secret_key: '' });
   const [showNoVNCModal, setShowNoVNCModal] = useState(searchParams.get('openNoVNC') === '1');
   const [noVNCUrl, setNoVNCUrl] = useState(() => {
-    if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    if (
+      typeof window !== 'undefined' &&
+      window.location.hostname !== 'localhost' &&
+      window.location.hostname !== '127.0.0.1'
+    ) {
       return `${window.location.origin}/novnc/`;
     }
     return 'http://localhost:6080';
   });
-  const [apiKeys, setApiKeys] = useState({ exchange: '', access_key: '', secret_key: '' });
+
+  // 2. Trading Parameters
   const [params, setParams] = useState({
-    usePercentParams: false,
-    minTargetProfitUsd: 10,
-    maxStopLossUsd: 50,
-    minTargetProfitPct: 1.0,
-    maxStopLossPct: -10.0,
-    maxAcceptableSpread: 0.01,
+    minTargetProfitPct: 1.5,
+    maxStopLossPct: -5.0,
     capitalLimitUsd: 10000,
-    maxRiskScore: 50.0,
-    riskMultiplier: 1.5,
+    maxAcceptableSpread: 0.01,
     rebalanceTriggerSkewPct: 20.0,
     rebalanceTargetSkewPct: 50.0,
     rebalanceMaxPremiumPct: 0.0
   });
-  const [profile, setProfile] = useState({
-    notifyOnEntry: true,
-    notifyOnExit: true,
-    discordWebhook: '',
-    telegramChatId: '',
-    partialExitMode: 'FIXED',
-    partialExitRatio: 0.5,
-    enableStrategicSwitching: false,
-    switchingProfitMultiplier: 2.0,
+
+  // 3. Paper Seed
+  const [paperSeed, setPaperSeed] = useState({
     paperUpbitKrw: 50000000,
     paperCoinbaseUsd: 35000
   });
 
-  // Load Data
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [keysRes, paramsRes, profileRes, exchangesRes] = await Promise.all([
-          apiClient.get('/settings/exchange'),
-          apiClient.get('/settings/parameters'),
-          apiClient.get('/settings/profile'),
-          apiClient.get('/settings/supported_exchanges')
-        ]);
+  // 4. Trade History
+  const [historyList, setHistoryList] = useState([]);
 
-        if (exchangesRes.data && exchangesRes.data.length > 0) {
-          setSupportedExchanges(exchangesRes.data);
-          setApiKeys(prev => ({ ...prev, exchange: prev.exchange || exchangesRes.data[0] }));
-        }
+  const switchSubTab = (tabName) => {
+    setActiveTab(tabName);
+    setSearchParams({ tab: tabName });
+  };
 
-        if (keysRes.data) {
-          setRegisteredKeys(keysRes.data);
-        }
+  const loadSettingsData = async () => {
+    try {
+      const [keysRes, paramsRes, profileRes, exRes] = await Promise.all([
+        apiClient.get('/settings/exchange').catch(() => ({ data: [] })),
+        apiClient.get('/settings/parameters').catch(() => ({ data: null })),
+        apiClient.get('/settings/profile').catch(() => ({ data: null })),
+        apiClient.get('/settings/supported_exchanges').catch(() => ({ data: ['UPBIT', 'COINBASE'] }))
+      ]);
 
-        if (paramsRes.data && paramsRes.data.ID) {
-          setParams({
-            usePercentParams: paramsRes.data.UsePercentParams || false,
-            minTargetProfitUsd: paramsRes.data.MinTargetProfit || 10,
-            maxStopLossUsd: paramsRes.data.MaxStopLoss || 50,
-            minTargetProfitPct: paramsRes.data.MinTargetProfitPercent || 1.0,
-            maxStopLossPct: paramsRes.data.MaxStopLossPercent || -10.0,
-            maxAcceptableSpread: paramsRes.data.MaxAcceptableSpread || 0.01,
-            capitalLimitUsd: paramsRes.data.CapitalLimitUsd || 10000,
-            maxRiskScore: paramsRes.data.MaxRiskScore || 50.0,
-            riskMultiplier: paramsRes.data.RiskMultiplier || 1.5,
-            rebalanceTriggerSkewPct: (paramsRes.data.RebalanceTriggerSkew || 0.20) * 100,
-            rebalanceTargetSkewPct: (paramsRes.data.RebalanceTargetSkew || 0.50) * 100,
-            rebalanceMaxPremiumPct: (paramsRes.data.RebalanceMaxPremium || 0.0) * 100
-          });
-        }
-
-        if (profileRes.data && profileRes.data.ID) {
-          setProfile({
-            notifyOnEntry: profileRes.data.NotifyOnEntry,
-            notifyOnExit: profileRes.data.NotifyOnExit,
-            discordWebhook: profileRes.data.DiscordWebhookURL || '',
-            telegramChatId: profileRes.data.TelegramChatID || '',
-            partialExitMode: profileRes.data.PartialExitMode || 'FIXED',
-            partialExitRatio: profileRes.data.PartialExitRatio || 0.5,
-            enableStrategicSwitching: profileRes.data.EnableStrategicSwitching || false,
-            switchingProfitMultiplier: profileRes.data.SwitchingProfitMultiplier || 2.0,
-            paperUpbitKrw: profileRes.data.PaperUpbitKRW || 50000000,
-            paperCoinbaseUsd: profileRes.data.PaperCoinbaseUSD || 35000
-          });
-        }
-      } catch (err) {
-        showToast('Failed to load user configuration.', 'error');
-      } finally {
-        setLoading(false);
+      if (Array.isArray(keysRes.data)) setRegisteredKeys(keysRes.data);
+      if (Array.isArray(exRes.data) && exRes.data.length > 0) {
+        setSupportedExchanges(exRes.data);
       }
-    };
-    fetchData();
-  }, [showToast]);
+      if (paramsRes.data) {
+        const d = paramsRes.data;
+        setParams({
+          minTargetProfitPct: d.MinTargetProfit ?? 1.5,
+          maxStopLossPct: d.MaxStopLoss ?? -5.0,
+          capitalLimitUsd: d.CapitalLimitUsd ?? 10000,
+          maxAcceptableSpread: d.MaxAcceptableSpread ?? 0.01,
+          rebalanceTriggerSkewPct: Number(d.RebalanceTriggerSkew ?? 0.2) * 100,
+          rebalanceTargetSkewPct: Number(d.RebalanceTargetSkew ?? 0.5) * 100,
+          rebalanceMaxPremiumPct: Number(d.RebalanceMaxPremium ?? 0.0) * 100
+        });
+      }
+      if (profileRes.data) {
+        setPaperSeed({
+          paperUpbitKrw: profileRes.data.paper_upbit_krw || 50000000,
+          paperCoinbaseUsd: profileRes.data.paper_coinbase_usd || 35000
+        });
+      }
+    } catch {}
+  };
 
-  const handleSaveKeys = async (e) => {
+  const loadHistoryData = async () => {
+    try {
+      const res = await apiClient.get(`/positions/history?mode=${viewMode}`);
+      if (Array.isArray(res.data)) {
+        setHistoryList(
+          res.data.map((item) => ({
+            id: item.PositionID || item.ID,
+            baseExchange: item.BaseExchange || 'UPBIT',
+            foreignExchange: item.ForeignExchange || 'COINBASE',
+            baseSymbol: item.BaseSymbol || 'BTC-KRW',
+            strategy: item.Type,
+            investedUsd: Number(item.InvestmentUSD || 0),
+            entrySpreadPct: Number((item.EntrySpread ?? item.EntryPremium) || 0) * 100,
+            realizedPnlUsd: Number(item.RealizedProfitUSD ?? item.CurrentPnLUSD ?? 0),
+            openedAt: item.OpenedAt,
+            closedAt: item.ClosedAt || item.UpdatedAt
+          }))
+        );
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    loadSettingsData();
+  }, []);
+
+  useEffect(() => {
+    loadHistoryData();
+  }, [viewMode, activeTab]);
+
+  const handleSaveExchangeKey = async (e) => {
     e.preventDefault();
+    if (!apiKeys.exchange || !apiKeys.access_key || !apiKeys.secret_key) return;
     setSaving(true);
     try {
       await apiClient.post('/settings/exchange', apiKeys);
-      setApiKeys(prev => ({ ...prev, access_key: '', secret_key: '' }));
-      const keysRes = await apiClient.get('/settings/exchange');
-      if (keysRes.data) setRegisteredKeys(keysRes.data);
-      showToast(`${apiKeys.exchange} API keys verified and saved!`, 'success');
+      setApiKeys({ ...apiKeys, access_key: '', secret_key: '' });
+      await loadSettingsData();
+      showToast(
+        lang === 'ko'
+          ? `${apiKeys.exchange} API 키가 안전하게 암호화되어 저장되었습니다.`
+          : `${apiKeys.exchange} API key saved.`,
+        'success'
+      );
     } catch (err) {
-      showToast('Verification failed: ' + (err.response?.data?.error || err.message), 'error');
+      showToast(err.response?.data?.error || err.message, 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  const handleToggleExchange = async (exchange, newState) => {
+  const handleToggleKey = async (exchangeName, currentActive) => {
     try {
-      await apiClient.post('/settings/exchange/toggle', { exchange, is_active: newState, force: false });
-      const keysRes = await apiClient.get('/settings/exchange');
-      if (keysRes.data) setRegisteredKeys(keysRes.data);
-      showToast(`${exchange} ${newState ? 'enabled' : 'paused'}.`, 'info');
+      await apiClient.post('/settings/exchange/toggle', {
+        exchange: exchangeName,
+        is_active: !currentActive,
+        force: true
+      });
+      await loadSettingsData();
+      showToast(
+        lang === 'ko'
+          ? `${exchangeName} 연결 상태가 변경되었습니다.`
+          : `${exchangeName} status updated.`,
+        'success'
+      );
     } catch (err) {
-      if (err.response && err.response.status === 409) {
-        setPopupConfig({ type: 'toggle', exchange, targetState: newState });
-      } else {
-        showToast('Toggle failed: ' + (err.response?.data?.error || err.message), 'error');
-      }
+      showToast(err.response?.data?.error || err.message, 'error');
     }
   };
 
-  const handleDeleteExchange = async (exchange) => {
-    try {
-      await apiClient.post('/settings/exchange/delete', { exchange, force: false });
-      const keysRes = await apiClient.get('/settings/exchange');
-      if (keysRes.data) setRegisteredKeys(keysRes.data);
-      showToast(`${exchange} connection removed.`, 'info');
-    } catch (err) {
-      if (err.response && err.response.status === 409) {
-        setPopupConfig({ type: 'delete', exchange });
-      } else {
-        showToast('Delete failed: ' + (err.response?.data?.error || err.message), 'error');
-      }
-    }
-  };
-
-  const confirmAction = async (force, forceOption) => {
-    if (!popupConfig) return;
-    setSaving(true);
-    try {
-      if (popupConfig.type === 'delete') {
-        if (forceOption === 'close_and_remove') {
-          await apiClient.post('/settings/exchange/delete', { exchange: popupConfig.exchange, force: true });
+  const handleDeleteKey = (exchangeName) => {
+    requestConfirm({
+      title: lang === 'ko' ? `${exchangeName} API 키 삭제` : `Delete ${exchangeName} Key`,
+      message:
+        lang === 'ko'
+          ? `등록된 ${exchangeName} API 키를 삭제하시겠습니까?`
+          : `Remove ${exchangeName} credentials?`,
+      confirmText: lang === 'ko' ? '삭제' : 'Delete',
+      cancelText: t.stopModal.cancel,
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await apiClient.post('/settings/exchange/delete', {
+            exchange: exchangeName,
+            force: true
+          });
+          await loadSettingsData();
+          showToast(
+            lang === 'ko' ? `${exchangeName} API 키가 삭제되었습니다.` : 'API key deleted.',
+            'success'
+          );
+        } catch (err) {
+          showToast(err.response?.data?.error || err.message, 'error');
         }
-      } else if (popupConfig.type === 'toggle') {
-        if (forceOption === 'close_and_disable' || forceOption === 'keep_and_disable') {
-          await apiClient.post('/settings/exchange/toggle', { exchange: popupConfig.exchange, is_active: popupConfig.targetState, force: true });
-        }
       }
-      const keysRes = await apiClient.get('/settings/exchange');
-      if (keysRes.data) setRegisteredKeys(keysRes.data);
-      showToast(`Exchange ${popupConfig.exchange} updated.`, 'success');
-    } catch (err) {
-      showToast('Action failed: ' + (err.response?.data?.error || err.message), 'error');
-    } finally {
-      setPopupConfig(null);
-      setSaving(false);
-    }
-  };
-
-  const isCloseToExpiry = (expiryDateStr) => {
-    if (!expiryDateStr) return false;
-    const expDate = new Date(expiryDateStr);
-    const timeDiff = expDate.getTime() - new Date().getTime();
-    const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
-    return daysDiff <= 7 && daysDiff > 0;
+    });
   };
 
   const handleSaveParams = async (e) => {
@@ -197,635 +195,554 @@ export const Settings = () => {
     setSaving(true);
     try {
       await apiClient.post('/settings/parameters', {
-        StrategyName: 'PremiumStrategy',
-        UsePercentParams: params.usePercentParams,
-        MinTargetProfit: parseFloat(params.minTargetProfitUsd),
-        MaxStopLoss: parseFloat(params.maxStopLossUsd),
-        MinTargetProfitPercent: parseFloat(params.minTargetProfitPct),
-        MaxStopLossPercent: parseFloat(params.maxStopLossPct),
-        MaxAcceptableSpread: parseFloat(params.maxAcceptableSpread),
-        CapitalLimitUsd: parseFloat(params.capitalLimitUsd),
-        MaxRiskScore: parseFloat(params.maxRiskScore),
-        RiskMultiplier: parseFloat(params.riskMultiplier),
-        RebalanceTriggerSkew: parseFloat(params.rebalanceTriggerSkewPct) / 100.0,
-        RebalanceTargetSkew: parseFloat(params.rebalanceTargetSkewPct) / 100.0,
-        RebalanceMaxPremium: parseFloat(params.rebalanceMaxPremiumPct) / 100.0
+        strategy_name: 'PremiumStrategy',
+        min_target_profit: Number(params.minTargetProfitPct),
+        max_stop_loss: Number(params.maxStopLossPct),
+        max_acceptable_spread: Number(params.maxAcceptableSpread),
+        capital_limit_usd: Number(params.capitalLimitUsd),
+        max_risk_score: 80.0,
+        risk_multiplier: 1.0,
+        rebalance_trigger_skew: Number(params.rebalanceTriggerSkewPct) / 100.0,
+        rebalance_target_skew: Number(params.rebalanceTargetSkewPct) / 100.0,
+        rebalance_max_premium: Number(params.rebalanceMaxPremiumPct) / 100.0
       });
-      showToast('Trading & Auto-Rebalancing parameters updated!', 'success');
+      showToast(
+        lang === 'ko' ? '자동매매 기준 설정이 저장되었습니다.' : 'Parameters saved.',
+        'success'
+      );
     } catch (err) {
-      showToast('Failed to save parameters.', 'error');
+      showToast(err.response?.data?.error || err.message, 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  const handleSaveProfile = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      await apiClient.post('/settings/profile', {
-        NotifyOnEntry: profile.notifyOnEntry,
-        NotifyOnExit: profile.notifyOnExit,
-        DiscordWebhookURL: profile.discordWebhook,
-        TelegramChatID: profile.telegramChatId,
-        PartialExitMode: profile.partialExitMode,
-        PartialExitRatio: parseFloat(profile.partialExitRatio),
-        EnableStrategicSwitching: profile.enableStrategicSwitching,
-        SwitchingProfitMultiplier: parseFloat(profile.switchingProfitMultiplier)
-      });
-      showToast('Profile & AI Portfolio Settings updated!', 'success');
-    } catch (err) {
-      showToast('Failed to save profile settings.', 'error');
-    } finally {
-      setSaving(false);
-    }
+  const handleResetPaperAccount = () => {
+    requestConfirm({
+      title: lang === 'ko' ? '모의매매 계좌 초기화' : 'Reset Paper Account',
+      message:
+        lang === 'ko'
+          ? `모의매매 계좌를 ₩${Number(paperSeed.paperUpbitKrw).toLocaleString()} KRW 및 $${Number(paperSeed.paperCoinbaseUsd).toLocaleString()} USD로 초기화하고 열린 가상 포지션을 모두 정리하시겠습니까?`
+          : 'Reset paper balances and close all open virtual positions?',
+      confirmText: t.settings.resetPaperBtn,
+      cancelText: t.stopModal.cancel,
+      danger: true,
+      onConfirm: async () => {
+        setSaving(true);
+        try {
+          await apiClient.post('/settings/paper_reset', {
+            paper_upbit_krw: Number(paperSeed.paperUpbitKrw),
+            paper_coinbase_usd: Number(paperSeed.paperCoinbaseUsd)
+          });
+          showToast(
+            lang === 'ko'
+              ? '모의매매 계좌가 설정된 시드로 초기화되었습니다.'
+              : 'Paper account reset complete.',
+            'success'
+          );
+        } catch (err) {
+          showToast(err.response?.data?.error || err.message, 'error');
+        } finally {
+          setSaving(false);
+        }
+      }
+    });
   };
 
-  if (loading) return <div className="flex-center" style={{ height: '100%' }}><div className="logo-orb animate-pulse"></div></div>;
+  const exportHistoryCsv = () => {
+    if (historyList.length === 0) return;
+    const headers = ['ID', 'Pair', 'Strategy', 'InvestedUSD', 'EntrySpreadPct', 'RealizedPnLUSD', 'OpenedAt', 'ClosedAt'];
+    const rows = historyList.map((h) => [
+      h.id,
+      `${h.baseSymbol} (${h.baseExchange}->${h.foreignExchange})`,
+      h.strategy,
+      h.investedUsd.toFixed(2),
+      h.entrySpreadPct.toFixed(2),
+      h.realizedPnlUsd.toFixed(2),
+      h.openedAt || '',
+      h.closedAt || ''
+    ]);
+    const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `magnolia_history_${viewMode.toLowerCase()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
-    <div className="settings-page animate-fade-in delay-100">
-      <header className="page-header mb-lg">
-        <h1 className="text-2xl font-bold">Trading Configuration</h1>
-        <p className="text-secondary mt-xs">Manage your exchange connections, delta-neutral rebalancing parameters, and notifications.</p>
-      </header>
-
-      <div className="settings-layout">
-        {/* Sidebar Navigation */}
-        <div className="settings-sidebar glass-panel">
-          <nav className="settings-nav">
-            <button className={`settings-tab ${activeTab === 'exchange' ? 'active' : ''}`} onClick={() => setActiveTab('exchange')}>
-              <Key size={18} /> Exchange Connections
-            </button>
-            <button className={`settings-tab ${activeTab === 'params' ? 'active' : ''}`} onClick={() => setActiveTab('params')}>
-              <Sliders size={18} /> Trade & Skew Parameters
-            </button>
-            <button className={`settings-tab ${activeTab === 'profile' ? 'active' : ''}`} onClick={() => setActiveTab('profile')}>
-              <Bell size={18} /> Webhooks & AI Portfolio
-            </button>
-          </nav>
-        </div>
-
-        {/* Tab Content Area */}
-        <div className="settings-content">
-          {activeTab === 'exchange' && (
-            <div className="settings-card glass-panel p-xl animate-fade-in">
-              <div className="flex-between mb-md">
-                <h2 className="settings-h2 text-xl font-semibold m-0">Exchange Connections</h2>
-                {registeredKeys.length > 0 && (
-                  <button className="btn-secondary text-sm px-sm py-1 rounded border border-white/20 hover:bg-white/10" onClick={() => setEditMode(!editMode)}>
-                    {editMode ? 'Done' : 'Edit'}
-                  </button>
-                )}
-              </div>
-
-              {registeredKeys.length < 2 && (
-                <div className="alert-warning mb-md flex items-center gap-sm text-sm p-sm rounded bg-amber-500/10 border border-amber-500/20 text-amber-200">
-                  <AlertCircle size={16} className="text-amber-500" />
-                  Arbitrage trading requires at least 2 registered exchanges to function.
-                </div>
-              )}
-
-              <div className="exchange-status-cards mb-xl flex flex-col gap-md">
-                {registeredKeys.map((ex) => (
-                  <div key={ex.exchange} className={`status-card flex items-start justify-between ${ex.is_active ? 'active-border' : ''}`}>
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-md">
-                        <div className="font-bold text-lg">{ex.exchange}</div>
-                        {ex.is_active ? (
-                          <span className="text-xs px-sm py-1 rounded bg-green-500/20 text-green-400 font-semibold border border-green-500/30">Active</span>
-                        ) : (
-                          <span className="text-xs px-sm py-1 rounded bg-gray-500/20 text-gray-400 font-semibold border border-gray-500/30">Paused</span>
-                        )}
-                      </div>
-
-                      {!ex.is_valid && (
-                        <div className="text-red-400 text-xs mt-2 flex items-center gap-1">
-                          <XCircle size={14} className="flex-shrink-0" /> {ex.error_msg || 'API Key is invalid or lacks necessary permissions.'}
-                        </div>
-                      )}
-                      {ex.expires_at && isCloseToExpiry(ex.expires_at) && (
-                        <div className="text-amber-400 text-xs mt-2 flex items-center gap-1">
-                          <Clock size={14} className="flex-shrink-0" /> API Key expires on {ex.expires_at}. Please renew soon.
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex items-center self-center gap-3">
-                      {editMode ? (
-                        <button
-                          className="text-red-400 hover:text-red-300 transition-colors p-2 rounded-full hover:bg-white/5"
-                          onClick={() => handleDeleteExchange(ex.exchange)}
-                          title="Remove Exchange"
-                        >
-                          <X size={20} />
-                        </button>
-                      ) : (
-                        <Toggle
-                          checked={ex.is_active}
-                          onChange={(e) => handleToggleExchange(ex.exchange, e.target.checked)}
-                        />
-                      )}
-                    </div>
-                  </div>
-                ))}
-
-                {registeredKeys.length === 0 && (
-                  <div className="text-center p-xl text-secondary border border-dashed border-white/10 rounded-xl">
-                    No exchanges registered yet. Add at least 2 below to begin trading.
-                  </div>
-                )}
-              </div>
-
-              <div className="separator mb-lg"></div>
-
-              <form onSubmit={handleSaveKeys} className="flex flex-col">
-                <h3 className="text-lg font-semibold mb-lg">Register New Exchange</h3>
-
-                <div className="form-group w-full max-w-sm">
-                  <label className="text-sm text-secondary">Exchange</label>
-                  <select
-                    value={apiKeys.exchange}
-                    onChange={e => setApiKeys({ ...apiKeys, exchange: e.target.value })}
-                    className="form-input mt-xs"
-                  >
-                    {supportedExchanges.map(ex => (
-                      <option key={ex} value={ex}>{ex}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="form-group">
-                  <label className="text-sm text-secondary">Access Key / API Name</label>
-                  <input
-                    type="text"
-                    value={apiKeys.access_key}
-                    onChange={e => setApiKeys({ ...apiKeys, access_key: e.target.value })}
-                    className="form-input mt-xs"
-                    required
-                    placeholder="Enter your public access key"
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="text-sm text-secondary">Secret Key (Encrypted at Rest)</label>
-                  <p className="form-help-text mb-sm">Must have Read, Trade, and Withdrawal permissions allowed for the engine.</p>
-                  <input
-                    type="password"
-                    value={apiKeys.secret_key}
-                    onChange={e => setApiKeys({ ...apiKeys, secret_key: e.target.value })}
-                    className="form-input mt-xs"
-                    required
-                    placeholder="Enter your secret key"
-                  />
-                </div>
-
-                <button type="submit" disabled={saving} className="btn-primary self-start">
-                  <Save size={18} /> {saving ? 'Verifying...' : 'Verify Keys & Add Exchange'}
-                </button>
-              </form>
-
-              <div className="separator my-lg"></div>
-
-              <div className="flex flex-col gap-sm">
-                <div className="flex-between">
-                  <div>
-                    <h3 className="text-lg font-semibold m-0">Web Coin Lending Session (noVNC Browser)</h3>
-                    <p className="text-xs text-secondary mt-xs">
-                      For exchanges without official Margin Borrow APIs (e.g., Upbit Coin Lending, Bithumb), authenticate directly inside the isolated browser container via QR / 2FA. The engine watchdog continuously monitors and maintains this session.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn-secondary text-sm px-md py-2 rounded border border-white/20 hover:bg-white/10"
-                    onClick={() => setShowNoVNCModal(true)}
-                  >
-                    Open noVNC Browser Login
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'params' && (
-            <div className="settings-card glass-panel p-xl animate-fade-in">
-              <h2 className="settings-h2 text-xl font-semibold mb-lg">Arbitrage & Risk Parameters</h2>
-              <form onSubmit={handleSaveParams} className="flex flex-col max-w-lg">
-                <div className="flex-between mb-lg">
-                  <div>
-                    <h4 className="font-semibold text-sm">Use Percentage Parameters</h4>
-                    <p className="text-xs text-muted mt-xs">Toggle to define thresholds by percentage of total investment rather than absolute USD value.</p>
-                  </div>
-                  <Toggle checked={params.usePercentParams} onChange={e => setParams({ ...params, usePercentParams: e.target.checked })} />
-                </div>
-
-                <div className="separator mb-lg"></div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">
-                    Min Target Profit {params.usePercentParams ? '(%)' : '(USD)'}
-                  </label>
-                  <p className="form-help-text mb-sm">Only execute trades if the net ROI exceeds this amount after fees.</p>
-                  {params.usePercentParams ? (
-                    <input
-                      type="number" step="0.1" min="0" required
-                      value={params.minTargetProfitPct}
-                      onChange={e => setParams({ ...params, minTargetProfitPct: e.target.value })}
-                      className="form-input w-full max-w-xs"
-                    />
-                  ) : (
-                    <input
-                      type="number" step="1" min="1" required
-                      value={params.minTargetProfitUsd}
-                      onChange={e => setParams({ ...params, minTargetProfitUsd: e.target.value })}
-                      className="form-input w-full max-w-xs"
-                    />
-                  )}
-                </div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">
-                    Max Stop Loss {params.usePercentParams ? '(%)' : '(USD)'}
-                  </label>
-                  <p className="form-help-text mb-sm">Emergency liquidation threshold if positions move against the expected premium prediction.</p>
-                  {params.usePercentParams ? (
-                    <input
-                      type="number" step="0.1" max="-0.1" required
-                      value={params.maxStopLossPct}
-                      onChange={e => setParams({ ...params, maxStopLossPct: e.target.value })}
-                      className="form-input w-full max-w-xs"
-                      placeholder="-10.0"
-                    />
-                  ) : (
-                    <input
-                      type="number" step="1" min="1" required
-                      value={params.maxStopLossUsd}
-                      onChange={e => setParams({ ...params, maxStopLossUsd: e.target.value })}
-                      className="form-input w-full max-w-xs"
-                    />
-                  )}
-                </div>
-
-                <div className="form-group">
-                  <label className="text-sm font-semibold block mb-xs">Max Acceptable Slippage (Spread %)</label>
-                  <p className="form-help-text mb-sm">Maximum allowed difference between expected quote and actual executed market fill.</p>
-                  <input
-                    type="number" step="0.001" min="0" required
-                    value={params.maxAcceptableSpread}
-                    onChange={e => setParams({ ...params, maxAcceptableSpread: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">Capital Allocation Limit (USD)</label>
-                  <p className="form-help-text mb-sm">Maximum USD equivalent of exposure the bot is allowed to allocate simultaneously.</p>
-                  <input
-                    type="number" step="1" min="10" required
-                    value={params.capitalLimitUsd}
-                    onChange={e => setParams({ ...params, capitalLimitUsd: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">Max AI Risk Score</label>
-                  <p className="form-help-text mb-sm">Opportunities yielding a Risk Score higher than this limit are ignored.</p>
-                  <input
-                    type="number" step="0.1" min="1" max="100" required
-                    value={params.maxRiskScore}
-                    onChange={e => setParams({ ...params, maxRiskScore: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="form-group mb-lg">
-                  <label className="text-sm font-semibold block mb-xs">Transfer Time Risk Multiplier</label>
-                  <p className="form-help-text mb-sm">Amplifies the base AI Network Risk Score based on estimated blockchain confirmation delays.</p>
-                  <input
-                    type="number" step="0.1" min="0" required
-                    value={params.riskMultiplier}
-                    onChange={e => setParams({ ...params, riskMultiplier: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="separator mb-lg"></div>
-
-                {/* 100% Delta-Neutral Auto-Rebalancing Section */}
-                <h3 className="text-lg font-semibold mb-sm flex items-center gap-sm">
-                  <Scale size={18} className="text-blue-400" /> 100% Delta-Neutral Capital Rebalancing
-                </h3>
-                <p className="form-help-text mb-lg">
-                  When Transfer Arbitrage (Strategy C) shifts quote capital from Foreign (USD) to Base (KRW), the Engine automatically executes a hedged reverse transfer (Base Spot Buy + Foreign 1x Short → Transfer → Foreign Sell + Close Short) once the Dual-Trigger conditions below are met.
-                </p>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">Rebalance Trigger Foreign Share (%)</label>
-                  <p className="form-help-text mb-sm">Trigger auto-rebalancing when Foreign USD balance falls below this percentage of total portfolio equity (Default: 20%).</p>
-                  <input
-                    type="number" step="1" min="5" max="45" required
-                    value={params.rebalanceTriggerSkewPct}
-                    onChange={e => setParams({ ...params, rebalanceTriggerSkewPct: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">Rebalance Target Foreign Share (%)</label>
-                  <p className="form-help-text mb-sm">Target Foreign USD share to restore during hedged reverse transfer (Default: 50% for 50:50 balance).</p>
-                  <input
-                    type="number" step="1" min="30" max="70" required
-                    value={params.rebalanceTargetSkewPct}
-                    onChange={e => setParams({ ...params, rebalanceTargetSkewPct: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <div className="form-group mb-lg">
-                  <label className="text-sm font-semibold block mb-xs">Max Rebalance Spread / Premium (%)</label>
-                  <p className="form-help-text mb-sm">Only execute reverse transfer when the Base-vs-Foreign premium is at or below this threshold (e.g., 0.0% break-even or negative reverse premium).</p>
-                  <input
-                    type="number" step="0.1" min="-5.0" max="2.0" required
-                    value={params.rebalanceMaxPremiumPct}
-                    onChange={e => setParams({ ...params, rebalanceMaxPremiumPct: e.target.value })}
-                    className="form-input w-full max-w-xs"
-                  />
-                </div>
-
-                <button type="submit" disabled={saving} className="btn-primary self-start">
-                  <Save size={18} /> {saving ? 'Saving...' : 'Update Parameters'}
-                </button>
-              </form>
-
-              <div className="separator my-lg"></div>
-
-              {/* Paper Trading Virtual Seed Configuration */}
-              <div className="flex flex-col max-w-lg">
-                <h3 className="text-lg font-semibold mb-sm flex items-center gap-sm">
-                  <FlaskConical size={18} className="text-emerald-400" /> 모의매매 가상 시드머니 설정 (Paper Trading Virtual Seed)
-                </h3>
-                <p className="form-help-text mb-lg">
-                  모의매매(Paper Engine)에서 사용할 거래소별 초기 가상 시드머니를 설정하고 초기화할 수 있습니다. (실매매 잔고 및 포지션에는 영향을 주지 않습니다.)
-                </p>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold block mb-xs">Upbit 초기 가상 원화 잔고 (KRW)</label>
-                  <input
-                    type="number"
-                    step="1000000"
-                    min="100000"
-                    value={profile.paperUpbitKrw}
-                    onChange={e => setProfile({ ...profile, paperUpbitKrw: parseFloat(e.target.value) || 0 })}
-                    className="form-input w-full max-w-xs font-mono"
-                  />
-                </div>
-
-                <div className="form-group mb-lg">
-                  <label className="text-sm font-semibold block mb-xs">Coinbase 초기 가상 달러 잔고 (USD)</label>
-                  <input
-                    type="number"
-                    step="1000"
-                    min="100"
-                    value={profile.paperCoinbaseUsd}
-                    onChange={e => setProfile({ ...profile, paperCoinbaseUsd: parseFloat(e.target.value) || 0 })}
-                    className="form-input w-full max-w-xs font-mono"
-                  />
-                </div>
-
-                <button
-                  type="button"
-                  disabled={saving}
-                  className="btn-secondary self-start flex items-center gap-2 px-md py-2 rounded border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
-                  onClick={() => {
-                    requestConfirm({
-                      title: '모의매매 시드머니 저장 및 가상 계좌 초기화',
-                      message: `UPBIT ₩${Number(profile.paperUpbitKrw).toLocaleString()} KRW / COINBASE $${Number(profile.paperCoinbaseUsd).toLocaleString()} USD로 가상 계좌를 재설정하고 현재 열린 모의매매 포지션을 초기화하시겠습니까?`,
-                      confirmText: '시드 적용 및 초기화',
-                      danger: true,
-                      onConfirm: async () => {
-                        setSaving(true);
-                        try {
-                          await apiClient.post('/settings/paper_reset', {
-                            upbit_krw: parseFloat(profile.paperUpbitKrw),
-                            coinbase_usd: parseFloat(profile.paperCoinbaseUsd)
-                          });
-                          showToast('모의매매 가상 시드머니가 적용되고 계좌가 초기화되었습니다!', 'success');
-                        } catch (err) {
-                          showToast('초기화 실패: ' + (err.response?.data?.error || err.message), 'error');
-                        } finally {
-                          setSaving(false);
-                        }
-                      }
-                    });
-                  }}
-                >
-                  <RotateCcw size={16} /> 가상 시드 적용 및 모의계좌 초기화
-                </button>
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'profile' && (
-            <div className="settings-card glass-panel p-xl animate-fade-in">
-              <h2 className="settings-h2 text-xl font-semibold mb-lg">Alerts & Notifications</h2>
-              <form onSubmit={handleSaveProfile} className="flex flex-col max-w-lg">
-                <div className="flex flex-col gap-xl mb-xl">
-                  <div className="form-group flex-between">
-                    <div>
-                      <h4 className="font-semibold text-sm">Notify on Position Entry</h4>
-                      <p className="text-xs text-muted mt-xs">Receive a webhook when the bot enters a new position.</p>
-                    </div>
-                    <Toggle checked={profile.notifyOnEntry} onChange={e => setProfile({ ...profile, notifyOnEntry: e.target.checked })} />
-                  </div>
-
-                  <div className="form-group flex-between">
-                    <div>
-                      <h4 className="font-semibold text-sm">Notify on Position Exit</h4>
-                      <p className="text-xs text-muted mt-xs">Receive a webhook when a position is closed or liquidated.</p>
-                    </div>
-                    <Toggle checked={profile.notifyOnExit} onChange={e => setProfile({ ...profile, notifyOnExit: e.target.checked })} />
-                  </div>
-                </div>
-
-                <div className="separator mb-lg"></div>
-
-                <h2 className="settings-h2 text-xl font-semibold mb-lg mt-md">AI Portfolio Management</h2>
-
-                <div className="flex flex-col gap-xl mb-xl">
-                  <div className="form-group">
-                    <div className="flex-between mb-xs">
-                      <h4 className="font-semibold text-sm">Partial Exit (Scale-Out) Mode</h4>
-                    </div>
-                    <p className="form-help-text mb-sm">
-                      Should the bot sell a fixed fraction on a SCALE_OUT signal, or dynamically reduce weight based on the AI target weight?
-                    </p>
-                    <select
-                      value={profile.partialExitMode}
-                      onChange={e => setProfile({ ...profile, partialExitMode: e.target.value })}
-                      className="form-input mt-xs w-full max-w-sm"
-                    >
-                      <option value="FIXED">FIXED (Constant Fraction)</option>
-                      <option value="AUTO">AUTO (Dynamic AI Proportional)</option>
-                    </select>
-                  </div>
-
-                  {profile.partialExitMode === 'FIXED' && (
-                    <div className="form-group pl-lg border-l-2 border-primary/30">
-                      <label className="text-sm font-semibold text-secondary block mb-xs">Fixed Exit Ratio</label>
-                      <p className="form-help-text mb-sm">A value of 0.5 means selling 50% of the active position when commanded.</p>
-                      <input
-                        type="number" step="0.1" min="0.1" max="1.0"
-                        value={profile.partialExitRatio}
-                        onChange={e => setProfile({ ...profile, partialExitRatio: e.target.value })}
-                        className="form-input w-full max-w-xs"
-                      />
-                    </div>
-                  )}
-
-                  <div className="form-group mt-md">
-                    <div className="flex-between mb-xs">
-                      <div>
-                        <h4 className="font-semibold text-sm">Enable Strategic Opportunity Switching</h4>
-                        <p className="text-xs text-muted mt-xs">Allow the AI to rotate capital early if a vastly superior arbitrage opportunity is discovered globally.</p>
-                      </div>
-                      <Toggle checked={profile.enableStrategicSwitching} onChange={e => setProfile({ ...profile, enableStrategicSwitching: e.target.checked })} />
-                    </div>
-                  </div>
-
-                  {profile.enableStrategicSwitching && (
-                    <div className="form-group pl-lg border-l-2 border-primary/30">
-                      <label className="text-sm font-semibold text-secondary block mb-xs">Switching Profit Multiplier (Gap Requirement)</label>
-                      <p className="form-help-text mb-sm">
-                        Only switch if the new opportunity's ROI is at least X times higher than the current position. e.g. 2.0x
-                      </p>
-                      <input
-                        type="number" step="0.5" min="1.1"
-                        value={profile.switchingProfitMultiplier}
-                        onChange={e => setProfile({ ...profile, switchingProfitMultiplier: e.target.value })}
-                        className="form-input w-full max-w-xs"
-                      />
-                    </div>
-                  )}
-                </div>
-
-                <div className="separator mb-lg"></div>
-
-                <div className="form-group mb-md">
-                  <label className="text-sm font-semibold text-secondary">Discord Webhook URL</label>
-                  <input
-                    type="url"
-                    value={profile.discordWebhook}
-                    onChange={e => setProfile({ ...profile, discordWebhook: e.target.value })}
-                    className="form-input mt-xs w-full"
-                    placeholder="https://discord.com/api/webhooks/..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="text-sm font-semibold text-secondary">Telegram Chat ID</label>
-                  <input
-                    type="text"
-                    value={profile.telegramChatId}
-                    onChange={e => setProfile({ ...profile, telegramChatId: e.target.value })}
-                    className="form-input mt-xs w-full"
-                    placeholder="-10012345678"
-                  />
-                </div>
-
-                <button type="submit" disabled={saving} className="btn-primary self-start">
-                  <Save size={18} /> {saving ? 'Saving...' : 'Update Preferences'}
-                </button>
-              </form>
-            </div>
-          )}
+    <>
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">{t.settings.title}</h1>
+          <p className="page-subtitle">{t.settings.subtitle}</p>
         </div>
       </div>
 
-      {/* Popups */}
-      {popupConfig && (
-        <div className="fixed inset-0 bg-black/70 flex-center z-50">
-          <div className="bg-gray-900 border border-gray-700 rounded-xl p-xl max-w-sm w-full animate-fade-in">
-            <h3 className="text-xl font-bold mb-md text-amber-400 flex items-center gap-2">
-              <AlertTriangle size={24} /> Action Required
-            </h3>
-            <p className="text-sm text-gray-300 mb-lg">
-              You currently hold active positional exposure dependent on <strong>{popupConfig.exchange}</strong>. How would you like to proceed?
-            </p>
+      {/* Sub-Navigation Bar */}
+      <div className="sub-tabs">
+        <button
+          type="button"
+          className={`sub-tab ${activeTab === 'exchange' ? 'active' : ''}`}
+          onClick={() => switchSubTab('exchange')}
+        >
+          {t.settings.tabExchange}
+        </button>
+        <button
+          type="button"
+          className={`sub-tab ${activeTab === 'params' ? 'active' : ''}`}
+          onClick={() => switchSubTab('params')}
+        >
+          {t.settings.tabParams}
+        </button>
+        <button
+          type="button"
+          className={`sub-tab ${activeTab === 'paper' ? 'active' : ''}`}
+          onClick={() => switchSubTab('paper')}
+        >
+          {t.settings.tabPaper}
+        </button>
+        <button
+          type="button"
+          className={`sub-tab ${activeTab === 'history' ? 'active' : ''}`}
+          onClick={() => switchSubTab('history')}
+        >
+          {t.settings.tabHistory}
+        </button>
+      </div>
 
-            {popupConfig.type === 'delete' && (
-              <div className="flex flex-col gap-sm">
-                <button
-                  className="btn-primary w-full justify-center bg-red-600 hover:bg-red-700"
-                  onClick={() => confirmAction(true, 'close_and_remove')}
-                >
-                  Close all positions and remove
-                </button>
-                <button
-                  className="btn-secondary w-full justify-center"
-                  onClick={() => setPopupConfig(null)}
-                >
-                  Keep Exchange (Cancel)
-                </button>
+      {/* Sub-Tab 1: Exchange API Keys & Web Lending */}
+      {activeTab === 'exchange' && (
+        <div className="section-block" style={{ gap: '32px' }}>
+          <div className="section-header">
+            <h2 className="section-title">{t.settings.exchangeListTitle}</h2>
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={() => setShowNoVNCModal(true)}
+            >
+              <span>{t.settings.openNoVncBtn}</span>
+              <ExternalLink size={14} />
+            </button>
+          </div>
+
+          <div className="table-surface">
+            {registeredKeys.length === 0 ? (
+              <div className="empty-state" style={{ padding: '40px 24px' }}>
+                <div>
+                  {lang === 'ko'
+                    ? '등록된 거래소 API 키가 없습니다. (모의매매는 API 키 없이도 100% 실제 시세로 즉시 작동합니다)'
+                    : 'No exchange API keys registered yet. (Paper mode works immediately without API keys)'}
+                </div>
               </div>
+            ) : (
+              <table className="clean-table">
+                <thead>
+                  <tr>
+                    <th>{lang === 'ko' ? '거래소' : 'Exchange'}</th>
+                    <th>{lang === 'ko' ? '상태' : 'Status'}</th>
+                    <th>{lang === 'ko' ? '등록된 키 (마스킹)' : 'Masked Key'}</th>
+                    <th style={{ textAlign: 'right' }}>{lang === 'ko' ? '관리' : 'Actions'}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {registeredKeys.map((k) => {
+                    const exName = k.exchange || k.Exchange;
+                    const isActive = k.is_active ?? k.IsActive ?? true;
+                    const access = k.access_key || k.AccessKey || '';
+                    return (
+                      <tr key={exName}>
+                        <td className="mono" style={{ fontWeight: 700 }}>
+                          {exName}
+                        </td>
+                        <td>
+                          <span className={`badge ${isActive ? 'badge-emerald' : 'badge-neutral'}`}>
+                            {isActive
+                              ? lang === 'ko'
+                                ? '활성화됨'
+                                : 'Active'
+                              : lang === 'ko'
+                                ? '비활성화'
+                                : 'Disabled'}
+                          </span>
+                        </td>
+                        <td className="mono" style={{ color: 'var(--text-secondary)' }}>
+                          {access ? `${access.slice(0, 6)}••••••` : '••••••••'}
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          <div style={{ display: 'inline-flex', gap: '8px' }}>
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-ghost"
+                              onClick={() => handleToggleKey(exName, isActive)}
+                            >
+                              {isActive
+                                ? lang === 'ko'
+                                  ? '일시 중지'
+                                  : 'Disable'
+                                : lang === 'ko'
+                                  ? '활성화'
+                                  : 'Enable'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-danger"
+                              onClick={() => handleDeleteKey(exName)}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             )}
+          </div>
 
-            {popupConfig.type === 'toggle' && (
-              <div className="flex flex-col gap-sm">
-                <button
-                  className="btn-primary w-full justify-center bg-red-600 hover:bg-red-700"
-                  onClick={() => confirmAction(true, 'close_and_disable')}
+          <form className="form-panel" onSubmit={handleSaveExchangeKey}>
+            <h3 className="section-title">{t.settings.addExchangeTitle}</h3>
+            <div className="form-grid-3">
+              <div className="field-group">
+                <label className="field-label">{t.settings.exchangeLabel}</label>
+                <select
+                  value={apiKeys.exchange}
+                  onChange={(e) => setApiKeys({ ...apiKeys, exchange: e.target.value })}
+                  className="select"
                 >
-                  Close all positions and disable
-                </button>
-                <button
-                  className="btn-secondary w-full justify-center border-amber-600 hover:bg-amber-600/20 text-amber-500"
-                  onClick={() => confirmAction(true, 'keep_and_disable')}
-                >
-                  Keep positions and disable (Risky)
-                </button>
-                <button
-                  className="btn-secondary w-full justify-center"
-                  onClick={() => setPopupConfig(null)}
-                >
-                  Keep Active (Cancel)
-                </button>
+                  {supportedExchanges.map((ex) => (
+                    <option key={ex} value={ex}>
+                      {ex}
+                    </option>
+                  ))}
+                </select>
               </div>
+
+              <div className="field-group">
+                <label className="field-label">{t.settings.accessKeyLabel}</label>
+                <input
+                  type="text"
+                  required
+                  value={apiKeys.access_key}
+                  onChange={(e) => setApiKeys({ ...apiKeys, access_key: e.target.value })}
+                  placeholder="Access Key / API Key ID"
+                  className="input mono"
+                />
+              </div>
+
+              <div className="field-group">
+                <label className="field-label">{t.settings.secretKeyLabel}</label>
+                <input
+                  type="password"
+                  required
+                  value={apiKeys.secret_key}
+                  onChange={(e) => setApiKeys({ ...apiKeys, secret_key: e.target.value })}
+                  placeholder="Secret Key"
+                  className="input mono"
+                />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button type="submit" disabled={saving} className="btn btn-primary">
+                {t.settings.saveKeyBtn}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Sub-Tab 2: Trading Thresholds & Rebalance Parameters */}
+      {activeTab === 'params' && (
+        <form className="form-panel" onSubmit={handleSaveParams}>
+          <div>
+            <h2 className="section-title">{t.settings.paramsTitle}</h2>
+            <p className="section-desc" style={{ marginTop: '4px' }}>
+              {lang === 'ko'
+                ? '포지션 익절·손절 기준과 해외 거래소 자본 쏠림 방지(100% 델타 중립 자동 역전송 리밸런싱) 기준을 설정합니다.'
+                : 'Configure profit/loss exits and automatic 100% delta-neutral reverse transfer rebalancing.'}
+            </p>
+          </div>
+
+          <div className="form-grid-2">
+            <div className="field-group">
+              <label className="field-label">{t.settings.minProfitLabel}</label>
+              <input
+                type="number"
+                step="0.1"
+                value={params.minTargetProfitPct}
+                onChange={(e) => setParams({ ...params, minTargetProfitPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.maxLossLabel}</label>
+              <input
+                type="number"
+                step="0.1"
+                value={params.maxStopLossPct}
+                onChange={(e) => setParams({ ...params, maxStopLossPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.capitalLimitLabel}</label>
+              <input
+                type="number"
+                step="100"
+                value={params.capitalLimitUsd}
+                onChange={(e) => setParams({ ...params, capitalLimitUsd: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.maxSpreadLabel}</label>
+              <input
+                type="number"
+                step="0.001"
+                value={params.maxAcceptableSpread}
+                onChange={(e) => setParams({ ...params, maxAcceptableSpread: e.target.value })}
+                className="input mono"
+              />
+            </div>
+          </div>
+
+          <div className="divider" />
+
+          <div className="form-grid-3">
+            <div className="field-group">
+              <label className="field-label">{t.settings.rebalanceTriggerLabel}</label>
+              <input
+                type="number"
+                step="1"
+                min="5"
+                max="45"
+                value={params.rebalanceTriggerSkewPct}
+                onChange={(e) => setParams({ ...params, balanceTrigger: e.target.value, rebalanceTriggerSkewPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.rebalanceTargetLabel}</label>
+              <input
+                type="number"
+                step="1"
+                min="30"
+                max="70"
+                value={params.rebalanceTargetSkewPct}
+                onChange={(e) => setParams({ ...params, rebalanceTargetSkewPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.rebalanceMaxPremLabel}</label>
+              <input
+                type="number"
+                step="0.05"
+                value={params.rebalanceMaxPremiumPct}
+                onChange={(e) => setParams({ ...params, rebalanceMaxPremiumPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button type="submit" disabled={saving} className="btn btn-primary">
+              {t.settings.saveParamsBtn}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Sub-Tab 3: Paper Trading Virtual Seed Management */}
+      {activeTab === 'paper' && (
+        <div className="form-panel">
+          <div>
+            <h2 className="section-title">{t.settings.paperTitle}</h2>
+            <p className="section-desc" style={{ marginTop: '4px' }}>
+              {t.settings.paperDesc}
+            </p>
+          </div>
+
+          <div className="form-grid-2">
+            <div className="field-group">
+              <label className="field-label">{t.settings.paperUpbitKrwLabel}</label>
+              <input
+                type="number"
+                step="1000000"
+                value={paperSeed.paperUpbitKrw}
+                onChange={(e) => setPaperSeed({ ...paperSeed, paperUpbitKrw: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group">
+              <label className="field-label">{t.settings.paperCoinbaseUsdLabel}</label>
+              <input
+                type="number"
+                step="1000"
+                value={paperSeed.paperCoinbaseUsd}
+                onChange={(e) => setPaperSeed({ ...paperSeed, paperCoinbaseUsd: e.target.value })}
+                className="input mono"
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              type="button"
+              disabled={saving}
+              onClick={handleResetPaperAccount}
+              className="btn btn-danger"
+            >
+              <RotateCcw size={15} />
+              <span>{t.settings.resetPaperBtn}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Tab 4: Closed Trade History */}
+      {activeTab === 'history' && (
+        <div className="section-block">
+          <div className="section-header">
+            <h2 className="section-title">
+              <span>{t.settings.historyTitle}</span>
+              <span className="badge badge-neutral mono">{historyList.length}</span>
+            </h2>
+            {historyList.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                onClick={exportHistoryCsv}
+              >
+                <Download size={14} />
+                <span>{t.settings.exportCsvBtn}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="table-surface">
+            {historyList.length === 0 ? (
+              <div className="empty-state">
+                <div>{t.settings.noHistory}</div>
+              </div>
+            ) : (
+              <table className="clean-table">
+                <thead>
+                  <tr>
+                    <th>{t.dashboard.colAsset}</th>
+                    <th>{t.dashboard.colStrategy}</th>
+                    <th>{t.dashboard.colInvested}</th>
+                    <th>{t.dashboard.colEntrySpread}</th>
+                    <th>{t.settings.colRealizedPnl}</th>
+                    <th>{t.settings.colOpenedAt}</th>
+                    <th>{t.settings.colClosedAt}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {historyList.map((h) => {
+                    const coin = String(h.baseSymbol).split('-')[0];
+                    const isWin = h.realizedPnlUsd >= 0;
+                    return (
+                      <tr key={h.id}>
+                        <td>
+                          <div className="mono" style={{ fontWeight: 700 }}>
+                            {coin}
+                          </div>
+                          <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                            {h.baseExchange} → {h.foreignExchange}
+                          </div>
+                        </td>
+                        <td>{formatStrategyLabel(h.strategy, lang)}</td>
+                        <td className="mono">${h.investedUsd.toFixed(2)}</td>
+                        <td className="mono">
+                          {h.entrySpreadPct >= 0 ? '+' : ''}
+                          {h.entrySpreadPct.toFixed(2)}%
+                        </td>
+                        <td
+                          className="mono"
+                          style={{
+                            fontWeight: 700,
+                            color: isWin ? 'var(--emerald)' : 'var(--rose)'
+                          }}
+                        >
+                          {isWin ? '+' : ''}${h.realizedPnlUsd.toFixed(2)}
+                        </td>
+                        <td className="mono" style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                          {h.openedAt ? new Date(h.openedAt).toLocaleString() : '-'}
+                        </td>
+                        <td className="mono" style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                          {h.closedAt ? new Date(h.closedAt).toLocaleString() : '-'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             )}
           </div>
         </div>
       )}
 
-      {/* noVNC Browser Session Modal */}
+      {/* noVNC Web Lending Browser Modal */}
       {showNoVNCModal && (
-        <div className="fixed inset-0 bg-black/80 flex-center z-50 p-lg">
-          <div className="bg-gray-900 border border-gray-700 rounded-xl p-lg max-w-5xl w-full flex flex-col gap-md animate-fade-in" style={{ height: '80vh' }}>
-            <div className="flex-between">
+        <div className="modal-backdrop">
+          <div
+            className="modal-sheet"
+            style={{ maxWidth: '1040px', height: '82vh', padding: '24px' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px' }}>
               <div>
-                <h3 className="text-lg font-bold m-0">Exchange Web Lending Session (noVNC)</h3>
-                <p className="text-xs text-secondary m-0">Complete QR / 2FA login below. Once authenticated, the Go Engine CDP Watchdog keeps your lending session alive.</p>
+                <h3 style={{ fontSize: '18px', fontWeight: 700 }}>
+                  {t.settings.openNoVncBtn}
+                </h3>
+                <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                  {lang === 'ko'
+                    ? '아래 원격 브라우저에서 업비트 로그인을 완료하면 엔진이 자동으로 대여 세션을 감지·유지합니다.'
+                    : 'Complete Upbit login below. The engine automatically monitors your lending session.'}
+                </p>
               </div>
-              <div className="flex items-center gap-sm">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                 <input
                   type="text"
                   value={noVNCUrl}
-                  onChange={e => setNoVNCUrl(e.target.value)}
-                  className="form-input text-xs px-sm py-1"
-                  style={{ width: '220px' }}
+                  onChange={(e) => setNoVNCUrl(e.target.value)}
+                  className="input mono"
+                  style={{ width: '240px', height: '36px', fontSize: '12px' }}
                 />
-                <button className="btn-secondary p-2 rounded" onClick={() => setShowNoVNCModal(false)}>
-                  <X size={18} />
+                <button
+                  type="button"
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => setShowNoVNCModal(false)}
+                >
+                  <X size={16} />
                 </button>
               </div>
             </div>
+
             <iframe
               src={noVNCUrl}
               title="noVNC Exchange Session"
-              className="w-full flex-1 rounded border border-white/10 bg-black"
+              style={{
+                width: '100%',
+                flex: 1,
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--border-subtle)',
+                background: '#000'
+              }}
             />
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 };

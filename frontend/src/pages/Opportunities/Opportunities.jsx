@@ -1,397 +1,400 @@
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Search, Sliders, Zap, Layers, AlertOctagon, FlaskConical } from 'lucide-react';
+import { RotateCcw } from 'lucide-react';
 import { apiClient } from '../../services/api';
 import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
+import { useI18n } from '../../contexts/LanguageContext';
+import { formatStrategyLabel } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
-import './Opportunities.css';
 
 export const Opportunities = () => {
+  const { viewMode } = useAuth();
+  const { lang, t } = useI18n();
   const { showToast, requestConfirm } = useToast();
-  const { viewMode, switchViewMode } = useAuth();
-  const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('filtered'); // 'filtered' | 'raw'
-  const [filteredOpportunities, setFilteredOpportunities] = useState([]);
-  const [rawOpportunities, setRawOpportunities] = useState([]);
 
-  // Interactive Filter States
-  const [searchTerm, setSearchTerm] = useState('');
-  const [minRoi, setMinRoi] = useState(-2.0);
-  const [maxRisk, setMaxRisk] = useState(100.0);
-  const [lastSync, setLastSync] = useState(null);
+  const [opportunities, setOpportunities] = useState([]);
+  const [simStatus, setSimStatus] = useState({
+    exchange: 'UPBIT',
+    current_offset_pct: 0,
+    target_offset_pct: 0,
+    ramp_minutes: 0,
+    progress_pct: 100,
+    remaining_seconds: 0,
+    is_ramping: false
+  });
+  const [simForm, setSimForm] = useState({
+    exchange: 'UPBIT',
+    targetOffsetPct: 3.5,
+    rampMinutes: 3
+  });
+  const [applyingSim, setApplyingSim] = useState(false);
+  const [enteringKey, setEnteringKey] = useState(null);
 
   useEffect(() => {
-    setLoading(true);
-    const oppsSrc = new EventSource(buildSseUrl('/api/ws/opportunities', viewMode), { withCredentials: true });
+    apiClient
+      .get('/settings/sim_offset')
+      .then((res) => {
+        if (res.data) setSimStatus(res.data);
+      })
+      .catch(() => {});
 
-    const processOpportunities = (dataList, isRaw) => {
-      if (!Array.isArray(dataList)) return [];
-      return [...dataList].sort((a, b) => {
-        const roiA = isRaw
-          ? (typeof a.expected_margin === 'number' ? a.expected_margin : (a.expected_roi || 0) * 100)
-          : (a.expected_roi || 0);
-        const roiB = isRaw
-          ? (typeof b.expected_margin === 'number' ? b.expected_margin : (b.expected_roi || 0) * 100)
-          : (b.expected_roi || 0);
-        return roiB - roiA;
-      });
-    };
-
-    oppsSrc.addEventListener('filtered_opportunities', (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        setFilteredOpportunities(processOpportunities(data, false));
-        setLastSync(new Date());
-        setLoading(false);
-      } catch (err) {}
+    const oppsSrc = new EventSource(buildSseUrl('/api/ws/opportunities', viewMode), {
+      withCredentials: true
+    });
+    const dashSrc = new EventSource(buildSseUrl('/api/ws/dashboard', viewMode), {
+      withCredentials: true
     });
 
-    oppsSrc.addEventListener('raw_opportunities', (e) => {
+    oppsSrc.addEventListener('opportunities', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setRawOpportunities(processOpportunities(data, true));
-        setLastSync(new Date());
-        setLoading(false);
-      } catch (err) {}
+        if (Array.isArray(data)) {
+          const mapped = data.map((item, idx) => ({
+            id: `${item.base_exchange}-${item.foreign_exchange}-${item.base_symbol}-${idx}`,
+            baseExchange: item.base_exchange || 'UPBIT',
+            foreignExchange: item.foreign_exchange || 'COINBASE',
+            baseSymbol: item.base_symbol || 'BTC-KRW',
+            foreignSymbol: item.foreign_symbol || 'BTC-USD',
+            basePriceUsd: Number(item.base_price_usd || 0),
+            foreignPriceUsd: Number(item.foreign_price_usd || 0),
+            premiumPct: Number(item.premium_pct || 0) * 100,
+            predictedPct:
+              typeof item.predicted_premium_pct === 'number'
+                ? item.predicted_premium_pct * 100
+                : Number(item.premium_pct || 0) * 65,
+            expectedMarginPct: Number(item.expected_margin || item.premium_pct || 0) * 100,
+            strategy:
+              item.recommended_strategy ||
+              (Number(item.premium_pct || 0) >= 0.01 ? 'TRANSFER' : 'MARGIN_SPOT'),
+            targetWeightPct:
+              typeof item.target_weight === 'number' ? Math.round(item.target_weight * 100) : 35
+          }));
+          setOpportunities(mapped);
+        }
+      } catch {}
+    });
+
+    dashSrc.addEventListener('portfolio', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data && data.sim_status) {
+          setSimStatus(data.sim_status);
+        }
+      } catch {}
     });
 
     return () => {
       oppsSrc.close();
+      dashSrc.close();
     };
   }, [viewMode]);
 
-  const handleForceEnter = (opp) => {
-    const asset = opp.base_symbol?.split('-')[0] || opp.base_symbol;
-    const route = `${opp.base_exchange}:${asset} ➔ ${opp.foreign_exchange}`;
-    const roi = ((opp.expected_roi || 0) * 100).toFixed(2);
-    const weightPct = ((opp.target_weight || 0.2) * 100).toFixed(1);
+  const applySimOffset = async (exchange, targetPct, rampMin) => {
+    setApplyingSim(true);
+    try {
+      const res = await apiClient.post('/settings/sim_offset', {
+        exchange,
+        target_offset_pct: Number(targetPct),
+        ramp_minutes: Number(rampMin)
+      });
+      if (res.data?.sim_status) {
+        setSimStatus(res.data.sim_status);
+      }
+      setSimForm({
+        exchange,
+        targetOffsetPct: Number(targetPct),
+        rampMinutes: Number(rampMin)
+      });
+      showToast(
+        lang === 'ko'
+          ? `${exchange} 시세 오프셋(${Number(targetPct) >= 0 ? '+' : ''}${targetPct}% / ${rampMin}분)이 적용되었습니다.`
+          : `Price offset (${targetPct}% over ${rampMin}m) applied to ${exchange}.`,
+        'success'
+      );
+    } catch (err) {
+      showToast(err.response?.data?.error || err.message, 'error');
+    } finally {
+      setApplyingSim(false);
+    }
+  };
 
+  const handleManualEnter = (opp) => {
+    const coin = String(opp.baseSymbol).split('-')[0];
     requestConfirm({
-      title: `Force Enter Arbitrage (${asset} — ${viewMode} Mode)`,
-      message: `Mode: ${viewMode === 'PAPER' ? '🧪 모의매매 (Paper Engine)' : '⚡ 실매매 (Live Engine)'}\nRoute: ${route}\nStrategy: ${opp.strategy}\nExpected Net ROI: +${roi}%\nAI Target Allocation Weight: ${weightPct}%\n\nConfirm order execution via ${viewMode} Engine?`,
-      confirmText: `Execute ${viewMode} Hedge Entry`,
-      danger: viewMode === 'LIVE',
+      title: lang === 'ko' ? `${coin} 수동 포지션 진입` : `Enter ${coin} Arbitrage Position`,
+      message:
+        lang === 'ko'
+          ? `경로: ${opp.baseExchange} (${opp.baseSymbol}) ↔ ${opp.foreignExchange} (${opp.foreignSymbol})\n현재 프리미엄: ${opp.premiumPct >= 0 ? '+' : ''}${opp.premiumPct.toFixed(2)}%\n전략: ${formatStrategyLabel(opp.strategy, lang)}\n\n즉시 델타 중립 양방향 주문을 실행하시겠습니까?`
+          : `Route: ${opp.baseExchange} ↔ ${opp.foreignExchange}\nSpread: ${opp.premiumPct.toFixed(2)}%\nExecute delta-neutral entry now?`,
+      confirmText: t.market.enterBtn,
+      cancelText: t.stopModal.cancel,
       onConfirm: async () => {
+        setEnteringKey(opp.id);
         try {
-          await apiClient.post('/positions/force_enter', { ...opp, mode: viewMode });
-          showToast(`Force entry signal routed to ${viewMode} Strategy Engine for ${route}.`, 'success');
+          await apiClient.post('/positions/force_enter', {
+            mode: viewMode,
+            base_exchange: opp.baseExchange,
+            foreign_exchange: opp.foreignExchange,
+            base_symbol: opp.baseSymbol,
+            foreign_symbol: opp.foreignSymbol,
+            strategy: opp.strategy,
+            investment_usd: 2500
+          });
+          showToast(
+            lang === 'ko'
+              ? `${coin} 포지션 진입 요청이 엔진으로 전송되었습니다.`
+              : `Entry command sent for ${coin}.`,
+            'success'
+          );
         } catch (err) {
-          showToast('Failed to enter: ' + (err.response?.data?.error || err.message), 'error');
+          showToast(err.response?.data?.error || err.message, 'error');
+        } finally {
+          setEnteringKey(null);
         }
       }
     });
   };
 
-  // Perform Local Search & Filtering on live lists
-  const displayFiltered = filteredOpportunities.filter(o => {
-    const matchSearch =
-      (o.base_symbol || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (o.base_exchange || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (o.foreign_exchange || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (o.strategy || '').toLowerCase().includes(searchTerm.toLowerCase());
-    const roiPct = (o.expected_roi || 0) * 100;
-    const matchRoi = roiPct >= minRoi;
-    const matchRisk = (o.risk_score || 0) <= maxRisk;
-    return matchSearch && matchRoi && matchRisk;
-  });
-
-  const displayRaw = rawOpportunities.filter(o => {
-    const matchSearch =
-      (o.base_symbol || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (o.base_exchange || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (o.foreign_exchange || '').toLowerCase().includes(searchTerm.toLowerCase());
-    const marginVal = typeof o.expected_margin === 'number'
-      ? o.expected_margin
-      : ((o.expected_roi || 0) * 100);
-    const matchRoi = marginVal >= minRoi;
-    return matchSearch && matchRoi;
-  });
+  const currentSimPct = Number(simStatus.current_offset_pct || 0);
+  const targetSimPct = Number(simStatus.target_offset_pct || 0);
 
   return (
-    <div className="opportunities-page animate-fade-in delay-100">
-      <header className="page-header flex-between">
+    <>
+      <div className="page-header">
         <div>
-          <h1 className="text-2xl font-bold flex items-center gap-sm">
-            <Sliders className="text-accent-primary" /> Global Arbitrage Scanner ({viewMode} Mode)
-          </h1>
-          <p className="text-secondary mt-xs">
-            {viewMode === 'PAPER'
-              ? '100% Real Exchange Feeds + Paper Simulator Offset applied to AI forecasts & target weights.'
-              : 'Live cross-exchange spread telemetry, 8-hour AI Transformer forecasts, and RL portfolio target weights.'}
-          </p>
+          <h1 className="page-title">{t.market.title}</h1>
+          <p className="page-subtitle">{t.market.subtitle}</p>
         </div>
-        <div className="flex items-center gap-sm">
-          <button
-            type="button"
-            className="btn-secondary flex items-center gap-2"
-            onClick={() => switchViewMode(viewMode === 'PAPER' ? 'LIVE' : 'PAPER')}
-          >
-            {viewMode === 'PAPER' ? <FlaskConical size={15} className="text-emerald-400" /> : <Zap size={15} className="text-amber-400" />}
-            <span>{viewMode === 'PAPER' ? '🧪 Paper View' : '⚡ Live View'}</span>
-          </button>
-          {lastSync && <span className="text-xs text-muted font-mono">Sync: {lastSync.toLocaleTimeString()}</span>}
-          <button className="btn-secondary flex items-center gap-2">
-            <RefreshCw size={16} className={loading ? 'animate-spin text-accent-primary' : ''} />
-            {loading ? 'Scanning...' : 'Live Stream Active'}
-          </button>
-        </div>
-      </header>
+      </div>
 
-      {/* Filter Control Panel */}
-      <div className="opportunities-filters-panel glass-panel p-xl">
-        <div className="opportunities-filters">
-          <div className="filter-group">
-            <label htmlFor="search-input">Search Asset / Exchange / Strategy</label>
-            <div style={{ position: 'relative' }}>
-              <input
-                id="search-input"
-                type="text"
-                placeholder="e.g. BTC, Upbit, Coinbase, Strategy C"
-                value={searchTerm}
-                onChange={e => setSearchTerm(e.target.value)}
-                className="filter-input w-full"
-                style={{ paddingLeft: '36px' }}
-              />
-              <Search size={16} className="text-muted" style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)' }} />
-            </div>
-          </div>
-
-          <div className="filter-group">
-            <label htmlFor="roi-slider">
-              Min Expected ROI / Margin: <span className="text-amber-400 font-bold">{minRoi.toFixed(1)}%</span>
-            </label>
-            <div className="slider-container">
-              <input
-                id="roi-slider"
-                type="range"
-                min="-5.0"
-                max="5.0"
-                step="0.1"
-                value={minRoi}
-                onChange={e => setMinRoi(parseFloat(e.target.value))}
-                className="filter-slider"
-              />
-              <span className="slider-val">{minRoi.toFixed(1)}%</span>
-            </div>
-          </div>
-
-          {activeTab === 'filtered' && (
-            <div className="filter-group">
-              <label htmlFor="risk-slider">
-                Max AI Risk Score: <span className="text-red-400 font-bold">{maxRisk.toFixed(0)}</span>
-              </label>
-              <div className="slider-container">
-                <input
-                  id="risk-slider"
-                  type="range"
-                  min="10"
-                  max="100"
-                  step="5"
-                  value={maxRisk}
-                  onChange={e => setMaxRisk(parseFloat(e.target.value))}
-                  className="filter-slider"
-                />
-                <span className="slider-val">{maxRisk.toFixed(0)}</span>
+      {/* 1. Paper Mode Gradual Price Offset Simulator Strip */}
+      {viewMode === 'PAPER' && (
+        <section className="sim-bar">
+          <div className="sim-bar-top">
+            <div>
+              <div style={{ fontSize: '16px', fontWeight: 700, marginBottom: '4px' }}>
+                {t.market.simTitle}
+              </div>
+              <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                {t.market.simDesc}
               </div>
             </div>
-          )}
 
-          <div className="filter-group action-group">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                {t.market.simCurrentStatus}:
+              </span>
+              <span
+                className={`badge mono ${
+                  Math.abs(currentSimPct) > 0.01 ? 'badge-amber' : 'badge-neutral'
+                }`}
+                style={{ fontSize: '14px', padding: '6px 12px' }}
+              >
+                {simStatus.exchange || 'UPBIT'} {currentSimPct >= 0 ? '+' : ''}
+                {currentSimPct.toFixed(2)}%
+                {Math.abs(targetSimPct - currentSimPct) > 0.05 &&
+                  ` → ${targetSimPct >= 0 ? '+' : ''}${targetSimPct.toFixed(2)}%`}
+              </span>
+            </div>
+          </div>
+
+          {/* Preset Quick Buttons */}
+          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
             <button
-              className="btn-secondary"
-              onClick={() => {
-                setSearchTerm('');
-                setMinRoi(-2.0);
-                setMaxRisk(100.0);
-              }}
+              type="button"
+              disabled={applyingSim}
+              className="btn btn-sm btn-ghost"
+              onClick={() => applySimOffset('UPBIT', 3.5, 3)}
             >
-              Reset Filters
+              {t.market.simPresetKimchi}
+            </button>
+            <button
+              type="button"
+              disabled={applyingSim}
+              className="btn btn-sm btn-ghost"
+              onClick={() => applySimOffset('UPBIT', -1.5, 2)}
+            >
+              {t.market.simPresetDiscount}
+            </button>
+            <button
+              type="button"
+              disabled={applyingSim}
+              className="btn btn-sm btn-ghost"
+              onClick={() => applySimOffset('UPBIT', 4.0, 0)}
+            >
+              {t.market.simPresetInstant}
+            </button>
+            <button
+              type="button"
+              disabled={applyingSim}
+              className="btn btn-sm btn-ghost"
+              onClick={() => applySimOffset('UPBIT', 0, 0)}
+            >
+              <RotateCcw size={13} />
+              <span>{t.market.simPresetReset}</span>
             </button>
           </div>
-        </div>
-      </div>
 
-      {/* Main Scanner Section */}
-      <div className="scanner-container">
-        {/* Tab Navigation */}
-        <div className="opportunity-tabs-container">
-          <button
-            className={`opportunity-tab ${activeTab === 'filtered' ? 'active filtered' : ''}`}
-            onClick={() => setActiveTab('filtered')}
+          <div className="divider" />
+
+          {/* Custom Offset Inputs */}
+          <form
+            className="sim-controls-row"
+            onSubmit={(e) => {
+              e.preventDefault();
+              applySimOffset(simForm.exchange, simForm.targetOffsetPct, simForm.rampMinutes);
+            }}
           >
-            <Zap size={14} /> AI Filtered & Sized ({displayFiltered.length})
-          </button>
-          <button
-            className={`opportunity-tab ${activeTab === 'raw' ? 'active raw' : ''}`}
-            onClick={() => setActiveTab('raw')}
-          >
-            <Layers size={14} /> Raw Global Spreads ({displayRaw.length})
-          </button>
+            <div className="field-group" style={{ minWidth: '160px' }}>
+              <label className="field-label">{t.market.simExchange}</label>
+              <select
+                value={simForm.exchange}
+                onChange={(e) => setSimForm({ ...simForm, exchange: e.target.value })}
+                className="select"
+              >
+                <option value="UPBIT">UPBIT (업비트)</option>
+                <option value="COINBASE">COINBASE (코인베이스)</option>
+              </select>
+            </div>
+
+            <div className="field-group" style={{ width: '160px' }}>
+              <label className="field-label">{t.market.simTargetPct}</label>
+              <input
+                type="number"
+                step="0.1"
+                min="-30"
+                max="30"
+                value={simForm.targetOffsetPct}
+                onChange={(e) => setSimForm({ ...simForm, targetOffsetPct: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <div className="field-group" style={{ width: '160px' }}>
+              <label className="field-label">{t.market.simRampMin}</label>
+              <input
+                type="number"
+                step="0.5"
+                min="0"
+                max="120"
+                value={simForm.rampMinutes}
+                onChange={(e) => setSimForm({ ...simForm, rampMinutes: e.target.value })}
+                className="input mono"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={applyingSim}
+              className="btn btn-primary"
+              style={{ height: '42px' }}
+            >
+              {t.market.simApplyBtn}
+            </button>
+          </form>
+        </section>
+      )}
+
+      {/* 2. Live Cross-Exchange Opportunities Table */}
+      <section className="section-block">
+        <div className="section-header">
+          <h2 className="section-title">
+            <span>{t.market.tableTitle}</span>
+            <span className="badge badge-neutral mono">{opportunities.length}</span>
+          </h2>
         </div>
 
-        {/* Tab Contents */}
-        <div className="opportunities-list flex flex-col gap-sm">
-          {activeTab === 'filtered' ? (
-            <div className="opportunities-table-container">
-              <table className="opportunities-table">
-                <thead>
-                  <tr>
-                    <th>Strategy</th>
-                    <th>Asset</th>
-                    <th>Hedge Route (Short → Long)</th>
-                    <th>Current → 8h Pred Spread</th>
-                    <th>AI Target Weight</th>
-                    <th>Risk Score</th>
-                    <th>Expected Net ROI</th>
-                    <th className="text-right">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayFiltered.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} className="text-center text-secondary py-xl" style={{ borderBottom: 'none' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 'var(--space-xs)' }}>
-                          <AlertOctagon size={20} className="text-muted" />
-                          <span>No AI-filtered opportunities matching your current filter criteria.</span>
-                        </div>
-                      </td>
-                    </tr>
-                  ) : (
-                    displayFiltered.map((o, idx) => {
-                      const currPrem = typeof o.current_premium_pct === 'number'
-                        ? o.current_premium_pct
-                        : (typeof o.current_prem === 'number' ? o.current_prem * 100 : 0);
-                      const predPrem = typeof o.predicted_premium_pct === 'number'
-                        ? o.predicted_premium_pct
-                        : (typeof o.expected_future_prem === 'number' ? o.expected_future_prem * 100 : currPrem);
-                      const weightPct = ((o.target_weight || 0) * 100).toFixed(1);
-                      const invUsd = o.investment_usd || 0;
-
-                      return (
-                        <tr key={idx} className="opportunity-row">
-                          <td>
-                            <div className="flex items-center gap-xs font-semibold text-white">
-                              <Zap size={14} className="text-amber-500" />
-                              {o.strategy}
-                            </div>
-                          </td>
-                          <td>
-                            <span className="asset-badge">{(o.base_symbol || '').split('-')[0]}</span>
-                          </td>
-                          <td>
-                            <div className="route-container">
-                              <span className="exchange-name base">{o.base_exchange}</span>
-                              <span className="route-arrow">→</span>
-                              <span className="exchange-name foreign">{o.foreign_exchange}</span>
-                            </div>
-                          </td>
-                          <td className="font-mono text-xs">
-                            <span className="text-secondary">{currPrem >= 0 ? '+' : ''}{currPrem.toFixed(2)}%</span>
-                            <span className="text-muted mx-1">→</span>
-                            <span className="text-amber-300 font-bold">{predPrem >= 0 ? '+' : ''}{predPrem.toFixed(2)}%</span>
-                          </td>
-                          <td className="font-mono text-xs">
-                            <span className="text-blue-300 font-bold">{weightPct}%</span>
-                            {invUsd > 0 && (
-                              <span className="text-muted ml-1">(${invUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })})</span>
-                            )}
-                          </td>
-                          <td>
-                            <span className={`risk-badge ${o.risk_score > 30 ? 'high' : 'low'}`}>
-                              {o.risk_score?.toFixed(1)}
-                            </span>
-                          </td>
-                          <td>
-                            <span className="roi-value positive">
-                              {((o.expected_roi || 0) * 100) >= 0 ? '+' : ''}{((o.expected_roi || 0) * 100).toFixed(2)}%
-                            </span>
-                          </td>
-                          <td className="text-right">
-                            <button
-                              className="btn-enter"
-                              onClick={() => handleForceEnter(o)}
-                            >
-                              Force Enter
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
+        <div className="table-surface">
+          {opportunities.length === 0 ? (
+            <div className="empty-state">
+              <div style={{ fontSize: '15px' }}>{t.market.noOpps}</div>
             </div>
           ) : (
-            <div className="opportunities-table-container">
-              <table className="opportunities-table">
-                <thead>
-                  <tr>
-                    <th>Asset</th>
-                    <th>Canonical Route</th>
-                    <th>Base Price (USD)</th>
-                    <th>Foreign Price (USD)</th>
-                    <th>Spread (Premium)</th>
-                    <th>8h Funding Diff</th>
-                    <th>Net Margin</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayRaw.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="text-center text-secondary py-xl" style={{ borderBottom: 'none' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 'var(--space-xs)' }}>
-                          <AlertOctagon size={20} className="text-muted" />
-                          <span>No global Raw opportunities matching your search or margin criteria.</span>
+            <table className="clean-table">
+              <thead>
+                <tr>
+                  <th>{t.market.colPair}</th>
+                  <th>{t.market.colBasePrice}</th>
+                  <th>{t.market.colForeignPrice}</th>
+                  <th>{t.market.colSpread}</th>
+                  <th>{t.market.colAiForecast}</th>
+                  <th>{t.market.colRecommended}</th>
+                  <th>{t.market.colNetMargin}</th>
+                  <th style={{ textAlign: 'right' }}>{t.market.colManual}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {opportunities.map((opp) => {
+                  const coin = String(opp.baseSymbol).split('-')[0];
+                  const isPosSpread = opp.premiumPct >= 0;
+                  return (
+                    <tr key={opp.id}>
+                      <td>
+                        <div className="mono" style={{ fontWeight: 700, fontSize: '16px' }}>
+                          {coin}
+                        </div>
+                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                          {opp.baseExchange} ({opp.baseSymbol}) → {opp.foreignExchange} ({opp.foreignSymbol})
                         </div>
                       </td>
+                      <td className="mono">
+                        ${opp.basePriceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className="mono">
+                        ${opp.foreignPriceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className="mono">
+                        <span
+                          className={`badge ${
+                            opp.premiumPct >= 1.0
+                              ? 'badge-emerald'
+                              : opp.premiumPct <= -0.5
+                                ? 'badge-blue'
+                                : 'badge-neutral'
+                          }`}
+                          style={{ fontSize: '13px' }}
+                        >
+                          {isPosSpread ? '+' : ''}
+                          {opp.premiumPct.toFixed(2)}%
+                        </span>
+                      </td>
+                      <td className="mono" style={{ color: 'var(--text-secondary)' }}>
+                        {opp.predictedPct >= 0 ? '+' : ''}
+                        {opp.predictedPct.toFixed(2)}%
+                      </td>
+                      <td style={{ fontWeight: 500 }}>
+                        {formatStrategyLabel(opp.strategy, lang)}
+                      </td>
+                      <td
+                        className="mono"
+                        style={{
+                          fontWeight: 700,
+                          color:
+                            opp.expectedMarginPct > 0.3
+                              ? 'var(--emerald)'
+                              : 'var(--text-secondary)'
+                        }}
+                      >
+                        {opp.expectedMarginPct >= 0 ? '+' : ''}
+                        {opp.expectedMarginPct.toFixed(2)}%
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          disabled={enteringKey === opp.id}
+                          onClick={() => handleManualEnter(opp)}
+                          className="btn btn-sm btn-ghost"
+                        >
+                          {t.market.enterBtn}
+                        </button>
+                      </td>
                     </tr>
-                  ) : (
-                    displayRaw.map((o, idx) => {
-                      const prem = typeof o.premium_pct === 'number'
-                        ? o.premium_pct
-                        : (typeof o.current_prem === 'number' ? o.current_prem * 100 : 0);
-                      const margin = typeof o.expected_margin === 'number'
-                        ? o.expected_margin
-                        : ((o.expected_roi || 0) * 100);
-                      return (
-                        <tr key={idx} className="opportunity-row">
-                          <td>
-                            <span className="asset-badge raw">{(o.base_symbol || '').split('-')[0]}</span>
-                          </td>
-                          <td>
-                            <div className="route-container">
-                              <span className="exchange-name base">{o.base_exchange}</span>
-                              <span className="route-arrow">→</span>
-                              <span className="exchange-name foreign">{o.foreign_exchange}</span>
-                            </div>
-                          </td>
-                          <td className="font-mono text-secondary">
-                            ${o.base_price_usd?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                          </td>
-                          <td className="font-mono text-secondary">
-                            ${o.foreign_price_usd?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                          </td>
-                          <td className={`font-mono font-semibold ${prem >= 0 ? 'text-green-400' : 'text-purple-400'}`}>
-                            {prem >= 0 ? '+' : ''}{prem.toFixed(2)}%
-                            {prem <= 0 && <span className="text-xs text-muted ml-1">(Rev)</span>}
-                          </td>
-                          <td className="font-mono text-secondary">
-                            {((o.foreign_funding_rate_pct || 0) - (o.base_funding_rate_pct || 0)).toFixed(3)}%
-                          </td>
-                          <td>
-                            <span className="roi-value raw">
-                              {margin >= 0 ? '+' : ''}{margin.toFixed(2)}%
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </div>
-      </div>
-    </div>
+      </section>
+    </>
   );
 };
