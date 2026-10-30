@@ -99,12 +99,85 @@ class UserAccountCache:
             return list(self.users.keys())
 
 
+def _anchor_traj_segment(raw_seg, origin_spread: float, seg_len: int) -> np.ndarray:
+    if not raw_seg or len(raw_seg) == 0:
+        return np.full(seg_len, origin_spread, dtype=np.float32)
+    arr = np.asarray(raw_seg[:seg_len], dtype=np.float32)
+    if len(arr) < seg_len:
+        arr = np.pad(arr, (0, seg_len - len(arr)), mode="edge")
+    diff = float(origin_spread) - float(arr[0])
+    decay = np.exp(-0.35 * np.linspace(0.0, float(seg_len) / 480.0, seg_len, dtype=np.float32))
+    anchored = arr + diff * decay
+    anchored[0] = float(origin_spread)
+    return anchored
+
+
+def compute_past_horizon_trajectories(context_df: pd.DataFrame, device: str = "cpu") -> dict:
+    """
+    Computes fixed-origin historical AI forecast trajectories for each lookback tab:
+      - '1h': 60-minute trajectory predicted 1 hour ago (origin = N - 60)
+      - '6h': 360-minute trajectory predicted 6 hours ago (origin = N - 360)
+      - '24h': 3 x 8-hour (480m) funding-cycle trajectories predicted at -24h, -16h, and -8h
+    """
+    n = len(context_df)
+    if n == 0:
+        return {"1h": [], "6h": [], "24h": []}
+
+    spreads = context_df["exchange_premium_spread"].astype(float).values
+    traj_24h = np.copy(spreads).astype(np.float32)
+    traj_6h = np.copy(spreads).astype(np.float32)
+    traj_1h = np.copy(spreads).astype(np.float32)
+
+    # 1. 1H Tab: Fixed-origin forecast from 1 hour ago (N - 60)
+    h1 = min(n, 60)
+    orig_1h = max(0, n - h1)
+    if orig_1h >= 10:
+        _, _, _, raw_1h = predict_reversion(context_df.iloc[: orig_1h + 1], pred_len=h1, device=device)
+        traj_1h[orig_1h:] = _anchor_traj_segment(raw_1h, spreads[orig_1h], h1)
+
+    # 2. 6H Tab: Fixed-origin forecast from 6 hours ago (N - 360)
+    h6 = min(n, 360)
+    orig_6h = max(0, n - h6)
+    if orig_6h >= 10:
+        _, _, _, raw_6h = predict_reversion(context_df.iloc[: orig_6h + 1], pred_len=h6, device=device)
+        traj_6h[orig_6h:] = _anchor_traj_segment(raw_6h, spreads[orig_6h], h6)
+    else:
+        traj_6h = np.copy(traj_1h)
+
+    # 3. 24H Tab: 3 x 8-hour (480m) funding-cycle forecast segments (-24h..-16h, -16h..-8h, -8h..NOW)
+    boundaries = []
+    if n > 960:
+        boundaries.append((0, n - 960))
+        boundaries.append((n - 960, n - 480))
+        boundaries.append((n - 480, n))
+    elif n > 480:
+        boundaries.append((0, n - 480))
+        boundaries.append((n - 480, n))
+    else:
+        boundaries.append((0, n))
+
+    for start_i, end_i in boundaries:
+        seg_len = end_i - start_i
+        if seg_len <= 0:
+            continue
+        ctx_slice = context_df.iloc[: max(12, start_i + 1)]
+        _, _, _, raw_seg = predict_reversion(ctx_slice, pred_len=min(480, seg_len), device=device)
+        traj_24h[start_i:end_i] = _anchor_traj_segment(raw_seg, spreads[start_i], seg_len)
+
+    return {
+        "1h": traj_1h.tolist(),
+        "6h": traj_6h.tolist(),
+        "24h": traj_24h.tolist(),
+    }
+
+
 def build_chart_payload(
     pair_key: tuple,
     history_deque,
     metrics: dict,
     current_spread: float,
     now_ts: float = None,
+    past_trajs: dict = None,
 ) -> dict:
     """
     Constructs the unified historical (actual + past AI forecast) and future 8-hour
@@ -114,19 +187,32 @@ def build_chart_payload(
         now_ts = time.time()
     now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
 
+    n_hist = len(history_deque)
+    t_1h = past_trajs.get("1h", []) if past_trajs else []
+    t_6h = past_trajs.get("6h", []) if past_trajs else []
+    t_24h = past_trajs.get("24h", []) if past_trajs else []
+
     history_points = []
-    for item in history_deque:
+    for idx, item in enumerate(history_deque):
         mb = int(item.get("minute_bucket", int(now_ts // 60)))
         ts_iso = item.get("timestamp_iso")
         if not ts_iso:
             ts_iso = datetime.fromtimestamp(mb * 60, tz=timezone.utc).isoformat()
         act_spread = float(item.get("exchange_premium_spread", 0.0))
-        past_pred_spread = float(item.get("ai_past_pred_spread", act_spread))
+        fallback_pred = float(item.get("ai_past_pred_spread", act_spread))
+
+        p1 = float(t_1h[idx]) if idx < len(t_1h) else fallback_pred
+        p6 = float(t_6h[idx]) if idx < len(t_6h) else fallback_pred
+        p24 = float(t_24h[idx]) if idx < len(t_24h) else fallback_pred
+
         history_points.append({
             "timestamp": ts_iso,
             "minute_bucket": mb,
             "actual_pct": round(act_spread * 100.0, 4),
-            "ai_past_pred_pct": round(past_pred_spread * 100.0, 4),
+            "ai_past_pred_pct": round(p6 * 100.0, 4),
+            "pred_1h_pct": round(p1 * 100.0, 4),
+            "pred_6h_pct": round(p6 * 100.0, 4),
+            "pred_24h_pct": round(p24 * 100.0, 4),
         })
 
     # Ensure the final history point matches the live current spread at NOW
@@ -373,17 +459,22 @@ def run_daemon():
                     or abs(current_spread - cached_fc.get("anchor_spread", current_spread)) > 0.0015
                 ):
                     _, _, _, raw_traj = predict_reversion(context_df, pred_len=PRED_LEN, device="cpu")
+                    if cached_fc is not None and cached_fc.get("past_trajs_minute") == current_minute_bucket:
+                        past_trajs = cached_fc.get("past_trajs", {})
+                    else:
+                        past_trajs = compute_past_horizon_trajectories(context_df, device="cpu")
                     forecast_minute_cache[pair_key] = {
                         "minute": current_minute_bucket,
                         "anchor_spread": current_spread,
                         "traj": raw_traj,
+                        "past_trajs": past_trajs,
+                        "past_trajs_minute": current_minute_bucket,
                     }
                     # Record future predictions in lookup table so future minutes know what AI predicted for them
                     if raw_traj:
                         for offset_m in range(1, min(60, len(raw_traj) + 1)):
                             target_mb = current_minute_bucket + offset_m
-                            # Keep causal 1-minute step-ahead prediction as primary reference or set if not yet populated
-                            if offset_m == 1 or target_mb not in future_pred_lookup[pair_key]:
+                            if target_mb not in future_pred_lookup[pair_key]:
                                 future_pred_lookup[pair_key][target_mb] = float(raw_traj[offset_m - 1])
                         # Prune old keys
                         old_keys = [k for k in future_pred_lookup[pair_key] if k < current_minute_bucket - 5]
@@ -391,6 +482,7 @@ def run_daemon():
                             future_pred_lookup[pair_key].pop(k, None)
                 else:
                     raw_traj = cached_fc["traj"]
+                    past_trajs = cached_fc.get("past_trajs", {})
 
                 base_fee_pair = float(opp.get("base_fee_rate", 0.0005))
                 foreign_fee_pair = float(opp.get("foreign_fee_rate", 0.002))
@@ -420,6 +512,7 @@ def run_daemon():
                         metrics=metrics,
                         current_spread=current_spread,
                         now_ts=now_ts,
+                        past_trajs=past_trajs,
                     )
                     chart_key = f"market:premium_chart:{pair_key[0]}:{pair_key[1]}:{pair_key[2]}:{pair_key[3]}"
                     try:

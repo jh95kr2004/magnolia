@@ -88,6 +88,9 @@ export const PremiumTrajectoryChart = ({
         ? livePremiumPct
         : Number(summary.current_pct ?? 0.25);
 
+    const horizonKey =
+      range === '1H' ? 'pred_1h_pct' : range === '24H' ? 'pred_24h_pct' : 'pred_6h_pct';
+
     const history =
       rawHistory.length > 0
         ? rawHistory.map((pt, i) => ({
@@ -95,7 +98,7 @@ export const PremiumTrajectoryChart = ({
             actual_pct:
               i === rawHistory.length - 1 ? curPct : Number(pt.actual_pct ?? curPct),
             ai_past_pred_pct: Number(
-              pt.ai_past_pred_pct ?? pt.actual_pct ?? curPct
+              pt[horizonKey] ?? pt.ai_past_pred_pct ?? pt.actual_pct ?? curPct
             )
           }))
         : Array.from({ length: 24 }, (_, i) => {
@@ -246,7 +249,7 @@ export const PremiumTrajectoryChart = ({
           : 'NARROWING'),
       mean8hPct: Number(summary.mean_8h_pct ?? curPct)
     };
-  }, [chartData, livePremiumPct]);
+  }, [chartData, livePremiumPct, range]);
 
   const width = Math.max(640, containerWidth);
   const height = 240;
@@ -446,7 +449,13 @@ export const PremiumTrajectoryChart = ({
                   display: 'inline-block'
                 }}
               />
-              {lang === 'ko' ? '과거 AI 예측 (정확도 비교)' : 'Past AI Forecast (Dimmed)'}
+              {lang === 'ko'
+                ? range === '1H'
+                  ? '과거 AI 예측 (1시간 전 예측 궤적)'
+                  : range === '24H'
+                    ? '과거 AI 예측 (8시간 주기 예측 궤적)'
+                    : '과거 AI 예측 (6시간 전 예측 궤적)'
+                : `Past AI Forecast (${range} Origin Replay)`}
             </span>
 
             <span
@@ -772,7 +781,13 @@ export const PremiumTrajectoryChart = ({
                   {hoveredPoint.actualPct.toFixed(2)}%
                 </span>
                 <span style={{ color: '#c084fc' }}>
-                  {lang === 'ko' ? '당시 AI예측:' : 'Past AI:'}{' '}
+                  {lang === 'ko'
+                    ? range === '1H'
+                      ? '1시간전 예측:'
+                      : range === '24H'
+                        ? '8시간주기 예측:'
+                        : '6시간전 예측:'
+                    : 'Past AI:'}{' '}
                   {hoveredPoint.aiPastPct >= 0 ? '+' : ''}
                   {hoveredPoint.aiPastPct.toFixed(2)}%
                 </span>

@@ -557,8 +557,25 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 		}
 	} else {
 		payload["range"] = rangeParam
-		if histRaw, ok := payload["history"].([]interface{}); ok && len(histRaw) > maxHistoryPoints {
-			payload["history"] = histRaw[len(histRaw)-maxHistoryPoints:]
+		predKey := "pred_6h_pct"
+		switch rangeParam {
+		case "1H":
+			predKey = "pred_1h_pct"
+		case "24H":
+			predKey = "pred_24h_pct"
+		}
+		if histRaw, ok := payload["history"].([]interface{}); ok {
+			if len(histRaw) > maxHistoryPoints {
+				histRaw = histRaw[len(histRaw)-maxHistoryPoints:]
+			}
+			for _, item := range histRaw {
+				if pt, ok := item.(map[string]interface{}); ok {
+					if v, has := pt[predKey]; has {
+						pt["ai_past_pred_pct"] = v
+					}
+				}
+			}
+			payload["history"] = histRaw
 		}
 	}
 
