@@ -540,6 +540,7 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 			"foreign_exchange": foreignEx,
 			"foreign_symbol":   foreignSym,
 			"range":            rangeParam,
+			"is_fallback":      true,
 			"summary": map[string]interface{}{
 				"current_pct":           0.25,
 				"target_pct":            0.16,

@@ -68,6 +68,12 @@ export const PremiumTrajectoryChart = ({
     };
   }, []);
 
+  const isLoadingChart =
+    !chartData ||
+    Boolean(chartData.is_fallback) ||
+    !Array.isArray(chartData.history) ||
+    chartData.history.length === 0;
+
   // Always fetch the full 24H history + 8H forecast so the user can freely zoom and pan anywhere
   useEffect(() => {
     let active = true;
@@ -87,22 +93,28 @@ export const PremiumTrajectoryChart = ({
             mode: viewMode
           }
         });
-        if (active && res.data) {
+        if (
+          active &&
+          res.data &&
+          !res.data.is_fallback &&
+          Array.isArray(res.data.history) &&
+          res.data.history.length > 0
+        ) {
           chartDataCache.set(cacheKey, res.data);
           setChartData(res.data);
         }
       } catch {
-        // Fallback handled gracefully by state
+        // Keep loading state until valid chart data arrives
       }
     };
 
     fetchChart();
-    const timer = setInterval(fetchChart, 5000);
+    const timer = setInterval(fetchChart, isLoadingChart ? 1000 : 5000);
     return () => {
       active = false;
       clearInterval(timer);
     };
-  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode, cacheKey]);
+  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode, cacheKey, isLoadingChart]);
 
   const width = Math.max(640, containerWidth);
   const height = 246;
@@ -382,7 +394,7 @@ export const PremiumTrajectoryChart = ({
     return () => {
       svgEl.removeEventListener('wheel', handleWheel);
     };
-  }, [width, plotW, padLeft, processed.minBound, processed.maxBound, clampViewport]);
+  }, [width, plotW, padLeft, processed.minBound, processed.maxBound, clampViewport, isLoadingChart]);
 
   // Attach window-level mousemove & mouseup listeners for smooth drag-panning
   useEffect(() => {
@@ -715,9 +727,56 @@ export const PremiumTrajectoryChart = ({
 
       {/* SVG Trajectory Canvas */}
       <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
-        <svg
-          ref={svgRef}
-          viewBox={`0 0 ${width} ${height}`}
+        {isLoadingChart ? (
+          <div
+            style={{
+              width: '100%',
+              height: `${height}px`,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '10px',
+              background: 'rgba(15, 23, 42, 0.45)',
+              borderRadius: '6px',
+              border: '1px dashed rgba(148, 163, 184, 0.16)',
+              color: 'var(--text-secondary)',
+              fontSize: '13px'
+            }}
+          >
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#38bdf8"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="9" strokeOpacity="0.2" />
+              <path d="M21 12a9 9 0 0 0-9-9">
+                <animateTransform
+                  attributeName="transform"
+                  type="rotate"
+                  from="0 12 12"
+                  to="360 12 12"
+                  dur="0.85s"
+                  repeatCount="indefinite"
+                />
+              </path>
+            </svg>
+            <span>
+              {lang === 'ko'
+                ? '차트 및 AI 예측 궤적 불러오는 중...'
+                : 'Loading chart & AI forecast trajectory...'}
+            </span>
+          </div>
+        ) : (
+          <>
+            <svg
+              ref={svgRef}
+              viewBox={`0 0 ${width} ${height}`}
           preserveAspectRatio="none"
           style={{
             width: '100%',
@@ -1076,6 +1135,8 @@ export const PremiumTrajectoryChart = ({
               </>
             )}
           </div>
+        )}
+          </>
         )}
       </div>
     </div>
