@@ -104,20 +104,28 @@ export const EquityChart = ({
   const deltaPct = startEquityUsd > 0 ? (deltaUsd / startEquityUsd) * 100 : 0;
   const isPositive = deltaUsd >= 0;
 
-  // Build SVG path coordinates (viewBox 720 x 200)
+  // Build SVG path coordinates with Y-axis anchored at 0 at the bottom
   const svgGeometry = useMemo(() => {
     const width = 720;
     const height = 195;
     const padX = 8;
     const padTop = 18;
-    const padBottom = 18;
+    const padBottom = 14;
     const usableW = width - padX * 2;
     const usableH = height - padTop - padBottom;
+    const bottomY = padTop + usableH;
 
-    const values = chartSeries.map((p) => Number(p.total_equity_usd || 0));
-    const minVal = Math.min(...values);
-    const maxVal = Math.max(...values);
+    const values = chartSeries.map((p) => Math.max(0, Number(p.total_equity_usd || 0)));
+    const minVal = 0;
+    const peakVal = Math.max(0, ...values);
+    const maxVal = peakVal > 0 ? peakVal * 1.16 : 100;
     const span = maxVal - minVal;
+
+    const toY = (val) => {
+      const clamped = Math.max(minVal, Math.min(maxVal, Number(val || 0)));
+      const normY = span > 1e-4 ? (clamped - minVal) / span : 0;
+      return bottomY - normY * usableH;
+    };
 
     const coords = chartSeries.map((pt, idx) => {
       const x =
@@ -125,8 +133,7 @@ export const EquityChart = ({
           ? padX + (idx / (chartSeries.length - 1)) * usableW
           : padX + usableW / 2;
       const val = Number(pt.total_equity_usd || 0);
-      const normY = span > 1e-4 ? (val - minVal) / span : 0.5;
-      const y = padTop + usableH - normY * usableH;
+      const y = toY(val);
       return { x, y, pt };
     });
 
@@ -135,9 +142,15 @@ export const EquityChart = ({
       .join(' ');
     const firstX = coords[0]?.x ?? padX;
     const lastX = coords[coords.length - 1]?.x ?? width - padX;
-    const areaPath = `${linePath} L ${lastX.toFixed(1)} ${height} L ${firstX.toFixed(1)} ${height} Z`;
+    const areaPath = `${linePath} L ${lastX.toFixed(1)} ${bottomY.toFixed(1)} L ${firstX.toFixed(1)} ${bottomY.toFixed(1)} Z`;
 
-    return { width, height, coords, linePath, areaPath };
+    const yTicks = [
+      { value: peakVal, y: toY(peakVal) },
+      { value: peakVal * 0.5, y: toY(peakVal * 0.5) },
+      { value: 0, y: bottomY }
+    ];
+
+    return { width, height, padX, bottomY, coords, linePath, areaPath, yTicks };
   }, [chartSeries]);
 
   const strokeColor = isPositive ? '#3b82f6' : '#f43f5e';
@@ -262,6 +275,20 @@ export const EquityChart = ({
             fill="url(#coinbaseDotGrid)"
           />
 
+          {/* Horizontal Y-Axis Guide Lines (Peak, Mid, and 0 at bottom) */}
+          {svgGeometry.yTicks.map((tick, idx) => (
+            <line
+              key={idx}
+              x1={svgGeometry.padX}
+              y1={tick.y}
+              x2={svgGeometry.width - svgGeometry.padX}
+              y2={tick.y}
+              stroke={tick.value === 0 ? 'rgba(148, 163, 184, 0.25)' : 'rgba(148, 163, 184, 0.12)'}
+              strokeDasharray={tick.value === 0 ? undefined : '3 3'}
+              strokeWidth="1"
+            />
+          ))}
+
           <path d={svgGeometry.areaPath} fill="url(#magnoliaEquityFill)" />
           <path
             d={svgGeometry.linePath}
@@ -294,6 +321,28 @@ export const EquityChart = ({
             </>
           )}
         </svg>
+
+        {/* Crisp Y-Axis Value Labels (Peak, 50%, and 0 at bottom) */}
+        {svgGeometry.yTicks.map((tick, idx) => (
+          <div
+            key={idx}
+            className="mono"
+            style={{
+              position: 'absolute',
+              left: '8px',
+              top: `${(tick.y / svgGeometry.height) * 100}%`,
+              transform: tick.value === 0 ? 'translateY(-100%)' : 'translateY(-50%)',
+              padding: '1px 5px',
+              borderRadius: '4px',
+              background: 'rgba(11, 14, 20, 0.68)',
+              fontSize: '10.5px',
+              color: 'rgba(148, 163, 184, 0.85)',
+              pointerEvents: 'none',
+            }}
+          >
+            {formatMoney(tick.value)}
+          </div>
+        ))}
 
         {hoveredCoord && hoveredCoord.pt?.timestamp && (
           <div
