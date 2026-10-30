@@ -112,10 +112,12 @@ func (s *FutureSpotStrategy) ExecuteEntry(
 	}
 
 	return &postgres.ActivePosition{
-		InvestmentUSD: s.lastEval.InvestmentUSD,
-		Type:          string(s.ID()),
-		BaseAmount:    baseRes.Amount,
-		ForeignAmount: foreignRes.Amount,
+		InvestmentUSD:     s.lastEval.InvestmentUSD,
+		Type:              string(s.ID()),
+		BaseAmount:        baseRes.Amount,
+		ForeignAmount:     foreignRes.Amount,
+		EntryBasePrice:    baseRes.Price,
+		EntryForeignPrice: foreignRes.Price,
 	}, nil
 }
 

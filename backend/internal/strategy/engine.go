@@ -977,9 +977,31 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						if strings.EqualFold(filteredOps[i].BaseExchange, simEx) {
 							filteredOps[i].PremiumPct = (1.0+filteredOps[i].PremiumPct)*(1.0+offsetDec) - 1.0
 							filteredOps[i].PredictedPremiumPct = (1.0+filteredOps[i].PredictedPremiumPct)*(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MeanPremiumPct = (1.0+filteredOps[i].MeanPremiumPct)*(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MaxPremiumPct = (1.0+filteredOps[i].MaxPremiumPct)*(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MinPremiumPct = (1.0+filteredOps[i].MinPremiumPct)*(1.0+offsetDec*0.5) - 1.0
 						} else if strings.EqualFold(filteredOps[i].ForeignExchange, simEx) {
 							filteredOps[i].PremiumPct = (1.0+filteredOps[i].PremiumPct)/(1.0+offsetDec) - 1.0
 							filteredOps[i].PredictedPremiumPct = (1.0+filteredOps[i].PredictedPremiumPct)/(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MeanPremiumPct = (1.0+filteredOps[i].MeanPremiumPct)/(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MaxPremiumPct = (1.0+filteredOps[i].MaxPremiumPct)/(1.0+offsetDec*0.5) - 1.0
+							filteredOps[i].MinPremiumPct = (1.0+filteredOps[i].MinPremiumPct)/(1.0+offsetDec*0.5) - 1.0
+						}
+
+						var hasCanonicalPos, hasReversePos bool
+						for _, pos := range activePos {
+							if pos.Status == "CLOSED" {
+								continue
+							}
+							if pos.BaseExchange == filteredOps[i].BaseExchange &&
+								pos.ForeignExchange == filteredOps[i].ForeignExchange &&
+								pos.BaseSymbol == filteredOps[i].BaseSymbol {
+								hasCanonicalPos = true
+							} else if pos.BaseExchange == filteredOps[i].ForeignExchange &&
+								pos.ForeignExchange == filteredOps[i].BaseExchange &&
+								pos.BaseSymbol == filteredOps[i].ForeignSymbol {
+								hasReversePos = true
+							}
 						}
 
 						// Reflect offset-driven arbitrage edge in target weight & action type for realistic simulation
@@ -987,13 +1009,42 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						if minTargetDec <= 0 {
 							minTargetDec = 0.01
 						}
-						if filteredOps[i].PremiumPct >= minTargetDec && filteredOps[i].TargetWeight < 0.20 {
-							filteredOps[i].TargetWeight = 0.25
+						if filteredOps[i].PremiumPct >= minTargetDec {
+							// Positive Kimchi Premium >= MinTargetProfit: Canonical direction (Base Short / Foreign Long)
+							filteredOps[i].ActionScore = 2.0
+							filteredOps[i].Direction = "NARROWING"
 							filteredOps[i].ActionType = 0
-						} else if filteredOps[i].PremiumPct <= 0.0015 && len(activePos) > 0 {
-							// Spread converged back near 0%: trigger profit-taking exit
-							filteredOps[i].ActionType = 2
-							filteredOps[i].TargetWeight = 0.0
+							if filteredOps[i].TargetWeight < 0.20 {
+								filteredOps[i].TargetWeight = 0.25
+							}
+						} else if filteredOps[i].PremiumPct <= -minTargetDec {
+							// Reverse Premium (역프) <= -MinTargetProfit:
+							// 1. If a canonical position (UPBIT -> COINBASE) is open, close it first to lock in profit.
+							// 2. Otherwise, flip direction to WIDENING (COINBASE Short / UPBIT Long) and hold until convergence.
+							if hasCanonicalPos {
+								filteredOps[i].ActionType = 2
+								filteredOps[i].TargetWeight = 0.0
+							} else {
+								filteredOps[i].ActionScore = 8.0
+								filteredOps[i].Direction = "WIDENING"
+								filteredOps[i].ActionType = 0
+								if filteredOps[i].TargetWeight < 0.20 {
+									filteredOps[i].TargetWeight = 0.25
+								}
+							}
+						} else {
+							// Spread is inside the neutral band (-minTargetDec, +minTargetDec)
+							if hasCanonicalPos && filteredOps[i].PremiumPct <= 0.0015 {
+								filteredOps[i].ActionType = 2
+								filteredOps[i].TargetWeight = 0.0
+							} else if hasReversePos && filteredOps[i].PremiumPct >= -0.0015 {
+								filteredOps[i].ActionType = 2
+								filteredOps[i].TargetWeight = 0.0
+							} else if !hasCanonicalPos && !hasReversePos {
+								// Prevent opening new positions when spread is inside the neutral band
+								filteredOps[i].ActionType = 0
+								filteredOps[i].TargetWeight = 0.0
+							}
 						}
 					}
 				}
@@ -1170,21 +1221,33 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								var selectedStrategy StrategyType = StrategyMarginSpot
 								isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
 								isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
+								reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
+								transferNetROI := entrySpread - 0.0022
+								isReverseDirection := opp.ActionScore > 5.0
+
 								if isBaseFuture && isForeignFuture {
 									selectedStrategy = StrategyFutureFuture
 								} else if isBaseFuture {
 									selectedStrategy = StrategyFutureSpot
 								} else {
-									reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
-									transferNetROI := entrySpread - 0.0022
-
-									if targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
+									// Only use Strategy C (Transfer Loop) for canonical positive-premium transfers;
+									// reverse capital transfers (UPBIT -> COINBASE) are strictly governed by evaluateRebalancing.
+									if !isReverseDirection && targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
 										selectedStrategy = StrategyForeignTransfer
 									} else if isForeignFuture {
 										selectedStrategy = StrategyMarginFuture
 									} else {
 										selectedStrategy = StrategyMarginSpot
 									}
+								}
+
+								expectedBestNetROI := reversionNetROI
+								if selectedStrategy == StrategyForeignTransfer {
+									expectedBestNetROI = transferNetROI
+								}
+								if expectedBestNetROI <= 0.0005 && entrySpread <= 0.0025 {
+									// Guard against opening a position with negative or sub-fee expected return
+									continue
 								}
 
 								targetStrategy := e.findStrategy(selectedStrategy)
@@ -1927,30 +1990,96 @@ func (e *Engine) notifyPositionOpened(ctx context.Context, pos *postgres.ActiveP
 	))
 }
 
+func (e *Engine) getExchangeCurrencyFX(exchangeName, symbol string) float64 {
+	if strings.HasSuffix(strings.ToUpper(symbol), "-KRW") ||
+		strings.EqualFold(exchangeName, "UPBIT") ||
+		strings.EqualFold(exchangeName, "BITHUMB") {
+		fx := GetFXRate("KRW")
+		if fx > 0 {
+			return fx
+		}
+		return 1400.0
+	}
+	return 1.0
+}
+
+func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
+	if pos == nil {
+		return 0.0
+	}
+	baseFX := e.getExchangeCurrencyFX(pos.BaseExchange, pos.BaseSymbol)
+	foreignFX := e.getExchangeCurrencyFX(pos.ForeignExchange, pos.ForeignSymbol)
+
+	// 1. Strategy C (FOREIGN_TRANSFER): Borrow & Sell on Base, Buy on Foreign, Transfer & 1:1 Repay
+	if pos.Type == string(StrategyForeignTransfer) {
+		if pos.EntryBasePrice > 0 && pos.EntryForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
+			baseSellUSD := (pos.BaseAmount * pos.EntryBasePrice) / baseFX
+			foreignBuyUSD := (pos.ForeignAmount * pos.EntryForeignPrice) / foreignFX
+			baseFeeUSD := baseSellUSD * 0.0005
+			foreignFeeUSD := foreignBuyUSD * 0.0020
+			return baseSellUSD - foreignBuyUSD - baseFeeUSD - foreignFeeUSD
+		}
+		return pos.InvestmentUSD * (pos.EntryPremium - 0.0025)
+	}
+
+	// 2. Strategies A, B, D, E (Convergence / Widening Delta-Neutral Hedging):
+	// Entry: Short Base @ EntryBasePrice, Long Foreign @ EntryForeignPrice
+	// Exit:  Buy Base @ exitBasePrice, Sell Foreign @ exitForeignPrice
+	var exitBasePrice, exitForeignPrice float64
+	if e.latestQuotes != nil {
+		if bq, ok := e.latestQuotes[pos.BaseSymbol]; ok {
+			if bq.RawAsk > 0 {
+				exitBasePrice = bq.RawAsk
+			} else if bq.AskUSD > 0 {
+				exitBasePrice = bq.AskUSD * baseFX
+			}
+		}
+		if fq, ok := e.latestQuotes[pos.ForeignSymbol]; ok {
+			if fq.RawBid > 0 {
+				exitForeignPrice = fq.RawBid
+			} else if fq.BidUSD > 0 {
+				exitForeignPrice = fq.BidUSD * foreignFX
+			}
+		}
+	}
+
+	if pos.EntryBasePrice > 0 && pos.EntryForeignPrice > 0 && exitBasePrice > 0 && exitForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
+		baseShortPnLUSD := (pos.BaseAmount * (pos.EntryBasePrice - exitBasePrice)) / baseFX
+		foreignLongPnLUSD := (pos.ForeignAmount * (exitForeignPrice - pos.EntryForeignPrice)) / foreignFX
+		entryNotionalUSD := ((pos.BaseAmount * pos.EntryBasePrice) / baseFX) + ((pos.ForeignAmount * pos.EntryForeignPrice) / foreignFX)
+		roundTripFeesUSD := entryNotionalUSD * 0.0015
+		return baseShortPnLUSD + foreignLongPnLUSD - roundTripFeesUSD
+	}
+
+	if e.liveUnrealizedPnLs != nil {
+		key := pos.BaseExchange + "|" + pos.BaseSymbol
+		if liveVal, ok := e.liveUnrealizedPnLs[key]; ok && math.Abs(liveVal) > 1e-6 {
+			return liveVal
+		}
+	}
+
+	return pos.InvestmentUSD * (-0.0030)
+}
+
 func (e *Engine) notifyPositionClosed(ctx context.Context, positionID string) {
+	profitStr := "N/A"
+	pos, err := e.db.GetPositionByID(positionID)
+	if err == nil && pos != nil {
+		netProfitUSD := e.calculateRealizedPnLUSD(pos)
+		_ = e.db.ClosePositionWithPnL(positionID, netProfitUSD)
+		profitStr = fmt.Sprintf("$%.2f", netProfitUSD)
+		log.Printf("💰 [REALIZED PROFIT] Position %s (%s) closed. Settled Net Profit: %s",
+			positionID, pos.Type, profitStr)
+	}
+
 	e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 		`{"action":"POSITION_CLOSED", "position_id":"%s"}`, positionID,
 	)))
 	e.forceNextSnapshot = true
 	e.publishAccountState(ctx)
 
-	profitStr := "N/A"
-	pos, err := e.db.GetPositionByID(positionID)
-	if err == nil && pos.EntryBasePrice > 0 && pos.EntryForeignPrice > 0 {
-		upbitSellUSD := (pos.BaseAmount * pos.EntryBasePrice) / GetFXRate("KRW")
-		coinbaseBuyUSD := pos.ForeignAmount * pos.EntryForeignPrice
-
-		upbitFeeUSD := upbitSellUSD * 0.0005     // 0.05% taker fee
-		coinbaseFeeUSD := coinbaseBuyUSD * 0.006 // 0.6% taker fee
-
-		netProfitUSD := upbitSellUSD - coinbaseBuyUSD - upbitFeeUSD - coinbaseFeeUSD
-		profitStr = fmt.Sprintf("$%.2f (Est.)", netProfitUSD)
-		log.Printf("💰 [REALIZED PROFIT] Position %s closed. Estimated Net Profit: %s (Base Sell: $%.2f, Foreign Buy: $%.2f, Fees: $%.2f)",
-			positionID, profitStr, upbitSellUSD, coinbaseBuyUSD, upbitFeeUSD+coinbaseFeeUSD)
-	}
-
 	e.sendNotification(ctx, notification.AlertPositionClosed, fmt.Sprintf(
-		"✅ **Position Closed**\n- **ID**: `%s`\n- **Estimated Profit**: `%s`\n- **Timestamp**: `%s`",
+		"✅ **Position Closed**\n- **ID**: `%s`\n- **Realized Profit**: `%s`\n- **Timestamp**: `%s`",
 		positionID, profitStr, time.Now().Format("2006-01-02 15:04:05 MST"),
 	))
 }

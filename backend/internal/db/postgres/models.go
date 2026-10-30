@@ -142,8 +142,10 @@ type ActivePosition struct {
 	RealizedProfitUSD  float64   // Settled realized profit in USD on close
 	BuyOrderID         string
 	SellOrderID        string
-	HedgeMarket        string    // e.g. "SPOT" or "FUTURE", used natively by Strategy C
+	HedgeMarket        string     // e.g. "SPOT" or "FUTURE", used natively by Strategy C
 	OpenedAt           time.Time
+	ClosedAt           *time.Time
+	UpdatedAt          time.Time
 }
 
 // LeaderLease handles cluster-wide locks to prevent multi-pod InfluxDB deduplication.

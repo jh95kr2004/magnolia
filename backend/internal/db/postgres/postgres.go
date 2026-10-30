@@ -271,18 +271,44 @@ func (db *DB) SavePosition(pos *ActivePosition) error {
 
 // UpdatePositionStatus modifies the live status (e.g., "CLOSED")
 func (db *DB) UpdatePositionStatus(positionID string, status string) error {
+	now := time.Now()
 	if status == "CLOSED" {
-		return db.conn.Model(&ActivePosition{}).Where("position_id = ?", positionID).Update("status", status).Error
+		return db.conn.Model(&ActivePosition{}).Where("position_id = ?", positionID).Updates(map[string]interface{}{
+			"status":     status,
+			"closed_at":  &now,
+			"updated_at": now,
+		}).Error
 	}
 	// Prevent transitioning a CLOSED position back to an active state
 	return db.conn.Model(&ActivePosition{}).
 		Where("position_id = ? AND status != ?", positionID, "CLOSED").
-		Update("status", status).Error
+		Updates(map[string]interface{}{
+			"status":     status,
+			"updated_at": now,
+		}).Error
+}
+
+// ClosePositionWithPnL marks a position CLOSED and records its settled RealizedProfitUSD and ClosedAt timestamp.
+func (db *DB) ClosePositionWithPnL(positionID string, realizedProfitUSD float64) error {
+	now := time.Now()
+	return db.conn.Model(&ActivePosition{}).
+		Where("position_id = ?", positionID).
+		Updates(map[string]interface{}{
+			"status":              "CLOSED",
+			"realized_profit_usd": realizedProfitUSD,
+			"closed_at":           &now,
+			"updated_at":          now,
+		}).Error
 }
 
 // ResetAllActivePositions closes all non-closed active positions in the database.
 func (db *DB) ResetAllActivePositions() error {
-	return db.conn.Model(&ActivePosition{}).Where("status != ?", "CLOSED").Update("status", "CLOSED").Error
+	now := time.Now()
+	return db.conn.Model(&ActivePosition{}).Where("status != ?", "CLOSED").Updates(map[string]interface{}{
+		"status":     "CLOSED",
+		"closed_at":  &now,
+		"updated_at": now,
+	}).Error
 }
 
 // UpdatePositionMaxROI modifies the peak unrealized ROI for trailing stops
@@ -361,9 +387,14 @@ func (db *DB) GetClosedPositionsByUserAndMode(userID uint, isPaper bool) ([]Acti
 
 // CloseAllActivePositionsByUserAndMode marks all open positions for a user and mode as CLOSED.
 func (db *DB) CloseAllActivePositionsByUserAndMode(userID uint, isPaper bool) error {
+	now := time.Now()
 	return db.conn.Model(&ActivePosition{}).
 		Where("user_id = ? AND is_paper = ? AND status != ?", userID, isPaper, "CLOSED").
-		Update("status", "CLOSED").Error
+		Updates(map[string]interface{}{
+			"status":     "CLOSED",
+			"closed_at":  &now,
+			"updated_at": now,
+		}).Error
 }
 
 // GetPositionByID fetches a position record by its unique positionID
