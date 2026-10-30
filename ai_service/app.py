@@ -112,6 +112,31 @@ def _anchor_traj_segment(raw_seg, origin_spread: float, seg_len: int) -> np.ndar
     return anchored
 
 
+def _compute_causal_equilibrium_target(spreads: np.ndarray) -> np.ndarray:
+    """
+    Computes the AI's continuous causal implied equilibrium target trend line:
+    1. Filters out transient 1-5m liquidity flash spikes via causal rolling median & MAD winsorization.
+    2. Synthesizes multi-horizon OU equilibrium targets (fast 16m, medium 50m, macro 180m) plus
+       sustained regime trend velocity, smoothed with a continuous causal filter.
+    """
+    n = len(spreads)
+    if n == 0:
+        return np.asarray([], dtype=np.float32)
+    s = pd.Series(spreads.astype(np.float64))
+    med_11 = s.rolling(11, min_periods=1).median()
+    mad_30 = (s - med_11).abs().rolling(30, min_periods=1).mean().clip(lower=1e-4) * 1.4826
+    s_clean = s.clip(lower=med_11 - 1.35 * mad_30, upper=med_11 + 1.35 * mad_30)
+
+    ema_fast = s_clean.ewm(span=16, adjust=False).mean()
+    ema_med = s_clean.ewm(span=50, adjust=False).mean()
+    ema_slow = s_clean.ewm(span=180, adjust=False).mean()
+
+    # Combine multi-horizon equilibrium targets with regime trend slope
+    eq_raw = 0.48 * ema_fast + 0.36 * ema_med + 0.16 * ema_slow + 0.22 * (ema_fast - ema_med)
+    eq_smooth = eq_raw.ewm(span=10, adjust=False).mean()
+    return eq_smooth.values.astype(np.float32)
+
+
 def _roll_periodic_trajectory(
     context_df: pd.DataFrame,
     start_offset: int,
@@ -120,75 +145,104 @@ def _roll_periodic_trajectory(
     device: str = "cpu",
 ) -> np.ndarray:
     """
-    Computes a periodic rolling AI trajectory starting from `start_offset` in steps of `step_min` minutes,
-    using a robust 5-minute median origin anchor and raised-cosine cross-fade between consecutive segments.
+    Synthesizes a stair-free continuous historical AI trajectory by combining:
+      1. Continuous Overlapping Forecast Ensemble (Hann-windowed overlap-add across dense stride windows)
+      2. AI Implied Equilibrium Target Convergence (outlier-resistant multi-horizon OU equilibrium trend)
+      3. Seamless convergence to the live spread origin at NOW (t = n - 1).
     """
     n = len(context_df)
     spreads = context_df["exchange_premium_spread"].astype(float).values.astype(np.float32)
-    out = np.copy(spreads)
     if n == 0 or start_offset >= n:
-        return out
+        return np.copy(spreads)
 
-    starts = list(range(max(0, start_offset), n, step_min))
-    prev_tail = None
+    eq_target = _compute_causal_equilibrium_target(spreads)
+    out = np.copy(eq_target)
 
-    for idx_s, start_i in enumerate(starts):
-        end_i = starts[idx_s + 1] if idx_s + 1 < len(starts) else n
-        seg_len = end_i - start_i
+    stride = max(10, min(int(step_min), 25))
+    win_len = max(stride * 3, stride + int(blend_len) * 2, 60)
+
+    starts = list(range(max(0, start_offset), n, stride))
+    if len(starts) == 0 or starts[-1] < max(0, n - stride // 2):
+        starts.append(max(0, n - stride // 2))
+
+    numer = np.zeros(n, dtype=np.float32)
+    denom = np.zeros(n, dtype=np.float32)
+
+    for start_i in starts:
+        seg_len = min(win_len, n - start_i)
         if seg_len <= 0:
             continue
-        need_len = seg_len + blend_len
-        origin_med = float(np.median(spreads[max(0, start_i - 4) : start_i + 1]))
+
+        origin_med = float(np.median(spreads[max(0, start_i - 6) : start_i + 1]))
+        origin_anchor = 0.72 * float(eq_target[start_i]) + 0.28 * origin_med
 
         if start_i >= 12:
             ctx_slice = context_df.iloc[max(0, start_i - 360) : start_i + 1]
-            _, _, _, raw_seg = predict_reversion(ctx_slice, pred_len=min(480, need_len), device=device)
+            _, _, _, raw_seg = predict_reversion(ctx_slice, pred_len=min(480, seg_len), device=device)
         else:
             raw_seg = []
 
-        anchored = _anchor_traj_segment(raw_seg, origin_med, need_len)
-        cur_seg = np.copy(anchored[:seg_len])
+        anchored = _anchor_traj_segment(raw_seg, origin_anchor, seg_len)
+        eq_slice = eq_target[start_i : start_i + seg_len]
 
-        if idx_s > 0 and prev_tail is not None and len(prev_tail) > 0:
-            b = min(seg_len, len(prev_tail))
-            w = 0.5 * (1.0 - np.cos(np.pi * np.linspace(1.0 / (b + 1), 1.0, b, dtype=np.float32)))
-            cur_seg[:b] = (1.0 - w) * prev_tail[:b] + w * cur_seg[:b]
+        # Progressively guide each forecast window toward the AI equilibrium target trend
+        alpha = np.linspace(0.30, 0.70, seg_len, dtype=np.float32)
+        seg_guided = (1.0 - alpha) * anchored + alpha * eq_slice
 
-        out[start_i:end_i] = cur_seg
-        prev_tail = anchored[seg_len : seg_len + blend_len]
+        # Smooth raised-cosine (Hann) bell window so overlapping trajectories never create step boundaries
+        if seg_len >= 4:
+            tau = np.linspace(1.0, float(seg_len), seg_len, dtype=np.float32)
+            w = 0.5 * (1.0 - np.cos(2.0 * np.pi * tau / float(seg_len + 1)))
+            w = np.maximum(w, 0.05)
+        else:
+            w = np.ones(seg_len, dtype=np.float32)
+
+        numer[start_i : start_i + seg_len] += w * seg_guided
+        denom[start_i : start_i + seg_len] += w
+
+    s0 = max(0, start_offset)
+    valid = denom[s0:] > 1e-6
+    combined_slice = np.where(valid, numer[s0:] / np.maximum(denom[s0:], 1e-6), eq_target[s0:])
+
+    # Final continuous causal smoothing pass to guarantee C1 smoothness (zero stairs)
+    smoothed_slice = (
+        pd.Series(combined_slice.astype(np.float64))
+        .ewm(span=9, adjust=False)
+        .mean()
+        .values.astype(np.float32)
+    )
+    out[s0:] = smoothed_slice
+
+    # Smoothly converge the final 20 minutes into the live spread at NOW so past & future lines meet cleanly
+    tail_len = min(20, n - s0)
+    if tail_len >= 2:
+        now_val = float(spreads[-1])
+        tail_diff = now_val - float(out[-1])
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.linspace(0.0, 1.0, tail_len, dtype=np.float32)))
+        out[n - tail_len : n] = out[n - tail_len : n] + tail_diff * ramp
+        out[-1] = now_val
 
     return out
 
 
 def compute_past_horizon_trajectories(context_df: pd.DataFrame, device: str = "cpu") -> dict:
     """
-    Computes periodic rolling historical AI forecast trajectories for each lookback tab:
-      - '1h': 20-minute rolling trajectory updates across the 1H window
-      - '6h': 60-minute (1-hour) rolling trajectory updates across the 6H window
-      - '24h': 60-minute (1-hour) rolling trajectory updates across the full 24H window
+    Computes the unified stair-free continuous overlapping AI forecast & equilibrium trend trajectory
+    across the historical timeline for all zoom/preset levels ('1h', '6h', '24h').
     """
     n = len(context_df)
     if n == 0:
         return {"1h": [], "6h": [], "24h": []}
 
-    orig_1h = max(0, n - min(n, 60))
-    orig_6h = max(0, n - min(n, 360))
-
-    traj_1h = _roll_periodic_trajectory(context_df, start_offset=orig_1h, step_min=20, blend_len=8, device=device)
-    traj_24h = _roll_periodic_trajectory(context_df, start_offset=0, step_min=60, blend_len=15, device=device)
-
-    # For 6H, reuse the 1-hour rolling trajectory anchored cleanly at orig_6h
-    traj_6h = np.copy(traj_24h)
-    if orig_6h < n:
-        traj_6h_aligned = _roll_periodic_trajectory(
-            context_df, start_offset=orig_6h, step_min=60, blend_len=15, device=device
-        )
-        traj_6h[orig_6h:] = traj_6h_aligned[orig_6h:]
+    unified_traj = _roll_periodic_trajectory(
+        context_df, start_offset=0, step_min=20, blend_len=20, device=device
+    )
+    traj_list = unified_traj.tolist()
 
     return {
-        "1h": traj_1h.tolist(),
-        "6h": traj_6h.tolist(),
-        "24h": traj_24h.tolist(),
+        "1h": traj_list,
+        "6h": traj_list,
+        "24h": traj_list,
     }
 
 

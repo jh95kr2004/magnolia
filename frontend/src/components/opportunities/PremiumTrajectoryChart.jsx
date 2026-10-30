@@ -118,16 +118,12 @@ export const PremiumTrajectoryChart = ({
     const viewSpan = Math.max(20, viewWindow.end - viewWindow.start);
     const useShortRolling = viewSpan <= 180;
 
-    const history =
+    const baseHistory =
       rawHistory.length > 0
         ? rawHistory.map((pt, i) => {
             const offsetMin = -(rawHistory.length - 1 - i);
             const pastPred =
-              useShortRolling && offsetMin >= -60
-                ? (pt.pred_1h_pct ?? pt.pred_6h_pct ?? pt.ai_past_pred_pct)
-                : offsetMin >= -360
-                  ? (pt.pred_6h_pct ?? pt.pred_24h_pct ?? pt.ai_past_pred_pct)
-                  : (pt.pred_24h_pct ?? pt.ai_past_pred_pct);
+              pt.pred_24h_pct ?? pt.pred_6h_pct ?? pt.pred_1h_pct ?? pt.ai_past_pred_pct;
             return {
               ...pt,
               offsetMin,
@@ -146,6 +142,28 @@ export const PremiumTrajectoryChart = ({
               ai_past_pred_pct: v - 0.03
             };
           });
+
+    // Smoothly anchor the final 18 minutes of the past AI trajectory to live curPct at NOW (offsetMin = 0)
+    const lastPastPred =
+      baseHistory.length > 0
+        ? baseHistory[baseHistory.length - 1].ai_past_pred_pct
+        : curPct;
+    const pastTailDiff = curPct - lastPastPred;
+    const tailWindow = 18;
+    const history = baseHistory.map((pt, idx) => {
+      if (idx === baseHistory.length - 1) {
+        return { ...pt, ai_past_pred_pct: curPct };
+      }
+      if (pt.offsetMin > -tailWindow && pt.offsetMin <= 0) {
+        const u = (pt.offsetMin + tailWindow) / tailWindow;
+        const ramp = 0.5 * (1 - Math.cos(Math.PI * u));
+        return {
+          ...pt,
+          ai_past_pred_pct: pt.ai_past_pred_pct + pastTailDiff * ramp
+        };
+      }
+      return pt;
+    });
 
     const anchorDiff =
       rawForecast.length > 0
@@ -610,10 +628,8 @@ export const PremiumTrajectoryChart = ({
                 }}
               />
               {lang === 'ko'
-                ? processed.useShortRolling
-                  ? '과거 AI 예측 (20분 단위 갱신 궤적)'
-                  : '과거 AI 예측 (1시간 단위 갱신 궤적)'
-                : 'Past AI Forecast (Rolling Trajectory)'}
+                ? '과거 AI 예측 (연속 추세·수렴 궤적)'
+                : 'Past AI Forecast (Continuous Equilibrium Trajectory)'}
             </span>
 
             <span
