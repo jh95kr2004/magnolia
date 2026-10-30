@@ -1,15 +1,22 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { apiClient } from '../../services/api';
 
-const RANGE_OPTIONS = ['1H', '6H', '24H'];
+const PRESET_OPTIONS = [
+  { id: '1H', label: '1H', start: -60, end: 120 },
+  { id: '6H', label: '6H', start: -360, end: 480 },
+  { id: '24H', label: '24H', start: -1440, end: 480 }
+];
 
 const formatOffsetLabel = (mins, lang = 'ko') => {
   const m = Math.round(Number(mins || 0));
-  if (m < 60) {
-    return lang === 'ko' ? `+${m}분` : `+${m}m`;
+  if (m === 0) return 'NOW';
+  const sign = m > 0 ? '+' : '-';
+  const absM = Math.abs(m);
+  if (absM < 60) {
+    return lang === 'ko' ? `${sign}${absM}분` : `${sign}${absM}m`;
   }
-  const h = (m / 60).toFixed(1).replace(/\.0$/, '');
-  return lang === 'ko' ? `+${h}시간` : `+${h}h`;
+  const h = (absM / 60).toFixed(1).replace(/\.0$/, '');
+  return lang === 'ko' ? `${sign}${h}시간` : `${sign}${h}h`;
 };
 
 export const PremiumTrajectoryChart = ({
@@ -21,11 +28,21 @@ export const PremiumTrajectoryChart = ({
   livePremiumPct,
   lang = 'ko'
 }) => {
-  const [range, setRange] = useState('6H');
   const [chartData, setChartData] = useState(null);
   const [hoverX, setHoverX] = useState(null);
+  const [viewWindow, setViewWindow] = useState({ start: -360, end: 480 });
+  const [activePreset, setActivePreset] = useState('6H');
+  const [isDragging, setIsDragging] = useState(false);
+
   const containerRef = useRef(null);
+  const svgRef = useRef(null);
   const [containerWidth, setContainerWidth] = useState(1240);
+  const dragRef = useRef({
+    active: false,
+    startClientX: 0,
+    startViewStart: -360,
+    startViewEnd: 480
+  });
 
   useEffect(() => {
     const el = containerRef.current;
@@ -48,6 +65,7 @@ export const PremiumTrajectoryChart = ({
     };
   }, []);
 
+  // Always fetch the full 24H history + 8H forecast so the user can freely zoom and pan anywhere
   useEffect(() => {
     let active = true;
     const fetchChart = async () => {
@@ -58,7 +76,7 @@ export const PremiumTrajectoryChart = ({
             base_symbol: baseSymbol,
             foreign_exchange: foreignExchange,
             foreign_symbol: foreignSymbol,
-            range,
+            range: '24H',
             mode: viewMode
           }
         });
@@ -76,7 +94,16 @@ export const PremiumTrajectoryChart = ({
       active = false;
       clearInterval(timer);
     };
-  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, range, viewMode]);
+  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode]);
+
+  const width = Math.max(640, containerWidth);
+  const height = 246;
+  const padLeft = 48;
+  const padRight = 12;
+  const padTop = 26;
+  const padBottom = 32;
+  const plotW = width - padLeft - padRight;
+  const plotH = height - padTop - padBottom;
 
   const processed = useMemo(() => {
     const rawHistory = Array.isArray(chartData?.history) ? chartData.history : [];
@@ -88,24 +115,34 @@ export const PremiumTrajectoryChart = ({
         ? livePremiumPct
         : Number(summary.current_pct ?? 0.25);
 
-    const horizonKey =
-      range === '1H' ? 'pred_1h_pct' : range === '24H' ? 'pred_24h_pct' : 'pred_6h_pct';
+    const viewSpan = Math.max(20, viewWindow.end - viewWindow.start);
+    const useShortRolling = viewSpan <= 180;
 
     const history =
       rawHistory.length > 0
-        ? rawHistory.map((pt, i) => ({
-            ...pt,
-            actual_pct:
-              i === rawHistory.length - 1 ? curPct : Number(pt.actual_pct ?? curPct),
-            ai_past_pred_pct: Number(
-              pt[horizonKey] ?? pt.ai_past_pred_pct ?? pt.actual_pct ?? curPct
-            )
-          }))
-        : Array.from({ length: 24 }, (_, i) => {
+        ? rawHistory.map((pt, i) => {
+            const offsetMin = -(rawHistory.length - 1 - i);
+            const pastPred =
+              useShortRolling && offsetMin >= -60
+                ? (pt.pred_1h_pct ?? pt.pred_6h_pct ?? pt.ai_past_pred_pct)
+                : offsetMin >= -360
+                  ? (pt.pred_6h_pct ?? pt.pred_24h_pct ?? pt.ai_past_pred_pct)
+                  : (pt.pred_24h_pct ?? pt.ai_past_pred_pct);
+            return {
+              ...pt,
+              offsetMin,
+              actual_pct:
+                i === rawHistory.length - 1 ? curPct : Number(pt.actual_pct ?? curPct),
+              ai_past_pred_pct: Number(pastPred ?? pt.actual_pct ?? curPct)
+            };
+          })
+        : Array.from({ length: 60 }, (_, i) => {
+            const offsetMin = -(59 - i);
             const v = curPct + Math.sin(i / 4) * 0.12;
             return {
-              timestamp: new Date(Date.now() - (23 - i) * 60000).toISOString(),
-              actual_pct: i === 23 ? curPct : v,
+              timestamp: new Date(Date.now() + offsetMin * 60000).toISOString(),
+              offsetMin,
+              actual_pct: i === 59 ? curPct : v,
               ai_past_pred_pct: v - 0.03
             };
           });
@@ -118,11 +155,12 @@ export const PremiumTrajectoryChart = ({
     const forecast =
       rawForecast.length > 0
         ? rawForecast.map((pt, i) => {
-            const offMin = Number(pt.offset_min ?? i * 5);
+            const offMin = Number(pt.offset_min ?? i * 2);
             const decay = Math.exp((-0.35 * offMin) / 480.0);
             return {
               ...pt,
               offset_min: offMin,
+              offsetMin: offMin,
               predicted_pct:
                 i === 0
                   ? curPct
@@ -136,12 +174,12 @@ export const PremiumTrajectoryChart = ({
             return {
               timestamp: new Date(Date.now() + offMin * 60000).toISOString(),
               offset_min: offMin,
+              offsetMin: offMin,
               predicted_pct: curPct * Math.exp((-0.35 * offMin) / 480.0) + wave
             };
           });
 
     // Identify MAX and MIN on the future forecast curve, preferring genuine interior turning points
-    // beyond the immediate NOW origin (offset_min >= 15) when index 1 is merely the starting boundary.
     let maxIdx = 1;
     let minIdx = 1;
     for (let i = 1; i < forecast.length; i++) {
@@ -220,15 +258,30 @@ export const PremiumTrajectoryChart = ({
     const maxPt = forecast[maxIdx] || forecast[0];
     const minPt = forecast[minIdx] || forecast[0];
 
-    const allValues = [
-      ...history.map((h) => h.actual_pct),
-      ...history.map((h) => h.ai_past_pred_pct),
-      ...forecast.map((f) => f.predicted_pct),
-      0
-    ];
-    let minVal = Math.min(...allValues);
-    let maxVal = Math.max(...allValues);
-    const span = Math.max(0.4, maxVal - minVal);
+    const minBound = history.length > 0 ? history[0].offsetMin : -1440;
+    const maxBound = forecast.length > 0 ? forecast[forecast.length - 1].offsetMin : 480;
+
+    // Auto-scale Y-axis to the currently visible [viewWindow.start, viewWindow.end] range
+    const visibleVals = [];
+    for (let i = 0; i < history.length; i++) {
+      const h = history[i];
+      if (h.offsetMin >= viewWindow.start - 5 && h.offsetMin <= viewWindow.end + 5) {
+        visibleVals.push(h.actual_pct, h.ai_past_pred_pct);
+      }
+    }
+    for (let i = 0; i < forecast.length; i++) {
+      const f = forecast[i];
+      if (f.offsetMin >= viewWindow.start - 5 && f.offsetMin <= viewWindow.end + 5) {
+        visibleVals.push(f.predicted_pct);
+      }
+    }
+    if (visibleVals.length === 0) {
+      visibleVals.push(curPct, 0);
+    }
+
+    let minVal = Math.min(...visibleVals);
+    let maxVal = Math.max(...visibleVals);
+    const span = Math.max(0.25, maxVal - minVal);
     minVal -= span * 0.18;
     maxVal += span * 0.22;
 
@@ -242,6 +295,9 @@ export const PremiumTrajectoryChart = ({
       minIdx,
       minVal,
       maxVal,
+      minBound,
+      maxBound,
+      useShortRolling,
       direction:
         summary.direction ||
         (maxPt.predicted_pct - curPct >= curPct - minPt.predicted_pct
@@ -249,61 +305,137 @@ export const PremiumTrajectoryChart = ({
           : 'NARROWING'),
       mean8hPct: Number(summary.mean_8h_pct ?? curPct)
     };
-  }, [chartData, livePremiumPct, range]);
+  }, [chartData, livePremiumPct, viewWindow.start, viewWindow.end]);
 
-  const width = Math.max(640, containerWidth);
-  const height = 240;
-  const padLeft = 48;
-  const padRight = 12;
-  const padTop = 26;
-  const padBottom = 30;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
+  const clampViewport = useCallback(
+    (start, end) => {
+      const minB = Math.min(-60, processed.minBound);
+      const maxB = Math.max(60, processed.maxBound);
+      const totalMaxSpan = maxB - minB;
+      const span = Math.min(totalMaxSpan, Math.max(20, end - start));
+      let s = start;
+      let e = start + span;
+      if (s < minB) {
+        s = minB;
+        e = minB + span;
+      }
+      if (e > maxB) {
+        e = maxB;
+        s = Math.max(minB, maxB - span);
+      }
+      return { start: s, end: e };
+    },
+    [processed.minBound, processed.maxBound]
+  );
 
-  // Split canvas: 52% for Past History, 48% for Future 8H Forecast
-  const nowX = padLeft + plotW * 0.52;
-  const histW = nowX - padLeft;
-  const futW = padLeft + plotW - nowX;
+  // Attach non-passive wheel listener for smooth cursor-centered zoom
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
 
+    const handleWheel = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const rect = svgEl.getBoundingClientRect();
+      const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
+      const cursorRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+
+      setViewWindow((prev) => {
+        const curSpan = Math.max(20, prev.end - prev.start);
+        const cursorTime = prev.start + cursorRatio * curSpan;
+        const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
+        const minB = Math.min(-60, processed.minBound);
+        const maxB = Math.max(60, processed.maxBound);
+        const nextSpan = Math.min(maxB - minB, Math.max(20, curSpan * zoomFactor));
+        const nextStart = cursorTime - cursorRatio * nextSpan;
+        const nextEnd = nextStart + nextSpan;
+        return clampViewport(nextStart, nextEnd);
+      });
+      setActivePreset(null);
+    };
+
+    svgEl.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      svgEl.removeEventListener('wheel', handleWheel);
+    };
+  }, [width, plotW, padLeft, processed.minBound, processed.maxBound, clampViewport]);
+
+  // Attach window-level mousemove & mouseup listeners for smooth drag-panning
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const handleWindowMove = (e) => {
+      if (!dragRef.current.active) return;
+      const dxPixels = e.clientX - dragRef.current.startClientX;
+      const startSpan = dragRef.current.startViewEnd - dragRef.current.startViewStart;
+      const deltaMinutes = -(dxPixels / Math.max(1, plotW)) * startSpan;
+      const next = clampViewport(
+        dragRef.current.startViewStart + deltaMinutes,
+        dragRef.current.startViewEnd + deltaMinutes
+      );
+      setViewWindow(next);
+      setActivePreset(null);
+    };
+
+    const handleWindowUp = () => {
+      dragRef.current.active = false;
+      setIsDragging(false);
+    };
+
+    window.addEventListener('mousemove', handleWindowMove);
+    window.addEventListener('mouseup', handleWindowUp);
+    return () => {
+      window.removeEventListener('mousemove', handleWindowMove);
+      window.removeEventListener('mouseup', handleWindowUp);
+    };
+  }, [isDragging, plotW, clampViewport]);
+
+  const applyPreset = (preset) => {
+    setViewWindow(clampViewport(preset.start, preset.end));
+    setActivePreset(preset.id);
+  };
+
+  const zoomByButton = (factor) => {
+    setViewWindow((prev) => {
+      const center = 0.5 * (prev.start + prev.end);
+      const nextSpan = (prev.end - prev.start) * factor;
+      return clampViewport(center - 0.5 * nextSpan, center + 0.5 * nextSpan);
+    });
+    setActivePreset(null);
+  };
+
+  const viewSpan = Math.max(1e-6, viewWindow.end - viewWindow.start);
+  const toX = (offsetMin) => padLeft + ((offsetMin - viewWindow.start) / viewSpan) * plotW;
   const toY = (pct) => {
     const ratio = (pct - processed.minVal) / Math.max(1e-6, processed.maxVal - processed.minVal);
     return padTop + plotH * (1 - Math.min(1, Math.max(0, ratio)));
   };
 
-  const histPoints = processed.history.map((pt, i) => {
-    const x =
-      processed.history.length > 1
-        ? padLeft + (i / (processed.history.length - 1)) * histW
-        : nowX;
-    return {
-      x,
-      yActual: toY(pt.actual_pct),
-      yPastAi: toY(pt.ai_past_pred_pct),
-      zone: 'PAST',
-      timestamp: pt.timestamp,
-      actualPct: pt.actual_pct,
-      aiPastPct: pt.ai_past_pred_pct
-    };
-  });
+  const nowX = toX(0);
+  const nowVisible = nowX >= padLeft && nowX <= width - padRight;
+  const futZoneLeft = Math.max(padLeft, Math.min(width - padRight, nowX));
+  const futZoneWidth = Math.max(0, width - padRight - futZoneLeft);
 
-  const futPoints = processed.forecast.map((pt, i) => {
-    const offRatio = Math.min(1, Math.max(0, Number(pt.offset_min || 0) / 480));
-    const x =
-      processed.forecast.length > 1
-        ? nowX +
-          (offRatio > 0
-            ? offRatio * futW
-            : (i / (processed.forecast.length - 1)) * futW)
-        : nowX;
-    return {
-      x,
-      yPred: toY(pt.predicted_pct),
-      zone: 'FUTURE',
-      offsetMin: pt.offset_min,
-      timestamp: pt.timestamp,
-      predictedPct: pt.predicted_pct
-    };
-  });
+  const histPoints = processed.history.map((pt) => ({
+    x: toX(pt.offsetMin),
+    offsetMin: pt.offsetMin,
+    yActual: toY(pt.actual_pct),
+    yPastAi: toY(pt.ai_past_pred_pct),
+    zone: 'PAST',
+    timestamp: pt.timestamp,
+    actualPct: pt.actual_pct,
+    aiPastPct: pt.ai_past_pred_pct
+  }));
+
+  const futPoints = processed.forecast.map((pt) => ({
+    x: toX(pt.offsetMin),
+    offsetMin: pt.offsetMin,
+    yPred: toY(pt.predicted_pct),
+    zone: 'FUTURE',
+    timestamp: pt.timestamp,
+    predictedPct: pt.predicted_pct
+  }));
 
   const actualPath = histPoints
     .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.yActual.toFixed(1)}`)
@@ -317,7 +449,7 @@ export const PremiumTrajectoryChart = ({
     .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.yPred.toFixed(1)}`)
     .join(' ');
 
-  const baselineY = toY(processed.minVal);
+  const baselineY = padTop + plotH;
   const actualAreaPath =
     histPoints.length > 1
       ? `${actualPath} L ${histPoints[histPoints.length - 1].x.toFixed(1)} ${baselineY.toFixed(1)} L ${histPoints[0].x.toFixed(1)} ${baselineY.toFixed(1)} Z`
@@ -329,7 +461,8 @@ export const PremiumTrajectoryChart = ({
       : '';
 
   const zeroY = toY(0);
-  const nowY = histPoints.length > 0 ? histPoints[histPoints.length - 1].yActual : toY(processed.curPct);
+  const nowY =
+    histPoints.length > 0 ? histPoints[histPoints.length - 1].yActual : toY(processed.curPct);
   const maxFutCoord = futPoints[processed.maxIdx] || futPoints[0];
   const minFutCoord = futPoints[processed.minIdx] || futPoints[0];
 
@@ -338,13 +471,15 @@ export const PremiumTrajectoryChart = ({
 
   // Compute exact cursor-locked hover state with linear segment interpolation
   let hoveredPoint = null;
-  if (hoverX !== null) {
+  if (hoverX !== null && !isDragging) {
     const clampedX = Math.min(width - padRight, Math.max(padLeft, hoverX));
-    if (clampedX <= nowX && histPoints.length > 0) {
+    const hoverOffsetMin = viewWindow.start + ((clampedX - padLeft) / plotW) * viewSpan;
+
+    if (hoverOffsetMin <= 0 && histPoints.length > 0) {
       let idx = 0;
       let bestDist = Infinity;
       for (let i = 0; i < histPoints.length; i++) {
-        const d = Math.abs(histPoints[i].x - clampedX);
+        const d = Math.abs(histPoints[i].offsetMin - hoverOffsetMin);
         if (d < bestDist) {
           bestDist = d;
           idx = i;
@@ -361,14 +496,17 @@ export const PremiumTrajectoryChart = ({
       let p0 = futPoints[0];
       let p1 = futPoints[futPoints.length - 1];
       for (let i = 0; i < futPoints.length - 1; i++) {
-        if (clampedX >= futPoints[i].x && clampedX <= futPoints[i + 1].x) {
+        if (
+          hoverOffsetMin >= futPoints[i].offsetMin &&
+          hoverOffsetMin <= futPoints[i + 1].offsetMin
+        ) {
           p0 = futPoints[i];
           p1 = futPoints[i + 1];
           break;
         }
       }
-      const segSpan = Math.max(1e-6, p1.x - p0.x);
-      const alpha = Math.min(1, Math.max(0, (clampedX - p0.x) / segSpan));
+      const segSpan = Math.max(1e-6, p1.offsetMin - p0.offsetMin);
+      const alpha = Math.min(1, Math.max(0, (hoverOffsetMin - p0.offsetMin) / segSpan));
       const interpPct = p0.predictedPct + alpha * (p1.predictedPct - p0.predictedPct);
       const interpOffMin = p0.offsetMin + alpha * (p1.offsetMin - p0.offsetMin);
       const interpY = toY(interpPct);
@@ -385,10 +523,29 @@ export const PremiumTrajectoryChart = ({
   }
 
   const yTicks = [
-    processed.maxVal - (processed.maxVal - processed.minVal) * 0.1,
+    processed.maxVal - (processed.maxVal - processed.minVal) * 0.12,
     (processed.maxVal + processed.minVal) * 0.5,
-    processed.minVal + (processed.maxVal - processed.minVal) * 0.1
+    processed.minVal + (processed.maxVal - processed.minVal) * 0.12
   ];
+
+  // Dynamic X-axis time grid ticks based on current zoom span
+  const xTickStep =
+    viewSpan <= 60
+      ? 10
+      : viewSpan <= 180
+        ? 30
+        : viewSpan <= 420
+          ? 60
+          : viewSpan <= 900
+            ? 120
+            : 240;
+  const firstTick = Math.ceil(viewWindow.start / xTickStep) * xTickStep;
+  const xTicks = [];
+  for (let m = firstTick; m <= viewWindow.end; m += xTickStep) {
+    xTicks.push(m);
+  }
+
+  const clipId = `plotClip-${baseExchange}-${baseSymbol}-${foreignExchange}`;
 
   return (
     <div
@@ -397,10 +554,11 @@ export const PremiumTrajectoryChart = ({
         padding: '14px 12px',
         background: 'rgba(15, 23, 42, 0.72)',
         borderTop: '1px solid rgba(148, 163, 184, 0.14)',
-        borderBottom: '1px solid rgba(148, 163, 184, 0.14)'
+        borderBottom: '1px solid rgba(148, 163, 184, 0.14)',
+        userSelect: 'none'
       }}
     >
-      {/* Top Bar: Legend + Summary Metrics + Lookback Range Selector */}
+      {/* Top Bar: Legend + Zoom/Pan Controls */}
       <div
         style={{
           display: 'flex',
@@ -408,7 +566,7 @@ export const PremiumTrajectoryChart = ({
           justifyContent: 'space-between',
           flexWrap: 'wrap',
           gap: '12px',
-          marginBottom: '12px'
+          marginBottom: '10px'
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
@@ -421,7 +579,9 @@ export const PremiumTrajectoryChart = ({
 
           {/* Legend Items */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '14px', fontSize: '12px' }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#38bdf8' }}>
+            <span
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#38bdf8' }}
+            >
               <span
                 style={{
                   width: '14px',
@@ -450,10 +610,10 @@ export const PremiumTrajectoryChart = ({
                 }}
               />
               {lang === 'ko'
-                ? range === '1H'
+                ? processed.useShortRolling
                   ? '과거 AI 예측 (20분 단위 갱신 궤적)'
                   : '과거 AI 예측 (1시간 단위 갱신 궤적)'
-                : `Past AI Forecast (${range === '1H' ? '20m' : '1H'} Rolling Trajectory)`}
+                : 'Past AI Forecast (Rolling Trajectory)'}
             </span>
 
             <span
@@ -476,23 +636,57 @@ export const PremiumTrajectoryChart = ({
           </div>
         </div>
 
-        {/* Lookback Range Buttons (1H / 6H / 24H) */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ fontSize: '12px', color: 'var(--text-secondary)', marginRight: '4px' }}>
-            {lang === 'ko' ? '과거 구간:' : 'History:'}
+        {/* Zoom / Pan Hint + Quick Preset Buttons */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+          <span
+            style={{
+              fontSize: '11.5px',
+              color: 'rgba(148, 163, 184, 0.75)',
+              marginRight: '6px'
+            }}
+          >
+            {lang === 'ko'
+              ? '휠: 확대/축소 · 드래그: 이동 · 더블클릭: 초기화'
+              : 'Wheel: Zoom · Drag: Pan · DblClick: Reset'}
           </span>
-          {RANGE_OPTIONS.map((opt) => (
+
+          <button
+            type="button"
+            title={lang === 'ko' ? '확대 (Zoom In)' : 'Zoom In'}
+            onClick={(e) => {
+              e.stopPropagation();
+              zoomByButton(0.75);
+            }}
+            className="btn btn-sm btn-ghost mono"
+            style={{ padding: '2px 8px', fontSize: '13px', height: '26px' }}
+          >
+            +
+          </button>
+          <button
+            type="button"
+            title={lang === 'ko' ? '축소 (Zoom Out)' : 'Zoom Out'}
+            onClick={(e) => {
+              e.stopPropagation();
+              zoomByButton(1.35);
+            }}
+            className="btn btn-sm btn-ghost mono"
+            style={{ padding: '2px 8px', fontSize: '13px', height: '26px' }}
+          >
+            −
+          </button>
+
+          {PRESET_OPTIONS.map((opt) => (
             <button
-              key={opt}
+              key={opt.id}
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                setRange(opt);
+                applyPreset(opt);
               }}
-              className={`btn btn-sm ${range === opt ? 'btn-primary' : 'btn-ghost'}`}
+              className={`btn btn-sm ${activePreset === opt.id ? 'btn-primary' : 'btn-ghost'}`}
               style={{ padding: '3px 10px', fontSize: '12px', height: '26px' }}
             >
-              {opt}
+              {opt.label}
             </button>
           ))}
         </div>
@@ -501,9 +695,31 @@ export const PremiumTrajectoryChart = ({
       {/* SVG Trajectory Canvas */}
       <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
         <svg
+          ref={svgRef}
           viewBox={`0 0 ${width} ${height}`}
           preserveAspectRatio="none"
-          style={{ width: '100%', height: `${height}px`, display: 'block', overflow: 'visible' }}
+          style={{
+            width: '100%',
+            height: `${height}px`,
+            display: 'block',
+            overflow: 'hidden',
+            cursor: isDragging ? 'grabbing' : 'grab'
+          }}
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            dragRef.current = {
+              active: true,
+              startClientX: e.clientX,
+              startViewStart: viewWindow.start,
+              startViewEnd: viewWindow.end
+            };
+            setIsDragging(true);
+          }}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            applyPreset(PRESET_OPTIONS[1]); // Reset to default 6H + 8H view
+          }}
           onMouseLeave={() => setHoverX(null)}
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
@@ -520,17 +736,22 @@ export const PremiumTrajectoryChart = ({
               <stop offset="0%" stopColor={forecastColor} stopOpacity="0.22" />
               <stop offset="100%" stopColor={forecastColor} stopOpacity="0.01" />
             </linearGradient>
+            <clipPath id={clipId}>
+              <rect x={padLeft} y={padTop - 8} width={plotW} height={plotH + 14} />
+            </clipPath>
           </defs>
 
           {/* Future 8H Shaded Zone Tint */}
-          <rect
-            x={nowX}
-            y={padTop}
-            width={futW}
-            height={plotH}
-            fill="rgba(30, 41, 59, 0.38)"
-            rx="4"
-          />
+          {futZoneWidth > 0 && (
+            <rect
+              x={futZoneLeft}
+              y={padTop}
+              width={futZoneWidth}
+              height={plotH}
+              fill="rgba(30, 41, 59, 0.38)"
+              rx="4"
+            />
+          )}
 
           {/* Horizontal Grid Lines & Y-Axis Labels */}
           {yTicks.map((val, idx) => {
@@ -560,6 +781,34 @@ export const PremiumTrajectoryChart = ({
             );
           })}
 
+          {/* Vertical X-Axis Time Grid & Labels */}
+          {xTicks.map((m) => {
+            const x = toX(m);
+            if (x < padLeft + 18 || x > width - padRight - 18) return null;
+            return (
+              <g key={m}>
+                <line
+                  x1={x}
+                  y1={padTop}
+                  x2={x}
+                  y2={padTop + plotH}
+                  stroke="rgba(148, 163, 184, 0.07)"
+                />
+                <text
+                  x={x}
+                  y={height - 8}
+                  textAnchor="middle"
+                  fill={m === 0 ? '#38bdf8' : 'rgba(148, 163, 184, 0.7)'}
+                  fontWeight={m === 0 ? '700' : '400'}
+                  fontSize="10.5"
+                  fontFamily="monospace"
+                >
+                  {formatOffsetLabel(m, lang)}
+                </text>
+              </g>
+            );
+          })}
+
           {/* 0.00% Parity Baseline */}
           {zeroY >= padTop && zeroY <= padTop + plotH && (
             <line
@@ -572,148 +821,157 @@ export const PremiumTrajectoryChart = ({
             />
           )}
 
-          {/* Area Fills */}
-          {actualAreaPath && <path d={actualAreaPath} fill={`url(#actualGrad-${baseSymbol})`} />}
-          {futureAreaPath && <path d={futureAreaPath} fill={`url(#futGrad-${baseSymbol})`} />}
+          {/* Clipped Plot Curves & Markers */}
+          <g clipPath={`url(#${clipId})`}>
+            {actualAreaPath && (
+              <path d={actualAreaPath} fill={`url(#actualGrad-${baseSymbol})`} />
+            )}
+            {futureAreaPath && (
+              <path d={futureAreaPath} fill={`url(#futGrad-${baseSymbol})`} />
+            )}
 
-          {/* 1. Dimmed Past AI Prediction Line (for visual accuracy comparison) */}
-          {pastAiPath && (
-            <path
-              d={pastAiPath}
-              fill="none"
-              stroke="rgba(192, 132, 252, 0.62)"
-              strokeWidth="1.8"
-              strokeDasharray="4 4"
-            />
-          )}
+            {/* 1. Dimmed Past AI Prediction Line */}
+            {pastAiPath && (
+              <path
+                d={pastAiPath}
+                fill="none"
+                stroke="rgba(192, 132, 252, 0.68)"
+                strokeWidth="1.9"
+                strokeDasharray="4 4"
+              />
+            )}
 
-          {/* 2. Solid Vivid Actual Past Premium Line */}
-          {actualPath && (
-            <path
-              d={actualPath}
-              fill="none"
-              stroke="#38bdf8"
-              strokeWidth="2.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          )}
+            {/* 2. Solid Vivid Actual Past Premium Line */}
+            {actualPath && (
+              <path
+                d={actualPath}
+                fill="none"
+                stroke="#38bdf8"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            )}
 
-          {/* 3. Future 8H AI Forecast Trajectory Curve */}
-          {futureAiPath && (
-            <path
-              d={futureAiPath}
-              fill="none"
-              stroke={forecastColor}
-              strokeWidth="2.5"
-              strokeDasharray="6 4"
-              strokeLinecap="round"
-            />
-          )}
+            {/* 3. Future 8H AI Forecast Trajectory Curve */}
+            {futureAiPath && (
+              <path
+                d={futureAiPath}
+                fill="none"
+                stroke={forecastColor}
+                strokeWidth="2.5"
+                strokeDasharray="6 4"
+                strokeLinecap="round"
+              />
+            )}
 
-          {/* 4. NOW Vertical Divider Line */}
-          <line
-            x1={nowX}
-            y1={padTop - 8}
-            x2={nowX}
-            y2={padTop + plotH}
-            stroke="rgba(226, 232, 240, 0.45)"
-            strokeWidth="1.5"
-            strokeDasharray="4 3"
-          />
-          <rect
-            x={nowX - 54}
-            y={4}
-            width={108}
-            height={18}
-            rx="9"
-            fill="rgba(15, 23, 42, 0.92)"
-            stroke="rgba(56, 189, 248, 0.55)"
-          />
-          <text
-            x={nowX}
-            y={16}
-            textAnchor="middle"
-            fill="#e2e8f0"
-            fontSize="10.5"
-            fontWeight="700"
-            fontFamily="monospace"
-          >
-            NOW {processed.curPct >= 0 ? '+' : ''}
-            {processed.curPct.toFixed(2)}%
-          </text>
-          <circle cx={nowX} cy={nowY} r="4.5" fill="#38bdf8" stroke="#0f172a" strokeWidth="2" />
+            {/* 4. NOW Vertical Divider Line */}
+            {nowVisible && (
+              <>
+                <line
+                  x1={nowX}
+                  y1={padTop - 8}
+                  x2={nowX}
+                  y2={padTop + plotH}
+                  stroke="rgba(226, 232, 240, 0.45)"
+                  strokeWidth="1.5"
+                  strokeDasharray="4 3"
+                />
+                <circle
+                  cx={nowX}
+                  cy={nowY}
+                  r="4.5"
+                  fill="#38bdf8"
+                  stroke="#0f172a"
+                  strokeWidth="2"
+                />
+              </>
+            )}
 
-          {/* 5. Future 8H MAX & MIN Inflection Markers */}
-          {maxFutCoord && (
+            {/* 5. Future 8H MAX & MIN Inflection Markers */}
+            {maxFutCoord &&
+              maxFutCoord.x >= padLeft &&
+              maxFutCoord.x <= width - padRight && (
+                <g>
+                  <circle
+                    cx={maxFutCoord.x}
+                    cy={maxFutCoord.yPred}
+                    r="4"
+                    fill="#10b981"
+                    stroke="#0f172a"
+                    strokeWidth="1.5"
+                  />
+                  <text
+                    x={Math.min(width - padRight - 65, Math.max(padLeft + 65, maxFutCoord.x))}
+                    y={Math.max(padTop + 14, maxFutCoord.yPred - 8)}
+                    textAnchor="middle"
+                    fill="#10b981"
+                    fontSize="10.5"
+                    fontWeight="700"
+                    fontFamily="monospace"
+                  >
+                    MAX {maxFutCoord.predictedPct >= 0 ? '+' : ''}
+                    {maxFutCoord.predictedPct.toFixed(2)}% (
+                    {formatOffsetLabel(maxFutCoord.offsetMin, lang)})
+                  </text>
+                </g>
+              )}
+
+            {minFutCoord &&
+              minFutCoord.x >= padLeft &&
+              minFutCoord.x <= width - padRight && (
+                <g>
+                  <circle
+                    cx={minFutCoord.x}
+                    cy={minFutCoord.yPred}
+                    r="4"
+                    fill="#f59e0b"
+                    stroke="#0f172a"
+                    strokeWidth="1.5"
+                  />
+                  <text
+                    x={Math.min(width - padRight - 65, Math.max(padLeft + 65, minFutCoord.x))}
+                    y={Math.min(padTop + plotH - 4, minFutCoord.yPred + 15)}
+                    textAnchor="middle"
+                    fill="#f59e0b"
+                    fontSize="10.5"
+                    fontWeight="700"
+                    fontFamily="monospace"
+                  >
+                    MIN {minFutCoord.predictedPct >= 0 ? '+' : ''}
+                    {minFutCoord.predictedPct.toFixed(2)}% (
+                    {formatOffsetLabel(minFutCoord.offsetMin, lang)})
+                  </text>
+                </g>
+              )}
+          </g>
+
+          {/* NOW Top Badge (rendered above clipPath when NOW is visible) */}
+          {nowVisible && (
             <g>
-              <circle
-                cx={maxFutCoord.x}
-                cy={maxFutCoord.yPred}
-                r="4"
-                fill="#10b981"
-                stroke="#0f172a"
-                strokeWidth="1.5"
+              <rect
+                x={Math.min(width - padRight - 108, Math.max(padLeft, nowX - 54))}
+                y={4}
+                width={108}
+                height={18}
+                rx="9"
+                fill="rgba(15, 23, 42, 0.92)"
+                stroke="rgba(56, 189, 248, 0.55)"
               />
               <text
-                x={Math.min(width - padRight - 10, Math.max(nowX + 35, maxFutCoord.x))}
-                y={Math.max(padTop + 12, maxFutCoord.yPred - 8)}
+                x={Math.min(width - padRight - 54, Math.max(padLeft + 54, nowX))}
+                y={16}
                 textAnchor="middle"
-                fill="#10b981"
+                fill="#e2e8f0"
                 fontSize="10.5"
                 fontWeight="700"
                 fontFamily="monospace"
               >
-                MAX {maxFutCoord.predictedPct >= 0 ? '+' : ''}
-                {maxFutCoord.predictedPct.toFixed(2)}% ({formatOffsetLabel(maxFutCoord.offsetMin, lang)})
+                NOW {processed.curPct >= 0 ? '+' : ''}
+                {processed.curPct.toFixed(2)}%
               </text>
             </g>
           )}
-
-          {minFutCoord && (
-            <g>
-              <circle
-                cx={minFutCoord.x}
-                cy={minFutCoord.yPred}
-                r="4"
-                fill="#f59e0b"
-                stroke="#0f172a"
-                strokeWidth="1.5"
-              />
-              <text
-                x={Math.min(width - padRight - 10, Math.max(nowX + 35, minFutCoord.x))}
-                y={Math.min(padTop + plotH - 4, minFutCoord.yPred + 15)}
-                textAnchor="middle"
-                fill="#f59e0b"
-                fontSize="10.5"
-                fontWeight="700"
-                fontFamily="monospace"
-              >
-                MIN {minFutCoord.predictedPct >= 0 ? '+' : ''}
-                {minFutCoord.predictedPct.toFixed(2)}% ({formatOffsetLabel(minFutCoord.offsetMin, lang)})
-              </text>
-            </g>
-          )}
-
-          {/* X-Axis Zone Labels */}
-          <text
-            x={padLeft + 6}
-            y={height - 8}
-            fill="rgba(148, 163, 184, 0.7)"
-            fontSize="11"
-            fontFamily="monospace"
-          >
-            {lang === 'ko' ? `← 과거 ${range} 실제 추이 & AI 예측 비교` : `← Past ${range} Actual vs AI`}
-          </text>
-          <text
-            x={nowX + 10}
-            y={height - 8}
-            fill="rgba(148, 163, 184, 0.7)"
-            fontSize="11"
-            fontFamily="monospace"
-          >
-            {lang === 'ko' ? '향후 +8시간 (480분) AI 예측 궤적 →' : 'Future +8H (480m) AI Forecast →'}
-          </text>
 
           {/* Hover Crosshair & Active Curve Tracking Dot */}
           {hoveredPoint && (
@@ -746,7 +1004,7 @@ export const PremiumTrajectoryChart = ({
               position: 'absolute',
               top: '6px',
               left: `${Math.min(
-                Math.max(12, width - 260),
+                Math.max(12, width - 270),
                 Math.max(padLeft + 4, hoveredPoint.xPos - 95)
               )}px`,
               background: 'rgba(15, 23, 42, 0.94)',
@@ -771,7 +1029,7 @@ export const PremiumTrajectoryChart = ({
                         hour: '2-digit',
                         minute: '2-digit'
                       })
-                    : 'PAST'}
+                    : formatOffsetLabel(hoveredPoint.offsetMin, lang)}
                 </span>
                 <span style={{ color: '#38bdf8', fontWeight: 700 }}>
                   {lang === 'ko' ? '실제:' : 'Actual:'}{' '}
