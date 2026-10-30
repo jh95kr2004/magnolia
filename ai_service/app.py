@@ -112,57 +112,78 @@ def _anchor_traj_segment(raw_seg, origin_spread: float, seg_len: int) -> np.ndar
     return anchored
 
 
+def _roll_periodic_trajectory(
+    context_df: pd.DataFrame,
+    start_offset: int,
+    step_min: int,
+    blend_len: int,
+    device: str = "cpu",
+) -> np.ndarray:
+    """
+    Computes a periodic rolling AI trajectory starting from `start_offset` in steps of `step_min` minutes,
+    using a robust 5-minute median origin anchor and raised-cosine cross-fade between consecutive segments.
+    """
+    n = len(context_df)
+    spreads = context_df["exchange_premium_spread"].astype(float).values.astype(np.float32)
+    out = np.copy(spreads)
+    if n == 0 or start_offset >= n:
+        return out
+
+    starts = list(range(max(0, start_offset), n, step_min))
+    prev_tail = None
+
+    for idx_s, start_i in enumerate(starts):
+        end_i = starts[idx_s + 1] if idx_s + 1 < len(starts) else n
+        seg_len = end_i - start_i
+        if seg_len <= 0:
+            continue
+        need_len = seg_len + blend_len
+        origin_med = float(np.median(spreads[max(0, start_i - 4) : start_i + 1]))
+
+        if start_i >= 12:
+            ctx_slice = context_df.iloc[max(0, start_i - 360) : start_i + 1]
+            _, _, _, raw_seg = predict_reversion(ctx_slice, pred_len=min(480, need_len), device=device)
+        else:
+            raw_seg = []
+
+        anchored = _anchor_traj_segment(raw_seg, origin_med, need_len)
+        cur_seg = np.copy(anchored[:seg_len])
+
+        if idx_s > 0 and prev_tail is not None and len(prev_tail) > 0:
+            b = min(seg_len, len(prev_tail))
+            w = 0.5 * (1.0 - np.cos(np.pi * np.linspace(1.0 / (b + 1), 1.0, b, dtype=np.float32)))
+            cur_seg[:b] = (1.0 - w) * prev_tail[:b] + w * cur_seg[:b]
+
+        out[start_i:end_i] = cur_seg
+        prev_tail = anchored[seg_len : seg_len + blend_len]
+
+    return out
+
+
 def compute_past_horizon_trajectories(context_df: pd.DataFrame, device: str = "cpu") -> dict:
     """
-    Computes fixed-origin historical AI forecast trajectories for each lookback tab:
-      - '1h': 60-minute trajectory predicted 1 hour ago (origin = N - 60)
-      - '6h': 360-minute trajectory predicted 6 hours ago (origin = N - 360)
-      - '24h': 3 x 8-hour (480m) funding-cycle trajectories predicted at -24h, -16h, and -8h
+    Computes periodic rolling historical AI forecast trajectories for each lookback tab:
+      - '1h': 20-minute rolling trajectory updates across the 1H window
+      - '6h': 60-minute (1-hour) rolling trajectory updates across the 6H window
+      - '24h': 60-minute (1-hour) rolling trajectory updates across the full 24H window
     """
     n = len(context_df)
     if n == 0:
         return {"1h": [], "6h": [], "24h": []}
 
-    spreads = context_df["exchange_premium_spread"].astype(float).values
-    traj_24h = np.copy(spreads).astype(np.float32)
-    traj_6h = np.copy(spreads).astype(np.float32)
-    traj_1h = np.copy(spreads).astype(np.float32)
+    orig_1h = max(0, n - min(n, 60))
+    orig_6h = max(0, n - min(n, 360))
 
-    # 1. 1H Tab: Fixed-origin forecast from 1 hour ago (N - 60)
-    h1 = min(n, 60)
-    orig_1h = max(0, n - h1)
-    if orig_1h >= 10:
-        _, _, _, raw_1h = predict_reversion(context_df.iloc[: orig_1h + 1], pred_len=h1, device=device)
-        traj_1h[orig_1h:] = _anchor_traj_segment(raw_1h, spreads[orig_1h], h1)
+    traj_1h = _roll_periodic_trajectory(context_df, start_offset=orig_1h, step_min=20, blend_len=8, device=device)
+    traj_24h = _roll_periodic_trajectory(context_df, start_offset=0, step_min=60, blend_len=15, device=device)
 
-    # 2. 6H Tab: Fixed-origin forecast from 6 hours ago (N - 360)
-    h6 = min(n, 360)
-    orig_6h = max(0, n - h6)
-    if orig_6h >= 10:
-        _, _, _, raw_6h = predict_reversion(context_df.iloc[: orig_6h + 1], pred_len=h6, device=device)
-        traj_6h[orig_6h:] = _anchor_traj_segment(raw_6h, spreads[orig_6h], h6)
-    else:
-        traj_6h = np.copy(traj_1h)
-
-    # 3. 24H Tab: 3 x 8-hour (480m) funding-cycle forecast segments (-24h..-16h, -16h..-8h, -8h..NOW)
-    boundaries = []
-    if n > 960:
-        boundaries.append((0, n - 960))
-        boundaries.append((n - 960, n - 480))
-        boundaries.append((n - 480, n))
-    elif n > 480:
-        boundaries.append((0, n - 480))
-        boundaries.append((n - 480, n))
-    else:
-        boundaries.append((0, n))
-
-    for start_i, end_i in boundaries:
-        seg_len = end_i - start_i
-        if seg_len <= 0:
-            continue
-        ctx_slice = context_df.iloc[: max(12, start_i + 1)]
-        _, _, _, raw_seg = predict_reversion(ctx_slice, pred_len=min(480, seg_len), device=device)
-        traj_24h[start_i:end_i] = _anchor_traj_segment(raw_seg, spreads[start_i], seg_len)
+    # For 6H, reuse the 1-hour rolling trajectory anchored cleanly at orig_6h
+    traj_6h = np.copy(traj_24h)
+    if orig_6h < n:
+        traj_6h_aligned = _roll_periodic_trajectory(
+            context_df, start_offset=orig_6h, step_min=60, blend_len=15, device=device
+        )
+        traj_6h[orig_6h:] = traj_6h_aligned[orig_6h:]
 
     return {
         "1h": traj_1h.tolist(),

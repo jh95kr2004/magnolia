@@ -148,9 +148,11 @@ class PremiumForecaster(nn.Module):
             tau_hist = torch.linspace(0.0, 1.0, w_spec, device=x.device, dtype=x.dtype).view(1, w_spec, 1)
             chord = recent_win[:, :1, :] + (recent_win[:, -1:, :] - recent_win[:, :1, :]) * tau_hist
             detrended = recent_win - chord
-            # Winsorize extreme outlier flash spikes to +/- 1.8 sigma while preserving microstructure texture
-            local_std = detrended.std(dim=1, keepdim=True).clamp(min=1e-5)
-            detrended_clean = torch.clamp(detrended, -1.8 * local_std, 1.8 * local_std)
+            # Winsorize extreme outlier flash spikes using recent 60m MAD so old simulator/flash shocks
+            # from hours ago do not inflate harmonic amplitude in calm regimes
+            recent_mad = (target_seq[:, -w_1h:, :] - mean_1h).abs().mean(dim=1, keepdim=True).clamp(min=1e-5) * 1.35
+            local_std = torch.minimum(detrended.std(dim=1, keepdim=True).clamp(min=1e-5), recent_mad * 1.6)
+            detrended_clean = torch.clamp(detrended, -1.5 * local_std, 1.5 * local_std)
 
             spec = torch.fft.rfft(detrended_clean, dim=1)  # [batch, w_spec//2 + 1, 3]
             max_k = min(spec.size(1) - 1, 36)

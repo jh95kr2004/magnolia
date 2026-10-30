@@ -451,11 +451,9 @@ export const PremiumTrajectoryChart = ({
               />
               {lang === 'ko'
                 ? range === '1H'
-                  ? '과거 AI 예측 (1시간 전 예측 궤적)'
-                  : range === '24H'
-                    ? '과거 AI 예측 (8시간 주기 예측 궤적)'
-                    : '과거 AI 예측 (6시간 전 예측 궤적)'
-                : `Past AI Forecast (${range} Origin Replay)`}
+                  ? '과거 AI 예측 (20분 단위 갱신 궤적)'
+                  : '과거 AI 예측 (1시간 단위 갱신 궤적)'
+                : `Past AI Forecast (${range === '1H' ? '20m' : '1H'} Rolling Trajectory)`}
             </span>
 
             <span
@@ -781,13 +779,7 @@ export const PremiumTrajectoryChart = ({
                   {hoveredPoint.actualPct.toFixed(2)}%
                 </span>
                 <span style={{ color: '#c084fc' }}>
-                  {lang === 'ko'
-                    ? range === '1H'
-                      ? '1시간전 예측:'
-                      : range === '24H'
-                        ? '8시간주기 예측:'
-                        : '6시간전 예측:'
-                    : 'Past AI:'}{' '}
+                  {lang === 'ko' ? 'AI 예측 궤적:' : 'Past AI:'}{' '}
                   {hoveredPoint.aiPastPct >= 0 ? '+' : ''}
                   {hoveredPoint.aiPastPct.toFixed(2)}%
                 </span>
