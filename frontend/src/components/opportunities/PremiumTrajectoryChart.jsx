@@ -7,6 +7,8 @@ const PRESET_OPTIONS = [
   { id: '24H', label: '24H', start: -1440, end: 480 }
 ];
 
+const chartDataCache = new Map();
+
 const formatOffsetLabel = (mins, lang = 'ko') => {
   const m = Math.round(Number(mins || 0));
   if (m === 0) return 'NOW';
@@ -28,7 +30,8 @@ export const PremiumTrajectoryChart = ({
   livePremiumPct,
   lang = 'ko'
 }) => {
-  const [chartData, setChartData] = useState(null);
+  const cacheKey = `${baseExchange}:${baseSymbol}:${foreignExchange}:${foreignSymbol}:${viewMode}`;
+  const [chartData, setChartData] = useState(() => chartDataCache.get(cacheKey) || null);
   const [hoverX, setHoverX] = useState(null);
   const [viewWindow, setViewWindow] = useState({ start: -360, end: 480 });
   const [activePreset, setActivePreset] = useState('6H');
@@ -68,6 +71,10 @@ export const PremiumTrajectoryChart = ({
   // Always fetch the full 24H history + 8H forecast so the user can freely zoom and pan anywhere
   useEffect(() => {
     let active = true;
+    const cached = chartDataCache.get(cacheKey);
+    if (cached) {
+      setChartData(cached);
+    }
     const fetchChart = async () => {
       try {
         const res = await apiClient.get('/opportunities/chart', {
@@ -81,6 +88,7 @@ export const PremiumTrajectoryChart = ({
           }
         });
         if (active && res.data) {
+          chartDataCache.set(cacheKey, res.data);
           setChartData(res.data);
         }
       } catch {
@@ -94,7 +102,7 @@ export const PremiumTrajectoryChart = ({
       active = false;
       clearInterval(timer);
     };
-  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode]);
+  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode, cacheKey]);
 
   const width = Math.max(640, containerWidth);
   const height = 246;
@@ -132,14 +140,13 @@ export const PremiumTrajectoryChart = ({
               ai_past_pred_pct: Number(pastPred ?? pt.actual_pct ?? curPct)
             };
           })
-        : Array.from({ length: 60 }, (_, i) => {
-            const offsetMin = -(59 - i);
-            const v = curPct + Math.sin(i / 4) * 0.12;
+        : Array.from({ length: 361 }, (_, i) => {
+            const offsetMin = -(360 - i);
             return {
               timestamp: new Date(Date.now() + offsetMin * 60000).toISOString(),
               offsetMin,
-              actual_pct: i === 59 ? curPct : v,
-              ai_past_pred_pct: v - 0.03
+              actual_pct: curPct,
+              ai_past_pred_pct: curPct
             };
           });
 
@@ -187,13 +194,11 @@ export const PremiumTrajectoryChart = ({
           })
         : Array.from({ length: 49 }, (_, i) => {
             const offMin = i * 10;
-            const t = offMin / 480.0;
-            const wave = Math.sin(offMin / 28.0) * 0.08 * Math.exp(-1.1 * t);
             return {
               timestamp: new Date(Date.now() + offMin * 60000).toISOString(),
               offset_min: offMin,
               offsetMin: offMin,
-              predicted_pct: curPct * Math.exp((-0.35 * offMin) / 480.0) + wave
+              predicted_pct: curPct * Math.exp((-0.25 * offMin) / 480.0)
             };
           });
 

@@ -511,16 +511,17 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 
 	if payload == nil {
 		now := time.Now().UTC()
-		history := make([]map[string]interface{}, 0, 60)
-		for i := 60; i >= 0; i-- {
+		history := make([]map[string]interface{}, 0, maxHistoryPoints+1)
+		for i := maxHistoryPoints; i >= 0; i-- {
 			ts := now.Add(-time.Duration(i) * time.Minute)
-			wave := 0.25 + 0.15*math.Sin(float64(60-i)/10.0)
-			aiPast := 0.25 + 0.14*math.Sin(float64(60-i-2)/10.0)
 			history = append(history, map[string]interface{}{
 				"timestamp":        ts.Format(time.RFC3339),
 				"minute_bucket":    ts.Unix() / 60,
-				"actual_pct":       math.Round(wave*10000) / 10000,
-				"ai_past_pred_pct": math.Round(aiPast*10000) / 10000,
+				"actual_pct":       0.25,
+				"ai_past_pred_pct": 0.25,
+				"pred_1h_pct":      0.25,
+				"pred_6h_pct":      0.25,
+				"pred_24h_pct":     0.25,
 			})
 		}
 		forecast := make([]map[string]interface{}, 0, 97)
