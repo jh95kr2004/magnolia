@@ -19,6 +19,7 @@ export const Dashboard = () => {
   const { showToast, requestConfirm } = useToast();
 
   const [sseConnected, setSseConnected] = useState(false);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [portfolio, setPortfolio] = useState({
     totalUsd: 0,
     availableUsd: 0,
@@ -122,6 +123,20 @@ export const Dashboard = () => {
         const data = JSON.parse(e.data);
         if (data && Array.isArray(data.positions)) {
           setActivePositions(mapPositions(data.positions));
+        }
+      } catch {}
+    });
+
+    dashboardSrc.addEventListener('notification', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (
+          data &&
+          (data.action === 'PAPER_ACCOUNT_RESET' ||
+            data.action === 'POSITION_OPENED' ||
+            data.action === 'POSITION_CLOSED')
+        ) {
+          setHistoryRefreshKey((k) => k + 1);
         }
       } catch {}
     });
@@ -258,6 +273,7 @@ export const Dashboard = () => {
           viewMode={viewMode}
           currentTotalUsd={displayTotalUsd}
           totalUnrealizedPnlUsd={totalUnrealizedPnl}
+          refreshKey={historyRefreshKey}
         />
 
         <ExchangeAllocationCard

@@ -545,43 +545,139 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 
 	userID := getUserIDFromContext(r)
 	var req struct {
-		UpbitKRW    float64 `json:"upbit_krw"`
-		CoinbaseUSD float64 `json:"coinbase_usd"`
+		UpbitKRW         *float64 `json:"upbit_krw"`
+		CoinbaseUSD      *float64 `json:"coinbase_usd"`
+		PaperUpbitKRW    *float64 `json:"paper_upbit_krw"`
+		PaperCoinbaseUSD *float64 `json:"paper_coinbase_usd"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	if req.UpbitKRW <= 0 {
-		req.UpbitKRW = 50000000.0
+	upbitKRW := -1.0
+	if req.PaperUpbitKRW != nil {
+		upbitKRW = *req.PaperUpbitKRW
+	} else if req.UpbitKRW != nil {
+		upbitKRW = *req.UpbitKRW
 	}
-	if req.CoinbaseUSD <= 0 {
-		req.CoinbaseUSD = 35000.0
+
+	coinbaseUSD := -1.0
+	if req.PaperCoinbaseUSD != nil {
+		coinbaseUSD = *req.PaperCoinbaseUSD
+	} else if req.CoinbaseUSD != nil {
+		coinbaseUSD = *req.CoinbaseUSD
+	}
+
+	if upbitKRW < 0 {
+		upbitKRW = 50000000.0
+	}
+	if coinbaseUSD < 0 {
+		coinbaseUSD = 35000.0
+	}
+	if upbitKRW <= 0 && coinbaseUSD <= 0 {
+		upbitKRW = 50000000.0
+		coinbaseUSD = 35000.0
 	}
 
 	settings, _ := s.DB.GetUserSettings(userID)
 	if settings == nil {
 		settings = &postgres.UserSettings{UserID: userID}
 	}
-	settings.PaperUpbitKRW = req.UpbitKRW
-	settings.PaperCoinbaseUSD = req.CoinbaseUSD
-	settings.PaperBalancesJSON = "{}"
+	settings.PaperUpbitKRW = upbitKRW
+	settings.PaperCoinbaseUSD = coinbaseUSD
+	initialBalancesJSON, _ := json.Marshal(map[string]interface{}{
+		"UPBIT": map[string]interface{}{
+			"balances": map[string]float64{"KRW": upbitKRW, "BTC": 0, "ETH": 0},
+			"borrowed": map[string]float64{},
+			"futures":  map[string]interface{}{},
+		},
+		"COINBASE": map[string]interface{}{
+			"balances": map[string]float64{"USD": coinbaseUSD, "BTC": 0, "ETH": 0},
+			"borrowed": map[string]float64{},
+			"futures":  map[string]interface{}{},
+		},
+	})
+	settings.PaperBalancesJSON = string(initialBalancesJSON)
 	_ = s.DB.SaveUserSettings(settings)
 	_ = s.DB.CloseAllActivePositionsByUserAndMode(userID, true)
 
 	fxRate := strategy.GetFXRate("KRW")
-	if fxRate <= 0 {
-		fxRate = 1400.0
+	if s.Redis != nil {
+		if rawState, err := s.Redis.GetLatestUserStateByMode(r.Context(), fmt.Sprint(userID), "PAPER"); err == nil && len(rawState) > 0 {
+			var prevState map[string]interface{}
+			if json.Unmarshal(rawState, &prevState) == nil {
+				if prevFX, ok := prevState["fx_rate_krw"].(float64); ok && prevFX > 500 {
+					fxRate = prevFX
+				}
+			}
+		}
 	}
-	initialEquityUSD := (req.UpbitKRW / fxRate) + req.CoinbaseUSD
-	_ = s.DB.ResetPaperEquitySnapshots(userID, initialEquityUSD, fxRate, "")
+	if fxRate <= 0 {
+		fxRate = 1385.0
+	}
+
+	upbitUSD := upbitKRW / fxRate
+	initialEquityUSD := upbitUSD + coinbaseUSD
+	upbitPct := 50.0
+	cbPct := 50.0
+	foreignShare := 0.50
+	if initialEquityUSD > 0 {
+		upbitPct = (upbitUSD / initialEquityUSD) * 100.0
+		cbPct = (coinbaseUSD / initialEquityUSD) * 100.0
+		foreignShare = coinbaseUSD / initialEquityUSD
+	}
+
+	exchangeBalances := []map[string]interface{}{
+		{
+			"name":             "UPBIT",
+			"quote_currency":   "KRW",
+			"available_native": upbitKRW,
+			"available_usd":    upbitUSD,
+			"percent":          upbitPct,
+			"web_lending_ok":   true,
+		},
+		{
+			"name":             "COINBASE",
+			"quote_currency":   "USD",
+			"available_native": coinbaseUSD,
+			"available_usd":    coinbaseUSD,
+			"percent":          cbPct,
+			"web_lending_ok":   true,
+		},
+	}
+	breakdownBytes, _ := json.Marshal(exchangeBalances)
+	_ = s.DB.ResetPaperEquitySnapshots(userID, initialEquityUSD, fxRate, string(breakdownBytes))
 
 	if s.Redis != nil {
+		paperBotStatus := settings.PaperBotStatus
+		if paperBotStatus == "" {
+			paperBotStatus = "RUNNING"
+		}
+		resetStatePayload, _ := json.Marshal(map[string]interface{}{
+			"user_id":                userID,
+			"mode":                   "PAPER",
+			"bot_status":             paperBotStatus,
+			"available_balance":      initialEquityUSD,
+			"total_equity_usd":       initialEquityUSD,
+			"fx_rate_krw":            fxRate,
+			"exchange_balances":      exchangeBalances,
+			"foreign_share":          foreignShare,
+			"rebalance_trigger_skew": 0.20,
+			"rebalance_target_skew":  0.50,
+			"web_lending_sessions":   map[string]bool{"UPBIT": true, "COINBASE": true},
+			"position_pnls":          map[string]float64{},
+			"current_exposures":      map[string]float64{},
+			"unrealized_pnls":        map[string]float64{},
+			"pair_states":            map[string]int{},
+			"state":                  0,
+		})
+		_ = s.Redis.PublishUserStateByMode(r.Context(), fmt.Sprint(userID), "PAPER", resetStatePayload)
+
 		cmdPayload, _ := json.Marshal(map[string]interface{}{
 			"action":             "RESET_PAPER_ACCOUNT",
 			"mode":               "PAPER",
-			"upbit_krw":          req.UpbitKRW,
-			"coinbase_usd":       req.CoinbaseUSD,
-			"paper_upbit_krw":    req.UpbitKRW,
-			"paper_coinbase_usd": req.CoinbaseUSD,
+			"upbit_krw":          upbitKRW,
+			"coinbase_usd":       coinbaseUSD,
+			"paper_upbit_krw":    upbitKRW,
+			"paper_coinbase_usd": coinbaseUSD,
 		})
 		_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), cmdPayload)
 	}
@@ -589,8 +685,10 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":            "Paper trading account reset successfully",
-		"paper_upbit_krw":    req.UpbitKRW,
-		"paper_coinbase_usd": req.CoinbaseUSD,
+		"paper_upbit_krw":    upbitKRW,
+		"paper_coinbase_usd": coinbaseUSD,
+		"total_equity_usd":   initialEquityUSD,
+		"fx_rate_krw":        fxRate,
 	})
 }
 

@@ -87,8 +87,9 @@ type Engine struct {
 	lastErrorLogTimeMu sync.Mutex
 
 	// Equity history snapshot cadence (every 60s or on key portfolio events)
-	lastSnapshotTime  time.Time
-	forceNextSnapshot bool
+	lastSnapshotTime     time.Time
+	forceNextSnapshot    bool
+	resetSnapshotPending bool
 }
 
 func (e *Engine) StartDraining() {
@@ -1569,17 +1570,15 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 				if e.isPaper {
 					_ = e.db.CloseAllActivePositionsByUserAndMode(e.userID, true)
 					upbitKRW := cmd.PaperUpbitKRW
-					if upbitKRW <= 0 {
+					if upbitKRW <= 0 && cmd.UpbitKRW > 0 {
 						upbitKRW = cmd.UpbitKRW
 					}
-					if upbitKRW <= 0 {
-						upbitKRW = 50000000.0
-					}
 					cbUSD := cmd.PaperCoinbaseUSD
-					if cbUSD <= 0 {
+					if cbUSD <= 0 && cmd.CoinbaseUSD > 0 {
 						cbUSD = cmd.CoinbaseUSD
 					}
-					if cbUSD <= 0 {
+					if upbitKRW <= 0 && cbUSD <= 0 {
+						upbitKRW = 50000000.0
 						cbUSD = 35000.0
 					}
 					for _, c := range e.clients {
@@ -1593,7 +1592,9 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					}
 					e.liveUnrealizedPnLs = make(map[string]float64)
 					e.persistPaperState()
+					e.resetSnapshotPending = true
 					e.forceNextSnapshot = true
+					e.publishAccountState(ctx)
 					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
 						`{"action":"PAPER_ACCOUNT_RESET","mode":"PAPER","message":"Paper account reset to ₩%.0f KRW & $%.0f USD. All virtual positions cleared."}`,
 						upbitKRW, cbUSD,
@@ -1849,20 +1850,26 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 	fxKRW := GetFXRate("KRW")
 
 	hasMarketData := len(e.rawQuotes) > 0 || e.forceNextSnapshot
-	if e.db != nil && totalEquityUSD > 0 && hasMarketData && (e.forceNextSnapshot || time.Since(e.lastSnapshotTime) >= 60*time.Second) {
+	if e.db != nil && totalEquityUSD > 0 && hasMarketData && (e.resetSnapshotPending || e.forceNextSnapshot || time.Since(e.lastSnapshotTime) >= 60*time.Second) {
 		e.lastSnapshotTime = time.Now().UTC()
-		e.forceNextSnapshot = false
 		breakdownBytes, _ := json.Marshal(exSnapshots)
-		_ = e.db.SaveEquitySnapshot(&postgres.EquitySnapshot{
-			UserID:                e.userID,
-			IsPaper:               e.isPaper,
-			TotalEquityUSD:        totalEquityUSD,
-			AvailableUSD:          totalLiquidUSD,
-			UnrealizedPnLUSD:      totalUnrealizedPnLUSD,
-			FXRateKRW:             fxKRW,
-			ExchangeBreakdownJSON: string(breakdownBytes),
-			RecordedAt:            e.lastSnapshotTime,
-		})
+		if e.resetSnapshotPending {
+			e.resetSnapshotPending = false
+			e.forceNextSnapshot = false
+			_ = e.db.ResetPaperEquitySnapshots(e.userID, totalEquityUSD, fxKRW, string(breakdownBytes))
+		} else {
+			e.forceNextSnapshot = false
+			_ = e.db.SaveEquitySnapshot(&postgres.EquitySnapshot{
+				UserID:                e.userID,
+				IsPaper:               e.isPaper,
+				TotalEquityUSD:        totalEquityUSD,
+				AvailableUSD:          totalLiquidUSD,
+				UnrealizedPnLUSD:      totalUnrealizedPnLUSD,
+				FXRateKRW:             fxKRW,
+				ExchangeBreakdownJSON: string(breakdownBytes),
+				RecordedAt:            e.lastSnapshotTime,
+			})
+		}
 	}
 
 	payload, err := json.Marshal(AIAccountState{

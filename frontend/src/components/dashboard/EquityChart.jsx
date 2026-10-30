@@ -9,6 +9,7 @@ export const EquityChart = ({
   viewMode = 'PAPER',
   currentTotalUsd = 0,
   totalUnrealizedPnlUsd = 0,
+  refreshKey = 0,
 }) => {
   const { lang, t } = useI18n();
   const {
@@ -45,7 +46,7 @@ export const EquityChart = ({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [viewMode, range, updateFxRate]);
+  }, [viewMode, range, updateFxRate, refreshKey]);
 
   // Append or update the tail point with the live SSE totalEquityUsd
   const chartSeries = useMemo(() => {
