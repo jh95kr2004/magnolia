@@ -190,27 +190,28 @@ export const Dashboard = () => {
     <>
       {/* 1. Page Title Bar */}
       <div className="page-header">
-        <div>
-          <h1 className="page-title">
-            {viewMode === 'PAPER' ? t.dashboard.titlePaper : t.dashboard.titleLive}
-          </h1>
-          <p className="page-subtitle">
+        <div style={{ width: '100%' }}>
+          <div className="page-title-row">
+            <h1 className="page-title" style={{ marginBottom: 0 }}>
+              {viewMode === 'PAPER' ? t.dashboard.titlePaper : t.dashboard.titleLive}
+            </h1>
+            <span className={`badge ${sseConnected ? 'badge-emerald' : 'badge-amber'}`}>
+              <span className={`status-dot ${sseConnected ? 'running' : 'draining'}`} />
+              <span>
+                {sseConnected
+                  ? lang === 'ko'
+                    ? '실시간 연동 중'
+                    : 'Live Stream'
+                  : lang === 'ko'
+                    ? '연결 중...'
+                    : 'Connecting...'}
+              </span>
+            </span>
+          </div>
+          <p className="page-subtitle" style={{ marginTop: '6px' }}>
             {viewMode === 'PAPER' ? t.dashboard.subPaper : t.dashboard.subLive}
           </p>
         </div>
-
-        <span className={`badge ${sseConnected ? 'badge-emerald' : 'badge-amber'}`}>
-          <span className={`status-dot ${sseConnected ? 'running' : 'draining'}`} />
-          <span>
-            {sseConnected
-              ? lang === 'ko'
-                ? '실시간 연동 중'
-                : 'Live Stream'
-              : lang === 'ko'
-                ? '연결 중...'
-                : 'Connecting...'}
-          </span>
-        </span>
       </div>
 
       {/* Optional Web Lending Alert (Only in Live Mode when session expired) */}

@@ -304,6 +304,43 @@ button:disabled {
   color: #60a5fa;
 }
 
+.breadcrumb-dropdown-footer {
+  display: none;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.breadcrumb-footer-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+}
+
+.breadcrumb-footer-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.breadcrumb-footer-logout {
+  color: #fb7185;
+}
+
+.bot-btn-label-short {
+  display: none;
+}
+
 .header-right {
   display: flex;
   align-items: center;
@@ -387,6 +424,14 @@ button:disabled {
   gap: 20px;
   padding-bottom: 24px;
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.page-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
 }
 
 .page-title {
@@ -1045,9 +1090,8 @@ button:disabled {
     grid-template-columns: 1fr;
   }
   .top-header-inner {
-    padding: 8px 16px;
-    flex-wrap: wrap;
-    gap: 8px 12px;
+    padding: 0 16px;
+    gap: 10px;
   }
   .page-container {
     padding: 24px 16px 56px;
@@ -1059,26 +1103,47 @@ button:disabled {
     overflow-x: hidden;
   }
   .top-header {
-    height: auto;
+    height: 56px;
     min-height: 56px;
   }
   .top-header-inner {
-    padding: 8px 12px;
+    height: 56px;
+    min-height: 56px;
+    padding: 0 12px;
+    flex-wrap: nowrap;
+    justify-content: space-between;
     gap: 8px;
   }
   .header-left {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .breadcrumb-brand,
+  .breadcrumb-brand-sep {
+    display: none;
   }
   .breadcrumb-trigger {
-    padding: 5px 10px;
+    padding: 6px 10px;
     font-size: 13px;
     gap: 6px;
   }
+  .breadcrumb-dropdown-footer {
+    display: grid;
+  }
   .header-right {
-    width: 100%;
-    justify-content: space-between;
-    flex-wrap: wrap;
+    width: auto;
+    justify-content: flex-end;
+    flex-wrap: nowrap;
     gap: 6px;
+  }
+  .header-utility-btn {
+    display: none;
+  }
+  .bot-btn-label-full {
+    display: none;
+  }
+  .bot-btn-label-short {
+    display: inline;
   }
   .mode-switch {
     padding: 2px;
@@ -1089,17 +1154,18 @@ button:disabled {
     gap: 5px;
   }
   .header-right .btn-sm {
-    padding: 6px 9px;
+    padding: 6px 10px;
     font-size: 12px;
     gap: 5px;
   }
   .page-header {
-    flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 12px;
+    padding-bottom: 18px;
   }
   .page-title {
-    font-size: 22px;
+    font-size: 20px;
+  }
+  .page-subtitle {
+    font-size: 13px;
   }
   .equity-chart-card,
   .allocation-card {

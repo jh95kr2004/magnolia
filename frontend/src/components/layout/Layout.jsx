@@ -204,7 +204,7 @@ export const Layout = () => {
               >
                 <span className="brand-dot" />
                 <span className="breadcrumb-brand">Magnolia</span>
-                <ChevronRight size={14} className="breadcrumb-sep" />
+                <ChevronRight size={14} className="breadcrumb-sep breadcrumb-brand-sep" />
                 <span className="breadcrumb-current">{activeNavItem.label}</span>
                 <ChevronRight size={13} className="breadcrumb-sep breadcrumb-sub-sep" />
                 <span className="breadcrumb-sub">{activeNavItem.subLabel}</span>
@@ -235,6 +235,28 @@ export const Layout = () => {
                       </button>
                     );
                   })}
+
+                  <div className="breadcrumb-dropdown-footer">
+                    <button
+                      type="button"
+                      className="breadcrumb-footer-btn"
+                      onClick={toggleLanguage}
+                    >
+                      <Globe size={14} />
+                      <span>{lang === 'ko' ? '언어: KO' : 'Lang: EN'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="breadcrumb-footer-btn breadcrumb-footer-logout"
+                      onClick={() => {
+                        setMobileMenuOpen(false);
+                        logout();
+                      }}
+                    >
+                      <LogOut size={14} />
+                      <span>{t.nav.logout}</span>
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -280,17 +302,29 @@ export const Layout = () => {
                 type="button"
                 disabled={updatingBot}
                 onClick={handleBotButtonClick}
-                className={`btn btn-sm ${isRunning ? 'btn-danger' : 'btn-emerald'}`}
+                className={`btn btn-sm bot-control-btn ${isRunning ? 'btn-danger' : 'btn-emerald'}`}
               >
                 {isRunning ? (
                   <>
                     <Square size={14} />
-                    <span>{t.nav.stopBot}</span>
+                    <span className="bot-btn-label-full">{t.nav.stopBot}</span>
+                    <span className="bot-btn-label-short">{lang === 'ko' ? '중지' : 'Stop'}</span>
                   </>
                 ) : (
                   <>
                     <Play size={14} />
-                    <span>{isDraining ? t.nav.botDraining : t.nav.startBot}</span>
+                    <span className="bot-btn-label-full">
+                      {isDraining ? t.nav.botDraining : t.nav.startBot}
+                    </span>
+                    <span className="bot-btn-label-short">
+                      {isDraining
+                        ? lang === 'ko'
+                          ? '정리중'
+                          : 'Drain'
+                        : lang === 'ko'
+                          ? '시작'
+                          : 'Start'}
+                    </span>
                   </>
                 )}
               </button>
@@ -298,7 +332,7 @@ export const Layout = () => {
               <button
                 type="button"
                 onClick={toggleLanguage}
-                className="btn btn-sm btn-ghost"
+                className="btn btn-sm btn-ghost header-utility-btn"
                 title="Switch Language (KO / EN)"
               >
                 <Globe size={14} />
@@ -308,7 +342,7 @@ export const Layout = () => {
               <button
                 type="button"
                 onClick={logout}
-                className="btn btn-sm btn-ghost"
+                className="btn btn-sm btn-ghost header-utility-btn"
                 title={t.nav.logout}
               >
                 <LogOut size={14} />
