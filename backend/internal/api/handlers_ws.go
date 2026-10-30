@@ -101,9 +101,6 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		if v, ok := stateMap["bot_status"]; ok {
 			portfolioPayload["bot_status"] = v
 		}
-		if v, ok := stateMap["sim_status"]; ok && isPaper {
-			portfolioPayload["sim_status"] = v
-		}
 		if v, ok := stateMap["total_equity_usd"]; ok {
 			portfolioPayload["total_equity_usd"] = v
 		}
@@ -581,40 +578,96 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Preserve raw un-offset baseline values on each history point
+	if histSlice, ok := payload["history"].([]interface{}); ok {
+		for _, item := range histSlice {
+			if pt, ok := item.(map[string]interface{}); ok {
+				if act, ok := pt["actual_pct"].(float64); ok {
+					pt["raw_actual_pct"] = act
+				}
+				if pastPred, ok := pt["ai_past_pred_pct"].(float64); ok {
+					pt["raw_ai_past_pred_pct"] = pastPred
+				} else if act, ok := pt["actual_pct"].(float64); ok {
+					pt["raw_ai_past_pred_pct"] = act
+				}
+			}
+		}
+	}
+
 	// Apply Paper Mode active price offset simulator if applicable
 	if mode == "PAPER" && s.DB != nil {
 		if settings, err := s.DB.GetUserSettings(userID); err == nil && settings != nil {
 			sim := computeSimStatusFromSettings(settings)
+			payload["sim_status"] = sim
+			nowUnix := time.Now().Unix()
+			payload["server_unix"] = nowUnix
+
 			currOffsetPct, _ := sim["current_offset_pct"].(float64)
 			simEx, _ := sim["exchange"].(string)
-			deltaPct := 0.0
+			sign := 0.0
 			if strings.EqualFold(baseEx, simEx) {
-				deltaPct = currOffsetPct
+				sign = 1.0
 			} else if strings.EqualFold(foreignEx, simEx) {
-				deltaPct = -currOffsetPct
+				sign = -1.0
 			}
-			if math.Abs(deltaPct) > 1e-6 {
+			deltaPct := currOffsetPct * sign
+			startDelta := settings.SimStartOffsetPct * sign
+			targetDelta := settings.SimTargetOffsetPct * sign
+
+			if sign != 0 && (math.Abs(startDelta) > 1e-6 || math.Abs(targetDelta) > 1e-6 || math.Abs(deltaPct) > 1e-6) {
 				if histSlice, ok := payload["history"].([]interface{}); ok && len(histSlice) > 0 {
-					if lastPt, ok := histSlice[len(histSlice)-1].(map[string]interface{}); ok {
-						if act, ok := lastPt["actual_pct"].(float64); ok {
-							lastPt["actual_pct"] = math.Round((act+deltaPct)*10000) / 10000
+					n := len(histSlice)
+					nowSec := float64(nowUnix)
+					for i, item := range histSlice {
+						pt, ok := item.(map[string]interface{})
+						if !ok {
+							continue
 						}
-					}
-				}
-				if fcSlice, ok := payload["forecast"].([]interface{}); ok {
-					for _, item := range fcSlice {
-						if pt, ok := item.(map[string]interface{}); ok {
-							offMin, _ := pt["offset_min"].(float64)
-							decay := math.Exp(-0.35 * offMin / 480.0)
-							if pred, ok := pt["predicted_pct"].(float64); ok {
-								pt["predicted_pct"] = math.Round((pred+deltaPct*decay)*10000) / 10000
+						ptSec := nowSec - float64(n-1-i)*60.0
+						ptDelta := 0.0
+						if settings.SimStartedAt <= 0 {
+							ptDelta = targetDelta
+						} else if ptSec <= float64(settings.SimStartedAt) {
+							ptDelta = startDelta
+						} else {
+							elapsedSec := ptSec - float64(settings.SimStartedAt)
+							totalSec := settings.SimRampMinutes * 60.0
+							if totalSec <= 0 || elapsedSec >= totalSec {
+								ptDelta = targetDelta
+							} else {
+								u := elapsedSec / totalSec
+								alpha := 0.5 * (1.0 - math.Cos(math.Pi*u))
+								ptDelta = startDelta + (targetDelta-startDelta)*alpha
+							}
+						}
+						if i == n-1 {
+							ptDelta = deltaPct
+						}
+						if math.Abs(ptDelta) > 1e-6 {
+							for _, key := range []string{"actual_pct", "ai_past_pred_pct", "pred_1h_pct", "pred_6h_pct", "pred_24h_pct"} {
+								if val, ok := pt[key].(float64); ok {
+									pt[key] = math.Round((val+ptDelta)*10000) / 10000
+								}
 							}
 						}
 					}
 				}
-				if summary, ok := payload["summary"].(map[string]interface{}); ok {
-					if cur, ok := summary["current_pct"].(float64); ok {
-						summary["current_pct"] = math.Round((cur+deltaPct)*10000) / 10000
+				if math.Abs(deltaPct) > 1e-6 {
+					if fcSlice, ok := payload["forecast"].([]interface{}); ok {
+						for _, item := range fcSlice {
+							if pt, ok := item.(map[string]interface{}); ok {
+								offMin, _ := pt["offset_min"].(float64)
+								decay := math.Exp(-0.35 * offMin / 480.0)
+								if pred, ok := pt["predicted_pct"].(float64); ok {
+									pt["predicted_pct"] = math.Round((pred+deltaPct*decay)*10000) / 10000
+								}
+							}
+						}
+					}
+					if summary, ok := payload["summary"].(map[string]interface{}); ok {
+						if cur, ok := summary["current_pct"].(float64); ok {
+							summary["current_pct"] = math.Round((cur+deltaPct)*10000) / 10000
+						}
 					}
 				}
 			}

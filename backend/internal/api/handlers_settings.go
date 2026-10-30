@@ -273,6 +273,7 @@ func computeSimStatusFromSettings(settings *postgres.UserSettings) map[string]in
 			"target_offset_pct":  0.0,
 			"current_offset_pct": 0.0,
 			"ramp_minutes":       0.0,
+			"started_at":         int64(0),
 			"progress_pct":       100.0,
 			"remaining_seconds":  0.0,
 			"is_ramping":         false,
@@ -312,6 +313,7 @@ func computeSimStatusFromSettings(settings *postgres.UserSettings) map[string]in
 		"target_offset_pct":  targetPct,
 		"current_offset_pct": currPct,
 		"ramp_minutes":       rampMin,
+		"started_at":         settings.SimStartedAt,
 		"progress_pct":       progressPct,
 		"remaining_seconds":  remSec,
 		"is_ramping":         isRamping,
@@ -513,6 +515,10 @@ func (s *Server) handleSimOffset(w http.ResponseWriter, r *http.Request) {
 	settings.SimTargetOffsetPct = req.TargetOffsetPct
 	settings.SimRampMinutes = req.RampMinutes
 	settings.SimStartedAt = now
+	if math.Abs(req.TargetOffsetPct) < 1e-6 && req.RampMinutes <= 0 {
+		settings.SimStartOffsetPct = 0
+		settings.SimStartedAt = 0
+	}
 	_ = s.DB.SaveUserSettings(settings)
 
 	if s.Redis != nil {

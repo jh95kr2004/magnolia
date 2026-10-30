@@ -28,6 +28,7 @@ export const PremiumTrajectoryChart = ({
   foreignSymbol = 'BTC-USD',
   viewMode = 'PAPER',
   livePremiumPct,
+  simStatus,
   lang = 'ko'
 }) => {
   const cacheKey = `${baseExchange}:${baseSymbol}:${foreignExchange}:${foreignSymbol}:${viewMode}`;
@@ -109,12 +110,27 @@ export const PremiumTrajectoryChart = ({
     };
 
     fetchChart();
-    const timer = setInterval(fetchChart, isLoadingChart ? 1000 : 5000);
+    const timer = setInterval(
+      fetchChart,
+      isLoadingChart || simStatus?.is_ramping ? 1000 : 5000
+    );
     return () => {
       active = false;
       clearInterval(timer);
     };
-  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode, cacheKey, isLoadingChart]);
+  }, [
+    baseExchange,
+    baseSymbol,
+    foreignExchange,
+    foreignSymbol,
+    viewMode,
+    cacheKey,
+    isLoadingChart,
+    simStatus?.started_at,
+    simStatus?.target_offset_pct,
+    simStatus?.ramp_minutes,
+    simStatus?.is_ramping
+  ]);
 
   const width = Math.max(640, containerWidth);
   const height = 246;
@@ -138,51 +154,143 @@ export const PremiumTrajectoryChart = ({
     const viewSpan = Math.max(20, viewWindow.end - viewWindow.start);
     const useShortRolling = viewSpan <= 180;
 
-    const baseHistory =
+    const activeSim =
+      viewMode === 'PAPER'
+        ? simStatus && simStatus.started_at !== undefined
+          ? simStatus
+          : chartData?.sim_status
+        : null;
+    const simEx = String(activeSim?.exchange || 'UPBIT').toUpperCase();
+    const simSign =
+      String(baseExchange).toUpperCase() === simEx
+        ? 1
+        : String(foreignExchange).toUpperCase() === simEx
+          ? -1
+          : 0;
+    const startDelta = Number(activeSim?.start_offset_pct || 0) * simSign;
+    const targetDelta = Number(activeSim?.target_offset_pct || 0) * simSign;
+    const rampMin = Math.max(0, Number(activeSim?.ramp_minutes || 0));
+    const startedAtSec = Number(activeSim?.started_at || 0);
+    const nowSec = Date.now() / 1000;
+    const simStartOffsetMin =
+      startedAtSec > 0 ? -Math.max(0, (nowSec - startedAtSec) / 60.0) : 0;
+    const simEndOffsetMin = simStartOffsetMin + rampMin;
+    const hasActiveSim =
+      viewMode === 'PAPER' &&
+      simSign !== 0 &&
+      (Math.abs(startDelta) > 1e-6 || Math.abs(targetDelta) > 1e-6);
+
+    const getSimDeltaAtOffsetMin = (offMin) => {
+      if (!hasActiveSim) return 0;
+      if (startedAtSec <= 0) return targetDelta;
+      if (offMin <= simStartOffsetMin) return startDelta;
+      if (rampMin <= 0 || offMin >= simEndOffsetMin) return targetDelta;
+      const u = Math.min(1, Math.max(0, (offMin - simStartOffsetMin) / Math.max(1e-6, rampMin)));
+      const alpha = 0.5 * (1 - Math.cos(Math.PI * u));
+      return startDelta + (targetDelta - startDelta) * alpha;
+    };
+
+    const hasRawBaseline =
+      rawHistory.length > 0 && rawHistory[0]?.raw_actual_pct !== undefined;
+
+    const unoffsetPoints =
       rawHistory.length > 0
         ? rawHistory.map((pt, i) => {
             const offsetMin = -(rawHistory.length - 1 - i);
-            const pastPred =
+            const rawAct = hasRawBaseline
+              ? Number(pt.raw_actual_pct ?? pt.actual_pct ?? curPct)
+              : Number(pt.actual_pct ?? curPct);
+            const fallbackPastPred =
               pt.pred_24h_pct ?? pt.pred_6h_pct ?? pt.pred_1h_pct ?? pt.ai_past_pred_pct;
+            const rawPred = hasRawBaseline
+              ? Number(pt.raw_ai_past_pred_pct ?? fallbackPastPred ?? rawAct)
+              : Number(fallbackPastPred ?? rawAct);
             return {
               ...pt,
               offsetMin,
-              actual_pct:
-                i === rawHistory.length - 1 ? curPct : Number(pt.actual_pct ?? curPct),
-              ai_past_pred_pct: Number(pastPred ?? pt.actual_pct ?? curPct)
+              rawAct,
+              rawPred
             };
           })
         : Array.from({ length: 361 }, (_, i) => {
             const offsetMin = -(360 - i);
+            const unoffCur = curPct - getSimDeltaAtOffsetMin(0);
             return {
               timestamp: new Date(Date.now() + offsetMin * 60000).toISOString(),
               offsetMin,
-              actual_pct: curPct,
-              ai_past_pred_pct: curPct
+              rawAct: unoffCur,
+              rawPred: unoffCur
             };
           });
 
-    // Smoothly anchor the final 18 minutes of the past AI trajectory to live curPct at NOW (offsetMin = 0)
-    const lastPastPred =
-      baseHistory.length > 0
-        ? baseHistory[baseHistory.length - 1].ai_past_pred_pct
+    // Smoothly anchor the final 18 minutes of the un-offset past AI trajectory to un-offset rawAct at NOW
+    const lastUnoffAct =
+      unoffsetPoints.length > 0
+        ? unoffsetPoints[unoffsetPoints.length - 1].rawAct
         : curPct;
-    const pastTailDiff = curPct - lastPastPred;
+    const lastUnoffPred =
+      unoffsetPoints.length > 0
+        ? unoffsetPoints[unoffsetPoints.length - 1].rawPred
+        : lastUnoffAct;
+    const rawTailDiff = lastUnoffAct - lastUnoffPred;
     const tailWindow = 18;
-    const history = baseHistory.map((pt, idx) => {
-      if (idx === baseHistory.length - 1) {
-        return { ...pt, ai_past_pred_pct: curPct };
+    const smoothedUnoffset = unoffsetPoints.map((pt, idx) => {
+      if (idx === unoffsetPoints.length - 1) {
+        return { ...pt, rawPredSmoothed: lastUnoffAct };
       }
       if (pt.offsetMin > -tailWindow && pt.offsetMin <= 0) {
         const u = (pt.offsetMin + tailWindow) / tailWindow;
         const ramp = 0.5 * (1 - Math.cos(Math.PI * u));
         return {
           ...pt,
-          ai_past_pred_pct: pt.ai_past_pred_pct + pastTailDiff * ramp
+          rawPredSmoothed: pt.rawPred + rawTailDiff * ramp
         };
       }
-      return pt;
+      return { ...pt, rawPredSmoothed: pt.rawPred };
     });
+
+    // Apply S-curve simulation offset and subdivide the active ramp window for smooth S-curve rendering
+    const history = [];
+    const subSteps = 6; // 10-second sub-intervals inside the S-curve ramp window
+    const shouldSubdivideRamp =
+      hasActiveSim &&
+      hasRawBaseline &&
+      rampMin > 0 &&
+      Math.abs(targetDelta - startDelta) > 1e-6;
+
+    for (let i = 0; i < smoothedUnoffset.length; i++) {
+      const p0 = smoothedUnoffset[i];
+      const isLast = i === smoothedUnoffset.length - 1;
+      const delta0 = hasRawBaseline ? getSimDeltaAtOffsetMin(p0.offsetMin) : 0;
+      history.push({
+        ...p0,
+        actual_pct: isLast ? curPct : p0.rawAct + delta0,
+        ai_past_pred_pct: isLast ? curPct : p0.rawPredSmoothed + delta0
+      });
+
+      if (!isLast && shouldSubdivideRamp) {
+        const p1 = smoothedUnoffset[i + 1];
+        const segOverlapsRamp =
+          p1.offsetMin > simStartOffsetMin - 0.05 &&
+          p0.offsetMin < Math.min(0, simEndOffsetMin + 0.05);
+        if (segOverlapsRamp) {
+          for (let k = 1; k < subSteps; k++) {
+            const frac = k / subSteps;
+            const m = p0.offsetMin + frac * (p1.offsetMin - p0.offsetMin);
+            const interpRawAct = p0.rawAct + frac * (p1.rawAct - p0.rawAct);
+            const interpRawPred =
+              p0.rawPredSmoothed + frac * (p1.rawPredSmoothed - p0.rawPredSmoothed);
+            const subDelta = getSimDeltaAtOffsetMin(m);
+            history.push({
+              timestamp: new Date(Date.now() + m * 60000).toISOString(),
+              offsetMin: m,
+              actual_pct: interpRawAct + subDelta,
+              ai_past_pred_pct: interpRawPred + subDelta
+            });
+          }
+        }
+      }
+    }
 
     const anchorDiff =
       rawForecast.length > 0
@@ -341,7 +449,16 @@ export const PremiumTrajectoryChart = ({
           : 'NARROWING'),
       mean8hPct: Number(summary.mean_8h_pct ?? curPct)
     };
-  }, [chartData, livePremiumPct, viewWindow.start, viewWindow.end]);
+  }, [
+    chartData,
+    livePremiumPct,
+    simStatus,
+    viewMode,
+    baseExchange,
+    foreignExchange,
+    viewWindow.start,
+    viewWindow.end
+  ]);
 
   const clampViewport = useCallback(
     (start, end) => {

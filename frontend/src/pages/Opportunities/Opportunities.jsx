@@ -654,6 +654,7 @@ export const Opportunities = () => {
                               foreignSymbol={opp.foreignSymbol}
                               viewMode={viewMode}
                               livePremiumPct={opp.premiumPct}
+                              simStatus={simStatus}
                               lang={lang}
                             />
                           </td>
