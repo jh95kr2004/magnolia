@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -561,28 +562,84 @@ func (c *CoinbaseClient) ConnectWS(ctx context.Context, symbols []Symbol, priceU
 	// If no authenticated Advanced Trade API key is configured, connect to Coinbase Public Exchange WebSocket feed
 	if c.apiName == "" || c.apiName == "public" || c.apiName == "dummy" {
 		pubWSURL := "wss://ws-feed.exchange.coinbase.com"
-		conn, _, dialErr := websocket.DefaultDialer.Dial(pubWSURL, nil)
-		if dialErr != nil {
-			return dialErr
-		}
-		c.wsConn = conn
+		subMsg := fmt.Sprintf(`{"type":"subscribe","product_ids":%s,"channels":["ticker","heartbeat"]}`, string(productIDsBytes))
 
-		subMsg := fmt.Sprintf(`{"type":"subscribe","product_ids":%s,"channels":["ticker"]}`, string(productIDsBytes))
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
-			conn.Close()
+		dialAndSubscribe := func() (*websocket.Conn, error) {
+			conn, _, dialErr := websocket.DefaultDialer.Dial(pubWSURL, nil)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+			conn.SetPongHandler(func(string) error {
+				conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+				return nil
+			})
+			c.wsConn = conn
+			return conn, nil
+		}
+
+		initialConn, err := dialAndSubscribe()
+		if err != nil {
 			return err
 		}
 
 		go func() {
-			defer conn.Close()
+			conn := initialConn
+			defer func() {
+				if conn != nil {
+					conn.Close()
+				}
+			}()
+
 			for {
-				select {
-				case <-ctx.Done():
+				if ctx.Err() != nil {
 					return
-				default:
+				}
+
+				if conn == nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+					newConn, err := dialAndSubscribe()
+					if err != nil {
+						log.Printf("[WS-RECONNECT] COINBASE Public WebSocket dial failed: %v (retrying...)", err)
+						continue
+					}
+					log.Printf("[WS-RECONNECT] COINBASE Public WebSocket reconnected and subscribed (%d symbols)", len(productIDs))
+					conn = newConn
+				}
+
+				pingDone := make(chan struct{})
+				go func(ws *websocket.Conn, done <-chan struct{}) {
+					ticker := time.NewTicker(20 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-done:
+							return
+						case <-ticker.C:
+							_ = ws.WriteControl(websocket.PingMessage, []byte("PING"), time.Now().Add(5*time.Second))
+						}
+					}
+				}(conn, pingDone)
+
+				for {
+					conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 					_, message, err := conn.ReadMessage()
 					if err != nil {
-						return
+						log.Printf("[WS-RECONNECT] COINBASE Public WebSocket read error: %v. Reconnecting...", err)
+						close(pingDone)
+						conn.Close()
+						conn = nil
+						break
 					}
 					var pubTick struct {
 						Type      string `json:"type"`
@@ -627,39 +684,93 @@ func (c *CoinbaseClient) ConnectWS(ctx context.Context, symbols []Symbol, priceU
 		return nil
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(coinbaseWSURL, nil)
-	if err != nil {
-		return err
+	dialAndSubscribeAuth := func() (*websocket.Conn, error) {
+		conn, _, err := websocket.DefaultDialer.Dial(coinbaseWSURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		token, err := c.generateJWT("GET", "api.coinbase.com", "")
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		subMsg := fmt.Sprintf(`{
+			"type": "subscribe",
+			"product_ids": %s,
+			"channel": "ticker",
+			"jwt": "%s"
+		}`, string(productIDsBytes), token)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+			return nil
+		})
+		c.wsConn = conn
+		return conn, nil
 	}
-	c.wsConn = conn
 
-	// Generate JWT for WS auth
-	token, err := c.generateJWT("GET", "api.coinbase.com", "")
+	initialConn, err := dialAndSubscribeAuth()
 	if err != nil {
-		return err
-	}
-
-	subMsg := fmt.Sprintf(`{
-		"type": "subscribe",
-		"product_ids": %s,
-		"channel": "ticker",
-		"jwt": "%s"
-	}`, string(productIDsBytes), token)
-
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
 		return err
 	}
 
 	go func() {
-		defer conn.Close()
+		conn := initialConn
+		defer func() {
+			if conn != nil {
+				conn.Close()
+			}
+		}()
+
 		for {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			default:
+			}
+
+			if conn == nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				newConn, err := dialAndSubscribeAuth()
+				if err != nil {
+					log.Printf("[WS-RECONNECT] COINBASE Auth WebSocket dial failed: %v (retrying...)", err)
+					continue
+				}
+				log.Printf("[WS-RECONNECT] COINBASE Auth WebSocket reconnected and subscribed (%d symbols)", len(productIDs))
+				conn = newConn
+			}
+
+			pingDone := make(chan struct{})
+			go func(ws *websocket.Conn, done <-chan struct{}) {
+				ticker := time.NewTicker(20 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-done:
+						return
+					case <-ticker.C:
+						_ = ws.WriteControl(websocket.PingMessage, []byte("PING"), time.Now().Add(5*time.Second))
+					}
+				}
+			}(conn, pingDone)
+
+			for {
+				conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 				_, message, err := conn.ReadMessage()
 				if err != nil {
-					return
+					log.Printf("[WS-RECONNECT] COINBASE Auth WebSocket read error: %v. Reconnecting...", err)
+					close(pingDone)
+					conn.Close()
+					conn = nil
+					break
 				}
 
 				var cbUpdate struct {
@@ -679,12 +790,22 @@ func (c *CoinbaseClient) ConnectWS(ctx context.Context, symbols []Symbol, priceU
 							ask, _ := strconv.ParseFloat(ticker.BestAsk, 64)
 
 							if bid > 0 && ask > 0 {
+								unifiedSym := toUnifiedSymbolFromCoinbase(ticker.ProductID)
+								_, quoteCur := ParseSymbol(unifiedSym)
 								priceUpdateCh <- PriceUpdate{
-									Exchange: c.GetName(),
-									Symbol:   toUnifiedSymbolFromCoinbase(ticker.ProductID),
-									BidUSD:   bid,
-									AskUSD:   ask,
-									FXRate:   1.0,
+									Exchange:       c.GetName(),
+									Symbol:         unifiedSym,
+									QuoteCurrency:  quoteCur,
+									RawBid:         bid,
+									RawAsk:         ask,
+									RawFutureBid:   bid,
+									RawFutureAsk:   ask,
+									BidUSD:         bid,
+									AskUSD:         ask,
+									BidFutureUSD:   bid,
+									AskFutureUSD:   ask,
+									FXRate:         1.0,
+									FXCurrencyPair: "USD/USD",
 								}
 							}
 						}

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -441,40 +442,93 @@ func (u *UpbitClient) CancelOrder(ctx context.Context, orderID string, symbol Sy
 }
 
 func (u *UpbitClient) ConnectWS(ctx context.Context, symbols []Symbol, priceUpdateCh chan<- PriceUpdate) error {
-	conn, _, err := websocket.DefaultDialer.Dial(upbitWSURL, nil)
-	if err != nil {
-		return err
-	}
-	u.wsConn = conn
-
 	var upbitSymbols []string
 	for _, sym := range symbols {
 		upbitSymbols = append(upbitSymbols, toUpbitSymbol(sym))
 	}
-
-	// Send subscription message
-	uuidStr := uuid.New().String()
 	codesBytes, err := json.Marshal(upbitSymbols)
 	if err != nil {
 		return err
 	}
-	subMsg := fmt.Sprintf(`[{"ticket":"%s"},{"type":"orderbook","codes":%s}]`, uuidStr, string(codesBytes))
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
+	dialAndSubscribe := func() (*websocket.Conn, error) {
+		conn, _, err := websocket.DefaultDialer.Dial(upbitWSURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		uuidStr := uuid.New().String()
+		subMsg := fmt.Sprintf(`[{"ticket":"%s"},{"type":"orderbook","codes":%s}]`, uuidStr, string(codesBytes))
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(subMsg)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+			return nil
+		})
+		u.wsConn = conn
+		return conn, nil
+	}
+
+	initialConn, err := dialAndSubscribe()
+	if err != nil {
 		return err
 	}
 
 	go func() {
-		defer conn.Close()
+		conn := initialConn
+		defer func() {
+			if conn != nil {
+				conn.Close()
+			}
+		}()
+
 		for {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			default:
+			}
+
+			if conn == nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				newConn, err := dialAndSubscribe()
+				if err != nil {
+					log.Printf("[WS-RECONNECT] UPBIT WebSocket dial failed: %v (retrying...)", err)
+					continue
+				}
+				log.Printf("[WS-RECONNECT] UPBIT WebSocket reconnected and subscribed (%d symbols)", len(upbitSymbols))
+				conn = newConn
+			}
+
+			pingDone := make(chan struct{})
+			go func(c *websocket.Conn, done <-chan struct{}) {
+				ticker := time.NewTicker(20 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-done:
+						return
+					case <-ticker.C:
+						_ = c.WriteControl(websocket.PingMessage, []byte("PING"), time.Now().Add(5*time.Second))
+					}
+				}
+			}(conn, pingDone)
+
+			for {
+				conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 				_, message, err := conn.ReadMessage()
 				if err != nil {
-					// Handle reconnect logic here later
-					return
+					log.Printf("[WS-RECONNECT] UPBIT WebSocket read error: %v. Reconnecting...", err)
+					close(pingDone)
+					conn.Close()
+					conn = nil
+					break
 				}
 
 				var ubUpdate struct {

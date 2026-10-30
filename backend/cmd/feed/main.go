@@ -95,6 +95,7 @@ func main() {
 
 	priceCh := make(chan exchange.PriceUpdate, 1000)
 	priceCache := &sync.Map{}
+	lastUpdateCache := &sync.Map{}
 
 	var fxMu sync.RWMutex
 	liveKRWRate := 1385.0
@@ -206,13 +207,62 @@ func main() {
 			continue
 		}
 
-		// 4. Connect to WebSockets or initiate pseudo-WSS REST Polling
+		// 4. Connect to WebSockets or initiate pseudo-WSS REST Polling + Stale-Tick Watchdog
 		go func(c exchange.Client, syms []exchange.Symbol) {
 			log.Printf("[INIT] Staring WSS Connection for %s with %d symbols...", c.GetName(), len(syms))
 			err := c.ConnectWS(ctx, syms, priceCh)
 			if err != nil {
 				log.Printf("[WARNING] %s WS Failed or Not Supported: %v. Falling back to REST polling logic.", c.GetName(), err)
 				startRESTPseudoWebsocketFallback(ctx, c, syms, priceCh)
+				return
+			}
+
+			// Watchdog: if any symbol has not received a WS tick in > 12s, poll REST so priceCache & InfluxDB never freeze
+			watchdogTicker := time.NewTicker(10 * time.Second)
+			defer watchdogTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-watchdogTicker.C:
+					now := time.Now()
+					for _, sym := range syms {
+						key := c.GetName() + "|" + string(sym)
+						stale := true
+						if tsVal, ok := lastUpdateCache.Load(key); ok {
+							if now.Sub(tsVal.(time.Time)) < 12*time.Second {
+								stale = false
+							}
+						}
+						if stale {
+							spotPrice, err := c.GetTicker(ctx, sym)
+							if err == nil && spotPrice > 0 {
+								_, quoteCur := exchange.ParseSymbol(sym)
+								krwRate := getKRWRate()
+								bidUSD, askUSD := spotPrice, spotPrice
+								fxRate := 1.0
+								fxPair := "USD/USD"
+								if quoteCur == "KRW" && krwRate > 0 {
+									bidUSD = spotPrice / krwRate
+									askUSD = spotPrice / krwRate
+									fxRate = krwRate
+									fxPair = "USD/KRW"
+								}
+								priceCh <- exchange.PriceUpdate{
+									Exchange:       c.GetName(),
+									Symbol:         sym,
+									QuoteCurrency:  quoteCur,
+									RawBid:         spotPrice,
+									RawAsk:         spotPrice,
+									BidUSD:         bidUSD,
+									AskUSD:         askUSD,
+									FXRate:         fxRate,
+									FXCurrencyPair: fxPair,
+								}
+							}
+						}
+					}
+				}
 			}
 		}(client, symbolsToMonitor)
 	}
@@ -271,6 +321,7 @@ func main() {
 
 			// Save back to sync.Map
 			priceCache.Store(cacheKey, &merged)
+			lastUpdateCache.Store(cacheKey, time.Now())
 
 			// Publish Ticker update to Redis
 			redisClient.PublishTicker(ctx, merged)
