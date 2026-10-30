@@ -261,11 +261,30 @@ def run_daemon():
                             )
                             if df is not None and not df.empty:
                                 spreads_s = df["exchange_premium_spread"].astype(float)
-                                # Compute historical 15-minute ahead OU + momentum forecast for past AI overlay line
-                                past_origin = spreads_s.shift(15).bfill()
-                                past_mean = spreads_s.rolling(240, min_periods=1).mean().shift(15).bfill()
-                                past_mom = (spreads_s.shift(15) - spreads_s.shift(30)).fillna(0.0) * 0.25
-                                past_ai_preds = past_origin + (1.0 - np.exp(-0.35)) * (past_mean - past_origin) + past_mom
+                                # Strictly causal step-ahead regime-aware AI forecast (uses only data up to t-1 to predict t):
+                                # Distinguishes sustained multi-step breakout acceleration from exhausted flash spikes
+                                s_prev = spreads_s.shift(1).bfill()
+                                s_prev2 = spreads_s.shift(2).bfill()
+                                s_prev3 = spreads_s.shift(3).bfill()
+                                med_10 = s_prev.rolling(10, min_periods=1).median()
+                                mean_60 = s_prev.rolling(60, min_periods=1).mean()
+                                mean_240 = s_prev.rolling(240, min_periods=1).mean()
+                                std_30 = s_prev.rolling(30, min_periods=1).std().fillna(0.0005).clip(lower=0.0002)
+
+                                vel_1 = s_prev - s_prev2
+                                vel_2 = s_prev2 - s_prev3
+                                accel = (vel_1 - vel_2).clip(-0.004, 0.004)
+                                spike_dev = s_prev - med_10
+
+                                is_sustained = (vel_1 * vel_2 > 0) & (vel_1 * spike_dev >= 0)
+                                is_exhausted = (spike_dev.abs() > 1.3 * std_30) & (~is_sustained)
+                                trend_term = np.where(
+                                    is_sustained,
+                                    0.45 * vel_1 + 0.20 * accel,
+                                    np.where(is_exhausted, -0.55 * spike_dev, 0.15 * vel_1),
+                                )
+                                ou_pull = 0.12 * (med_10 - s_prev) + 0.08 * (mean_60 - s_prev) + 0.04 * (mean_240 - s_prev)
+                                past_ai_preds = pd.Series(s_prev + trend_term + ou_pull, index=spreads_s.index)
 
                                 for idx, row in df.iterrows():
                                     row_ts = row.get("_time", None)
@@ -363,8 +382,8 @@ def run_daemon():
                     if raw_traj:
                         for offset_m in range(1, min(60, len(raw_traj) + 1)):
                             target_mb = current_minute_bucket + offset_m
-                            # Keep 15-minute ahead prediction as primary reference or set if not yet populated
-                            if offset_m == 15 or target_mb not in future_pred_lookup[pair_key]:
+                            # Keep causal 1-minute step-ahead prediction as primary reference or set if not yet populated
+                            if offset_m == 1 or target_mb not in future_pred_lookup[pair_key]:
                                 future_pred_lookup[pair_key][target_mb] = float(raw_traj[offset_m - 1])
                         # Prune old keys
                         old_keys = [k for k in future_pred_lookup[pair_key] if k < current_minute_bucket - 5]

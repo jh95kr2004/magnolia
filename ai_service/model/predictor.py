@@ -95,15 +95,49 @@ class PremiumForecaster(nn.Module):
         macro_reversion = (1.0 - torch.exp(-0.45 * t_grid)) * 0.55 * dev_24h
         ou_reversion = fast_pullback + med_reversion + macro_reversion
 
-        # (b) Short-term momentum impulse wave (captures 15m-60m continuation overshoot before reversion)
+        # (b) Regime-aware short-term dynamics:
+        #     Distinguishes sustained multi-step breakout acceleration from 1-2m flash-spike exhaustion
+        w_10m = min(seq_len, 10)
+        w_30m = min(seq_len, 30)
+        recent_10m_med = target_seq[:, -w_10m:, :].median(dim=1, keepdim=True).values
         recent_15m_mean = target_seq[:, -w_15m:, :].mean(dim=1, keepdim=True)
-        short_vel = origin_anchor - recent_15m_mean
+        std_30m = target_seq[:, -w_30m:, :].std(dim=1, keepdim=True).clamp(min=1e-4)
+
+        if seq_len >= 3:
+            vel_1 = target_seq[:, -1:, :] - target_seq[:, -2:-1, :]
+            vel_2 = target_seq[:, -2:-1, :] - target_seq[:, -3:-2, :]
+            accel = torch.clamp(vel_1 - vel_2, -2.0 * std_30m, 2.0 * std_30m)
+        else:
+            vel_1 = origin_anchor - recent_10m_med
+            vel_2 = vel_1
+            accel = torch.zeros_like(vel_1)
+
+        spike_dev = origin_anchor - recent_10m_med
+        is_sustained = (vel_1 * vel_2 > 0) & (vel_1 * spike_dev >= 0)
+        is_exhausted = (spike_dev.abs() > 1.3 * std_30m) & (~is_sustained)
+
+        # Sustained breakout carries forward with acceleration lead; exhausted flash spike snaps back within minutes
+        effective_short_vel = torch.where(
+            is_sustained,
+            0.55 * vel_1 + 0.25 * accel + 0.35 * (origin_anchor - recent_15m_mean),
+            torch.where(
+                is_exhausted,
+                -0.25 * spike_dev,
+                0.35 * (origin_anchor - recent_15m_mean),
+            ),
+        )
+        flash_snapback = torch.where(
+            is_exhausted,
+            -(1.0 - torch.exp(-32.0 * t_grid)) * torch.exp(-1.5 * t_grid) * (0.65 * spike_dev),
+            torch.zeros_like(t_grid),
+        )
+
         med_vel = recent_15m_mean - mean_1h
-        tau_fast = 0.065  # peaks around ~31 minutes
+        tau_fast = 0.055  # peaks around ~26 minutes
         tau_med = 0.22    # peaks around ~105 minutes
-        impulse_fast = (t_grid / tau_fast) * torch.exp(1.0 - t_grid / tau_fast) * (0.65 * short_vel)
+        impulse_fast = (t_grid / tau_fast) * torch.exp(1.0 - t_grid / tau_fast) * effective_short_vel
         impulse_med = (t_grid / tau_med) * torch.exp(1.0 - t_grid / tau_med) * (0.40 * med_vel)
-        momentum_wave = impulse_fast + impulse_med
+        momentum_wave = impulse_fast + impulse_med + flash_snapback
 
         # (c) Multi-band empirical spectral harmonics from winsorized recent window
         #     Captures macro (1.5h-3h), meso (30m-60m), and micro (10m-25m) cyclical market structure
