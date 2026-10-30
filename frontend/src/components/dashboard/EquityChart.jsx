@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { apiClient } from '../../services/api';
 import { useCurrency } from '../../contexts/CurrencyContext';
 import { useI18n } from '../../contexts/LanguageContext';
@@ -23,6 +23,29 @@ export const EquityChart = ({
   const [range, setRange] = useState('24H');
   const [historyPoints, setHistoryPoints] = useState([]);
   const [hoverIdx, setHoverIdx] = useState(null);
+  const chartContainerRef = useRef(null);
+  const [containerWidth, setContainerWidth] = useState(720);
+
+  useEffect(() => {
+    const el = chartContainerRef.current;
+    if (!el) return;
+    const measure = () => {
+      if (el.clientWidth && el.clientWidth > 180) {
+        setContainerWidth(el.clientWidth);
+      }
+    };
+    measure();
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(measure);
+      ro.observe(el);
+    }
+    window.addEventListener('resize', measure);
+    return () => {
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,7 +130,7 @@ export const EquityChart = ({
 
   // Build SVG path coordinates with Y-axis anchored at 0 at the bottom
   const svgGeometry = useMemo(() => {
-    const width = 720;
+    const width = Math.max(240, containerWidth);
     const height = 195;
     const padX = 8;
     const padTop = 18;
@@ -152,7 +175,7 @@ export const EquityChart = ({
     ];
 
     return { width, height, padX, bottomY, coords, linePath, areaPath, yTicks };
-  }, [chartSeries]);
+  }, [chartSeries, containerWidth]);
 
   const strokeColor = isPositive ? '#3b82f6' : '#f43f5e';
   const hoveredCoord =
@@ -237,6 +260,7 @@ export const EquityChart = ({
 
       {/* Interactive Coinbase-Style Glowing SVG Area Chart */}
       <div
+        ref={chartContainerRef}
         style={{ position: 'relative', width: '100%', height: '195px' }}
         onMouseLeave={() => setHoverIdx(null)}
       >
@@ -301,27 +325,36 @@ export const EquityChart = ({
           />
 
           {hoveredCoord && (
-            <>
-              <line
-                x1={hoveredCoord.x}
-                y1={0}
-                x2={hoveredCoord.x}
-                y2={svgGeometry.height}
-                stroke="rgba(148, 163, 184, 0.35)"
-                strokeDasharray="3 3"
-                strokeWidth="1.2"
-              />
-              <circle
-                cx={hoveredCoord.x}
-                cy={hoveredCoord.y}
-                r="5"
-                fill={strokeColor}
-                stroke="#0b0e14"
-                strokeWidth="2"
-              />
-            </>
+            <line
+              x1={hoveredCoord.x}
+              y1={0}
+              x2={hoveredCoord.x}
+              y2={svgGeometry.height}
+              stroke="rgba(148, 163, 184, 0.35)"
+              strokeDasharray="3 3"
+              strokeWidth="1.2"
+            />
           )}
         </svg>
+
+        {/* Aspect-Ratio-Independent Circular Hover Point Indicator */}
+        {hoveredCoord && (
+          <div
+            style={{
+              position: 'absolute',
+              left: `${(hoveredCoord.x / svgGeometry.width) * 100}%`,
+              top: `${(hoveredCoord.y / svgGeometry.height) * 100}%`,
+              width: '11px',
+              height: '11px',
+              borderRadius: '50%',
+              background: strokeColor,
+              border: '2px solid #0b0e14',
+              boxShadow: `0 0 8px ${strokeColor}`,
+              transform: 'translate(-50%, -50%)',
+              pointerEvents: 'none',
+            }}
+          />
+        )}
 
         {/* Crisp Y-Axis Value Labels (Peak, 50%, and 0 at bottom) */}
         {svgGeometry.yTicks.map((tick, idx) => (
