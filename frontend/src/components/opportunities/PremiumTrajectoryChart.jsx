@@ -314,11 +314,12 @@ export const PremiumTrajectoryChart = ({
       visibleVals.push(curPct, 0);
     }
 
-    let minVal = Math.min(...visibleVals);
-    let maxVal = Math.max(...visibleVals);
-    const span = Math.max(0.25, maxVal - minVal);
-    minVal -= span * 0.18;
-    maxVal += span * 0.22;
+    const rawMin = Math.min(...visibleVals);
+    const rawMax = Math.max(...visibleVals);
+    const maxAbs = Math.max(0.25, Math.abs(rawMin), Math.abs(rawMax));
+    const halfRange = maxAbs * 1.24;
+    const minVal = -halfRange;
+    const maxVal = halfRange;
 
     return {
       history,
@@ -484,7 +485,8 @@ export const PremiumTrajectoryChart = ({
     .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.yPred.toFixed(1)}`)
     .join(' ');
 
-  const baselineY = padTop + plotH;
+  const zeroY = toY(0);
+  const baselineY = zeroY;
   const actualAreaPath =
     histPoints.length > 1
       ? `${actualPath} L ${histPoints[histPoints.length - 1].x.toFixed(1)} ${baselineY.toFixed(1)} L ${histPoints[0].x.toFixed(1)} ${baselineY.toFixed(1)} Z`
@@ -494,8 +496,6 @@ export const PremiumTrajectoryChart = ({
     futPoints.length > 1
       ? `${futureAiPath} L ${futPoints[futPoints.length - 1].x.toFixed(1)} ${baselineY.toFixed(1)} L ${futPoints[0].x.toFixed(1)} ${baselineY.toFixed(1)} Z`
       : '';
-
-  const zeroY = toY(0);
   const nowY =
     histPoints.length > 0 ? histPoints[histPoints.length - 1].yActual : toY(processed.curPct);
   const maxFutCoord = futPoints[processed.maxIdx] || futPoints[0];
@@ -850,12 +850,13 @@ export const PremiumTrajectoryChart = ({
                   x={padLeft - 8}
                   y={y + 4}
                   textAnchor="end"
-                  fill="rgba(148, 163, 184, 0.75)"
+                  fill={Math.abs(val) < 1e-4 ? 'rgba(226, 232, 240, 0.9)' : 'rgba(148, 163, 184, 0.75)'}
+                  fontWeight={Math.abs(val) < 1e-4 ? '600' : '400'}
                   fontSize="11"
                   fontFamily="monospace"
                 >
-                  {val >= 0 ? '+' : ''}
-                  {val.toFixed(2)}%
+                  {val > 1e-4 ? '+' : ''}
+                  {Math.abs(val) < 1e-4 ? '0.00' : val.toFixed(2)}%
                 </text>
               </g>
             );
