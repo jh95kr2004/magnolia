@@ -185,6 +185,7 @@ button:disabled {
 .app-main-column {
   flex: 1;
   min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -193,7 +194,8 @@ button:disabled {
   position: sticky;
   top: 0;
   z-index: 100;
-  height: 64px;
+  min-height: 64px;
+  width: 100%;
   background: rgba(11, 14, 20, 0.88);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border-subtle);
@@ -201,7 +203,7 @@ button:disabled {
 
 .top-header-inner {
   max-width: 1360px;
-  height: 100%;
+  min-height: 64px;
   margin: 0 auto;
   padding: 0 28px;
   display: flex;
@@ -215,6 +217,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 
 .breadcrumb-trigger {
@@ -227,6 +230,7 @@ button:disabled {
   border: 1px solid transparent;
   font-size: 14px;
   color: var(--text-secondary);
+  white-space: nowrap;
   transition: all 0.15s ease;
 }
 
@@ -303,7 +307,8 @@ button:disabled {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 /* Mode Segmented Switch (Paper vs Live) */
@@ -315,6 +320,7 @@ button:disabled {
   border-radius: 999px;
   padding: 3px;
   gap: 2px;
+  flex-shrink: 0;
 }
 
 .mode-switch-btn {
@@ -326,6 +332,7 @@ button:disabled {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
+  white-space: nowrap;
   transition: all 0.15s ease;
 }
 
@@ -1021,6 +1028,10 @@ button:disabled {
     background: var(--bg-elevated);
     border-color: var(--border-subtle);
   }
+  .breadcrumb-sub,
+  .breadcrumb-sub-sep {
+    display: none;
+  }
   .dashboard-top-grid {
     grid-template-columns: 1fr;
   }
@@ -1034,9 +1045,67 @@ button:disabled {
     grid-template-columns: 1fr;
   }
   .top-header-inner {
-    padding: 0 16px;
+    padding: 8px 16px;
+    flex-wrap: wrap;
+    gap: 8px 12px;
   }
   .page-container {
     padding: 24px 16px 56px;
+  }
+}
+
+@media (max-width: 680px) {
+  html, body {
+    overflow-x: hidden;
+  }
+  .top-header {
+    height: auto;
+    min-height: 56px;
+  }
+  .top-header-inner {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+  .header-left {
+    flex: 1 1 auto;
+  }
+  .breadcrumb-trigger {
+    padding: 5px 10px;
+    font-size: 13px;
+    gap: 6px;
+  }
+  .header-right {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .mode-switch {
+    padding: 2px;
+  }
+  .mode-switch-btn {
+    padding: 5px 10px;
+    font-size: 12px;
+    gap: 5px;
+  }
+  .header-right .btn-sm {
+    padding: 6px 9px;
+    font-size: 12px;
+    gap: 5px;
+  }
+  .page-header {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .page-title {
+    font-size: 22px;
+  }
+  .equity-chart-card,
+  .allocation-card {
+    padding: 20px 16px;
+  }
+  .equity-hero-value {
+    font-size: 28px;
   }
 }
