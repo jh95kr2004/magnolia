@@ -22,8 +22,26 @@ export const EquityChart = ({
 
   const [range, setRange] = useState('24H');
   const [historyPoints, setHistoryPoints] = useState([]);
-  const [hoverIdx, setHoverIdx] = useState(null);
+  const [hoverRatio, setHoverRatio] = useState(null);
+  const [zoomWindow, setZoomWindow] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+
   const chartContainerRef = useRef(null);
+  const svgRef = useRef(null);
+  const dragRef = useRef({
+    active: false,
+    moved: false,
+    startX: 0,
+    startMs: 0,
+    endMs: 0,
+  });
+  const pinchRef = useRef({
+    active: false,
+    initialDist: 0,
+    startSpan: 0,
+    anchorTime: 0,
+  });
+  const activeWindowRef = useRef({ startMs: 0, endMs: 0, minMs: 0, maxMs: 0 });
   const [containerWidth, setContainerWidth] = useState(720);
 
   useEffect(() => {
@@ -71,6 +89,12 @@ export const EquityChart = ({
     };
   }, [viewMode, range, updateFxRate, refreshKey]);
 
+  // Reset zoom window whenever range or viewMode changes
+  useEffect(() => {
+    setZoomWindow(null);
+    setHoverRatio(null);
+  }, [range, viewMode]);
+
   // Append or update the tail point with the live SSE totalEquityUsd
   const chartSeries = useMemo(() => {
     const base = Array.isArray(historyPoints) ? [...historyPoints] : [];
@@ -113,15 +137,313 @@ export const EquityChart = ({
     return base;
   }, [historyPoints, currentTotalUsd]);
 
-  const firstPoint = chartSeries[0];
-  const lastPoint = chartSeries[chartSeries.length - 1];
-  const activePoint =
-    hoverIdx !== null && chartSeries[hoverIdx] ? chartSeries[hoverIdx] : lastPoint;
+  // Parse timestamps into sorted millisecond series
+  const timedSeries = useMemo(() => {
+    const pts = chartSeries
+      .map((pt, i) => {
+        const parsed = pt?.timestamp ? new Date(pt.timestamp).getTime() : NaN;
+        const timeMs = Number.isFinite(parsed)
+          ? parsed
+          : Date.now() - (chartSeries.length - 1 - i) * 60000;
+        return {
+          ...pt,
+          timeMs,
+          val: Math.max(0, Number(pt?.total_equity_usd || 0)),
+        };
+      })
+      .sort((a, b) => a.timeMs - b.timeMs);
+
+    if (pts.length >= 2 && pts[pts.length - 1].timeMs <= pts[0].timeMs) {
+      pts[0] = { ...pts[0], timeMs: pts[pts.length - 1].timeMs - 60000 };
+    }
+    return pts;
+  }, [chartSeries]);
+
+  const dataStartMs = timedSeries[0]?.timeMs ?? Date.now() - 3600 * 1000;
+  const dataEndMs = Math.max(dataStartMs + 60000, timedSeries[timedSeries.length - 1]?.timeMs ?? Date.now());
+  const fullSpanMs = Math.max(60000, dataEndMs - dataStartMs);
+  const minZoomSpanMs = Math.max(15000, Math.min(60000, Math.floor(fullSpanMs * 0.02)));
+
+  const winStartMs = zoomWindow
+    ? Math.max(dataStartMs, Math.min(dataEndMs - minZoomSpanMs, zoomWindow.startMs))
+    : dataStartMs;
+  const winEndMs = zoomWindow
+    ? Math.max(winStartMs + minZoomSpanMs, Math.min(dataEndMs, zoomWindow.endMs))
+    : dataEndMs;
+
+  useEffect(() => {
+    activeWindowRef.current = {
+      startMs: winStartMs,
+      endMs: winEndMs,
+      minMs: dataStartMs,
+      maxMs: dataEndMs,
+      minSpanMs: minZoomSpanMs,
+    };
+  }, [winStartMs, winEndMs, dataStartMs, dataEndMs, minZoomSpanMs]);
+
+  const interpolateValueAt = (tMs) => {
+    if (timedSeries.length === 0) return 0;
+    if (tMs <= timedSeries[0].timeMs) return timedSeries[0].val;
+    const last = timedSeries[timedSeries.length - 1];
+    if (tMs >= last.timeMs) return last.val;
+
+    for (let i = 0; i < timedSeries.length - 1; i++) {
+      const p0 = timedSeries[i];
+      const p1 = timedSeries[i + 1];
+      if (tMs >= p0.timeMs && tMs <= p1.timeMs) {
+        const dt = p1.timeMs - p0.timeMs;
+        if (dt <= 0) return p1.val;
+        const ratio = (tMs - p0.timeMs) / dt;
+        return p0.val + ratio * (p1.val - p0.val);
+      }
+    }
+    return last.val;
+  };
+
+  // Visible points within [winStartMs, winEndMs] with exact boundary interpolation
+  const visibleSeries = useMemo(() => {
+    const startVal = interpolateValueAt(winStartMs);
+    const endVal = interpolateValueAt(winEndMs);
+    const interior = timedSeries.filter(
+      (pt) => pt.timeMs > winStartMs && pt.timeMs < winEndMs
+    );
+    return [
+      {
+        timestamp: new Date(winStartMs).toISOString(),
+        timeMs: winStartMs,
+        total_equity_usd: startVal,
+        val: startVal,
+      },
+      ...interior,
+      {
+        timestamp: new Date(winEndMs).toISOString(),
+        timeMs: winEndMs,
+        total_equity_usd: endVal,
+        val: endVal,
+      },
+    ];
+  }, [timedSeries, winStartMs, winEndMs]);
+
+  const applyZoomFactor = (factor, anchorRatio = 0.5) => {
+    const { startMs, endMs, minMs, maxMs, minSpanMs } = activeWindowRef.current;
+    const totalAvailable = Math.max(60000, maxMs - minMs);
+    const curSpan = Math.max(minSpanMs, endMs - startMs);
+    const nextSpan = Math.max(minSpanMs, Math.min(totalAvailable, curSpan * factor));
+
+    if (nextSpan >= totalAvailable * 0.999) {
+      setZoomWindow(null);
+      return;
+    }
+
+    const clampedRatio = Math.max(0, Math.min(1, anchorRatio));
+    const anchorTime = startMs + clampedRatio * curSpan;
+    let nextStart = anchorTime - clampedRatio * nextSpan;
+    let nextEnd = nextStart + nextSpan;
+
+    if (nextStart < minMs) {
+      nextStart = minMs;
+      nextEnd = minMs + nextSpan;
+    }
+    if (nextEnd > maxMs) {
+      nextEnd = maxMs;
+      nextStart = Math.max(minMs, maxMs - nextSpan);
+    }
+    setZoomWindow({ startMs: nextStart, endMs: nextEnd });
+  };
+
+  // Non-passive wheel zoom + two-finger pinch-to-zoom + single-finger touch tooltip
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+
+    const handleWheel = (e) => {
+      e.preventDefault();
+      const rect = svgEl.getBoundingClientRect();
+      if (!rect.width) return;
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
+      applyZoomFactor(zoomFactor, ratio);
+    };
+
+    const getTouchDist = (t1, t2) => {
+      const dx = t1.clientX - t2.clientX;
+      const dy = t1.clientY - t2.clientY;
+      return Math.hypot(dx, dy);
+    };
+
+    const handleTouchStart = (e) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const rect = svgEl.getBoundingClientRect();
+        if (!rect.width) return;
+        const dist = getTouchDist(e.touches[0], e.touches[1]);
+        if (dist < 8) return;
+        const midClientX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midRatio = Math.max(0, Math.min(1, (midClientX - rect.left) / rect.width));
+        const { startMs, endMs } = activeWindowRef.current;
+        const curSpan = Math.max(1000, endMs - startMs);
+        pinchRef.current = {
+          active: true,
+          initialDist: dist,
+          startSpan: curSpan,
+          anchorTime: startMs + midRatio * curSpan,
+        };
+        setHoverRatio(null);
+      } else if (e.touches.length === 1 && !pinchRef.current.active) {
+        const rect = svgEl.getBoundingClientRect();
+        if (!rect.width) return;
+        const relX = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
+        setHoverRatio(relX);
+      }
+    };
+
+    const handleTouchMove = (e) => {
+      if (e.touches.length === 2 && pinchRef.current.active) {
+        e.preventDefault();
+        const rect = svgEl.getBoundingClientRect();
+        if (!rect.width) return;
+        const curDist = getTouchDist(e.touches[0], e.touches[1]);
+        if (curDist < 8 || pinchRef.current.initialDist < 8) return;
+
+        const { minMs, maxMs, minSpanMs } = activeWindowRef.current;
+        const totalAvailable = Math.max(60000, maxMs - minMs);
+        const scale = pinchRef.current.initialDist / curDist;
+        const nextSpan = Math.max(
+          minSpanMs,
+          Math.min(totalAvailable, pinchRef.current.startSpan * scale)
+        );
+
+        if (nextSpan >= totalAvailable * 0.999) {
+          setZoomWindow(null);
+          return;
+        }
+
+        const midClientX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const curMidRatio = Math.max(0, Math.min(1, (midClientX - rect.left) / rect.width));
+        let nextStart = pinchRef.current.anchorTime - curMidRatio * nextSpan;
+        let nextEnd = nextStart + nextSpan;
+
+        if (nextStart < minMs) {
+          nextStart = minMs;
+          nextEnd = minMs + nextSpan;
+        }
+        if (nextEnd > maxMs) {
+          nextEnd = maxMs;
+          nextStart = Math.max(minMs, maxMs - nextSpan);
+        }
+        setZoomWindow({ startMs: nextStart, endMs: nextEnd });
+      } else if (e.touches.length === 1 && !pinchRef.current.active) {
+        const rect = svgEl.getBoundingClientRect();
+        if (!rect.width) return;
+        const relX = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
+        setHoverRatio(relX);
+      }
+    };
+
+    const handleTouchEnd = (e) => {
+      if (e.touches.length < 2) {
+        pinchRef.current.active = false;
+      }
+    };
+
+    const handleGesture = (e) => {
+      e.preventDefault();
+    };
+
+    svgEl.addEventListener('wheel', handleWheel, { passive: false });
+    svgEl.addEventListener('touchstart', handleTouchStart, { passive: false });
+    svgEl.addEventListener('touchmove', handleTouchMove, { passive: false });
+    svgEl.addEventListener('touchend', handleTouchEnd);
+    svgEl.addEventListener('touchcancel', handleTouchEnd);
+    svgEl.addEventListener('gesturestart', handleGesture, { passive: false });
+    svgEl.addEventListener('gesturechange', handleGesture, { passive: false });
+
+    return () => {
+      svgEl.removeEventListener('wheel', handleWheel);
+      svgEl.removeEventListener('touchstart', handleTouchStart);
+      svgEl.removeEventListener('touchmove', handleTouchMove);
+      svgEl.removeEventListener('touchend', handleTouchEnd);
+      svgEl.removeEventListener('touchcancel', handleTouchEnd);
+      svgEl.removeEventListener('gesturestart', handleGesture);
+      svgEl.removeEventListener('gesturechange', handleGesture);
+    };
+  }, []);
+
+  // Desktop mouse drag panning
+  useEffect(() => {
+    const onMouseMove = (e) => {
+      if (!dragRef.current.active || !svgRef.current) return;
+      const dx = e.clientX - dragRef.current.startX;
+      if (Math.abs(dx) > 3) {
+        dragRef.current.moved = true;
+      }
+      const rect = svgRef.current.getBoundingClientRect();
+      if (!rect.width) return;
+      const { minMs, maxMs } = activeWindowRef.current;
+      const span = dragRef.current.endMs - dragRef.current.startMs;
+      const timeShift = -(dx / rect.width) * span;
+      let nextStart = dragRef.current.startMs + timeShift;
+      let nextEnd = dragRef.current.endMs + timeShift;
+      if (nextStart < minMs) {
+        nextStart = minMs;
+        nextEnd = minMs + span;
+      }
+      if (nextEnd > maxMs) {
+        nextEnd = maxMs;
+        nextStart = Math.max(minMs, maxMs - span);
+      }
+      setZoomWindow({ startMs: nextStart, endMs: nextEnd });
+    };
+
+    const onMouseUp = () => {
+      if (dragRef.current.active) {
+        dragRef.current.active = false;
+        setIsDragging(false);
+      }
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
+
+  const hoverPoint = useMemo(() => {
+    if (hoverRatio === null) return null;
+    const hoverTimeMs = winStartMs + hoverRatio * (winEndMs - winStartMs);
+    // Snap to closest point in visibleSeries if within 1.8% of window width
+    let closest = null;
+    let minDiff = Infinity;
+    for (const pt of visibleSeries) {
+      const diff = Math.abs(pt.timeMs - hoverTimeMs);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = pt;
+      }
+    }
+    if (closest && minDiff <= (winEndMs - winStartMs) * 0.018) {
+      return closest;
+    }
+    const val = interpolateValueAt(hoverTimeMs);
+    return {
+      timestamp: new Date(hoverTimeMs).toISOString(),
+      timeMs: hoverTimeMs,
+      total_equity_usd: val,
+      val,
+    };
+  }, [hoverRatio, winStartMs, winEndMs, visibleSeries]);
+
+  const firstPoint = visibleSeries[0] || chartSeries[0];
+  const lastPoint = visibleSeries[visibleSeries.length - 1] || chartSeries[chartSeries.length - 1];
 
   const displayEquityUsd =
-    hoverIdx !== null && activePoint
-      ? Number(activePoint.total_equity_usd || 0)
-      : Number(currentTotalUsd > 0 ? currentTotalUsd : lastPoint?.total_equity_usd || 0);
+    hoverPoint !== null
+      ? Number(hoverPoint.total_equity_usd || 0)
+      : zoomWindow
+        ? Number(lastPoint?.total_equity_usd || 0)
+        : Number(currentTotalUsd > 0 ? currentTotalUsd : lastPoint?.total_equity_usd || 0);
 
   const startEquityUsd = Number(firstPoint?.total_equity_usd || displayEquityUsd || 0);
   const deltaUsd = displayEquityUsd - startEquityUsd;
@@ -139,7 +461,7 @@ export const EquityChart = ({
     const usableH = height - padTop - padBottom;
     const bottomY = padTop + usableH;
 
-    const values = chartSeries.map((p) => Math.max(0, Number(p.total_equity_usd || 0)));
+    const values = visibleSeries.map((p) => Math.max(0, Number(p.total_equity_usd || 0)));
     const minVal = 0;
     const peakVal = Math.max(0, ...values);
     const maxVal = peakVal > 0 ? peakVal * 1.16 : 100;
@@ -151,11 +473,14 @@ export const EquityChart = ({
       return bottomY - normY * usableH;
     };
 
-    const coords = chartSeries.map((pt, idx) => {
-      const x =
-        chartSeries.length > 1
-          ? padX + (idx / (chartSeries.length - 1)) * usableW
-          : padX + usableW / 2;
+    const timeSpan = Math.max(1, winEndMs - winStartMs);
+    const toX = (tMs) => {
+      const ratio = Math.max(0, Math.min(1, (tMs - winStartMs) / timeSpan));
+      return padX + ratio * usableW;
+    };
+
+    const coords = visibleSeries.map((pt) => {
+      const x = toX(pt.timeMs);
       const val = Number(pt.total_equity_usd || 0);
       const y = toY(val);
       return { x, y, pt };
@@ -171,15 +496,20 @@ export const EquityChart = ({
     const yTicks = [
       { value: peakVal, y: toY(peakVal) },
       { value: peakVal * 0.5, y: toY(peakVal * 0.5) },
-      { value: 0, y: bottomY }
+      { value: 0, y: bottomY },
     ];
 
-    return { width, height, padX, bottomY, coords, linePath, areaPath, yTicks };
-  }, [chartSeries, containerWidth]);
+    return { width, height, padX, bottomY, coords, linePath, areaPath, yTicks, toX, toY };
+  }, [visibleSeries, containerWidth, winStartMs, winEndMs]);
 
   const strokeColor = isPositive ? '#3b82f6' : '#f43f5e';
-  const hoveredCoord =
-    hoverIdx !== null && svgGeometry.coords[hoverIdx] ? svgGeometry.coords[hoverIdx] : null;
+  const hoveredCoord = hoverPoint
+    ? {
+        x: svgGeometry.toX(hoverPoint.timeMs),
+        y: svgGeometry.toY(hoverPoint.total_equity_usd),
+        pt: hoverPoint,
+      }
+    : null;
 
   return (
     <div className="equity-chart-card" data-testid="equity-chart-card">
@@ -262,19 +592,43 @@ export const EquityChart = ({
       <div
         ref={chartContainerRef}
         style={{ position: 'relative', width: '100%', height: '195px' }}
-        onMouseLeave={() => setHoverIdx(null)}
+        onMouseLeave={() => setHoverRatio(null)}
       >
         <svg
+          ref={svgRef}
           viewBox={`0 0 ${svgGeometry.width} ${svgGeometry.height}`}
           preserveAspectRatio="none"
-          style={{ width: '100%', height: '100%', overflow: 'visible', display: 'block' }}
+          style={{
+            width: '100%',
+            height: '100%',
+            overflow: 'visible',
+            display: 'block',
+            cursor: isDragging ? 'grabbing' : 'crosshair',
+            userSelect: 'none',
+            touchAction: 'pan-y',
+          }}
           data-testid="equity-area-chart"
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            dragRef.current = {
+              active: true,
+              moved: false,
+              startX: e.clientX,
+              startMs: winStartMs,
+              endMs: winEndMs,
+            };
+            setIsDragging(true);
+          }}
+          onDoubleClick={() => {
+            setZoomWindow(null);
+            setHoverRatio(null);
+          }}
           onMouseMove={(e) => {
+            if (dragRef.current.active && dragRef.current.moved) return;
             const rect = e.currentTarget.getBoundingClientRect();
             if (!rect.width || chartSeries.length === 0) return;
             const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            const idx = Math.round(relX * (chartSeries.length - 1));
-            setHoverIdx(idx);
+            setHoverRatio(relX);
           }}
         >
           <defs>
@@ -412,7 +766,10 @@ export const EquityChart = ({
             aria-selected={range === tf}
             data-testid={`timeframe-tab-${tf}`}
             className={`timeframe-tab mono ${range === tf ? 'active' : ''}`}
-            onClick={() => setRange(tf)}
+            onClick={() => {
+              setRange(tf);
+              setZoomWindow(null);
+            }}
           >
             {tf}
           </button>
