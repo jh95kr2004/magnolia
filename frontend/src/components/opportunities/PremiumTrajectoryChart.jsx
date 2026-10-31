@@ -53,12 +53,30 @@ export const PremiumTrajectoryChart = ({
   });
   const pinchRef = useRef({
     active: false,
+    touchDriven: false,
     initialDist: 0,
     startSpan: 840,
-    anchorTime: 0
+    anchorTime: 0,
+    midRatio: 0.5
+  });
+  const singleTouchRef = useRef({
+    active: false,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastY: 0,
+    mode: null
   });
   const viewWindowRef = useRef(viewWindow);
   viewWindowRef.current = viewWindow;
+  const layoutRef = useRef({
+    width: 1240,
+    plotW: 1000,
+    padLeft: 48,
+    minBound: -1440,
+    maxBound: 480,
+    clampViewport: (s, e) => ({ start: s, end: e })
+  });
 
   useEffect(() => {
     const rootEl = rootRef.current;
@@ -513,91 +531,138 @@ export const PremiumTrajectoryChart = ({
     [processed.minBound, processed.maxBound]
   );
 
-  // Attach non-passive wheel & two-finger touch pinch listeners for smooth zoom
+  layoutRef.current = {
+    width,
+    plotW,
+    padLeft,
+    minBound: processed.minBound,
+    maxBound: processed.maxBound,
+    clampViewport
+  };
+
+  // Attach non-passive wheel & two-finger touch pinch listeners on containerRef
   useEffect(() => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return;
+    const targetEl = containerRef.current;
+    if (!targetEl) return;
+
+    const getChartRect = () => (svgRef.current || targetEl).getBoundingClientRect();
 
     const handleWheel = (e) => {
       e.preventDefault();
       e.stopPropagation();
 
-      const rect = svgEl.getBoundingClientRect();
-      const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
-      const cursorRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+      const { width: w, padLeft: pl, plotW: pw, minBound, maxBound, clampViewport: clampFn } =
+        layoutRef.current;
+      const rect = getChartRect();
+      const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * w;
+      const cursorRatio = Math.min(1, Math.max(0, (relX - pl) / Math.max(1, pw)));
 
       setViewWindow((prev) => {
         const curSpan = Math.max(20, prev.end - prev.start);
         const cursorTime = prev.start + cursorRatio * curSpan;
         const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
-        const minB = Math.min(-60, processed.minBound);
-        const maxB = Math.max(60, processed.maxBound);
+        const minB = Math.min(-60, minBound);
+        const maxB = Math.max(60, maxBound);
         const nextSpan = Math.min(maxB - minB, Math.max(20, curSpan * zoomFactor));
         const nextStart = cursorTime - cursorRatio * nextSpan;
         const nextEnd = nextStart + nextSpan;
-        return clampViewport(nextStart, nextEnd);
+        return clampFn(nextStart, nextEnd);
       });
       setActivePreset(null);
     };
 
     const initPinch = (t0, t1) => {
-      const dist = Math.max(12, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+      const { width: w, padLeft: pl, plotW: pw } = layoutRef.current;
+      const dist = Math.max(10, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
       const midClientX = 0.5 * (t0.clientX + t1.clientX);
-      const rect = svgEl.getBoundingClientRect();
-      const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * width;
-      const midRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+      const rect = getChartRect();
+      const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * w;
+      const midRatio = Math.min(1, Math.max(0, (relX - pl) / Math.max(1, pw)));
       const curStart = viewWindowRef.current.start;
       const curEnd = viewWindowRef.current.end;
       const curSpan = Math.max(20, curEnd - curStart);
       pinchRef.current = {
         active: true,
+        touchDriven: true,
         initialDist: dist,
         startSpan: curSpan,
-        anchorTime: curStart + midRatio * curSpan
+        anchorTime: curStart + midRatio * curSpan,
+        midRatio
       };
+      singleTouchRef.current.active = false;
       setHoverX(null);
     };
 
     const handleTouchStart = (e) => {
       if (!e.touches) return;
-      if (e.touches.length === 2) {
-        e.preventDefault();
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
         e.stopPropagation();
         initPinch(e.touches[0], e.touches[1]);
       } else if (e.touches.length === 1 && !pinchRef.current.active) {
-        const rect = svgEl.getBoundingClientRect();
-        const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+        const t0 = e.touches[0];
+        singleTouchRef.current = {
+          active: true,
+          startX: t0.clientX,
+          startY: t0.clientY,
+          lastX: t0.clientX,
+          lastY: t0.clientY,
+          mode: null
+        };
+        const { width: w } = layoutRef.current;
+        const rect = getChartRect();
+        const relX = ((t0.clientX - rect.left) / Math.max(1, rect.width)) * w;
         setHoverX(relX);
       }
     };
 
     const handleTouchMove = (e) => {
       if (!e.touches) return;
-      if (e.touches.length === 2) {
-        e.preventDefault();
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
         e.stopPropagation();
         const t0 = e.touches[0];
         const t1 = e.touches[1];
         if (!pinchRef.current.active) {
           initPinch(t0, t1);
         }
-        const curDist = Math.max(12, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+        const { width: w, padLeft: pl, plotW: pw, minBound, maxBound, clampViewport: clampFn } =
+          layoutRef.current;
+        const curDist = Math.max(10, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
         const midClientX = 0.5 * (t0.clientX + t1.clientX);
-        const rect = svgEl.getBoundingClientRect();
-        const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * width;
-        const midRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+        const rect = getChartRect();
+        const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * w;
+        const midRatio = Math.min(1, Math.max(0, (relX - pl) / Math.max(1, pw)));
 
         const scale = pinchRef.current.initialDist / curDist;
-        const minB = Math.min(-60, processed.minBound);
-        const maxB = Math.max(60, processed.maxBound);
+        const minB = Math.min(-60, minBound);
+        const maxB = Math.max(60, maxBound);
         const nextSpan = Math.min(maxB - minB, Math.max(20, pinchRef.current.startSpan * scale));
         const nextStart = pinchRef.current.anchorTime - midRatio * nextSpan;
         const nextEnd = nextStart + nextSpan;
-        setViewWindow(clampViewport(nextStart, nextEnd));
+        setViewWindow(clampFn(nextStart, nextEnd));
         setActivePreset(null);
       } else if (e.touches.length === 1 && !pinchRef.current.active) {
-        const rect = svgEl.getBoundingClientRect();
-        const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+        const t0 = e.touches[0];
+        const st = singleTouchRef.current;
+        if (st.active) {
+          const totalDx = Math.abs(t0.clientX - st.startX);
+          const totalDy = Math.abs(t0.clientY - st.startY);
+          const dy = t0.clientY - st.lastY;
+          st.lastX = t0.clientX;
+          st.lastY = t0.clientY;
+          if (!st.mode && (totalDx > 5 || totalDy > 5)) {
+            st.mode = totalDy > totalDx * 1.15 ? 'scroll-y' : 'scrub-x';
+          }
+          if (st.mode === 'scroll-y') {
+            window.scrollBy(0, -dy);
+            return;
+          }
+        }
+        if (e.cancelable) e.preventDefault();
+        const { width: w } = layoutRef.current;
+        const rect = getChartRect();
+        const relX = ((t0.clientX - rect.left) / Math.max(1, rect.width)) * w;
         setHoverX(relX);
       }
     };
@@ -605,31 +670,81 @@ export const PremiumTrajectoryChart = ({
     const handleTouchEnd = (e) => {
       if (!e.touches || e.touches.length < 2) {
         pinchRef.current.active = false;
+        pinchRef.current.touchDriven = false;
+      }
+      if (!e.touches || e.touches.length === 0) {
+        singleTouchRef.current.active = false;
+        singleTouchRef.current.mode = null;
       }
     };
 
-    const handleGesture = (e) => {
-      e.preventDefault();
+    const handleGestureStart = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (!pinchRef.current.touchDriven) {
+        const { width: w, padLeft: pl, plotW: pw } = layoutRef.current;
+        const rect = getChartRect();
+        const clientX = typeof e.clientX === 'number' ? e.clientX : rect.left + rect.width * 0.5;
+        const relX = ((clientX - rect.left) / Math.max(1, rect.width)) * w;
+        const midRatio = Math.min(1, Math.max(0, (relX - pl) / Math.max(1, pw)));
+        const curStart = viewWindowRef.current.start;
+        const curEnd = viewWindowRef.current.end;
+        const curSpan = Math.max(20, curEnd - curStart);
+        pinchRef.current = {
+          active: true,
+          touchDriven: false,
+          initialDist: 100,
+          startSpan: curSpan,
+          anchorTime: curStart + midRatio * curSpan,
+          midRatio
+        };
+      }
     };
 
-    svgEl.addEventListener('wheel', handleWheel, { passive: false });
-    svgEl.addEventListener('touchstart', handleTouchStart, { passive: false });
-    svgEl.addEventListener('touchmove', handleTouchMove, { passive: false });
-    svgEl.addEventListener('touchend', handleTouchEnd);
-    svgEl.addEventListener('touchcancel', handleTouchEnd);
-    svgEl.addEventListener('gesturestart', handleGesture, { passive: false });
-    svgEl.addEventListener('gesturechange', handleGesture, { passive: false });
+    const handleGestureChange = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (pinchRef.current.touchDriven) return;
+      const scaleVal = typeof e.scale === 'number' && e.scale > 0.05 ? e.scale : 1;
+      const { minBound, maxBound, clampViewport: clampFn } = layoutRef.current;
+      const minB = Math.min(-60, minBound);
+      const maxB = Math.max(60, maxBound);
+      const nextSpan = Math.min(
+        maxB - minB,
+        Math.max(20, pinchRef.current.startSpan / scaleVal)
+      );
+      const midRatio = pinchRef.current.midRatio ?? 0.5;
+      const nextStart = pinchRef.current.anchorTime - midRatio * nextSpan;
+      const nextEnd = nextStart + nextSpan;
+      setViewWindow(clampFn(nextStart, nextEnd));
+      setActivePreset(null);
+    };
+
+    const handleGestureEnd = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (!pinchRef.current.touchDriven) {
+        pinchRef.current.active = false;
+      }
+    };
+
+    targetEl.addEventListener('wheel', handleWheel, { passive: false });
+    targetEl.addEventListener('touchstart', handleTouchStart, { passive: false });
+    targetEl.addEventListener('touchmove', handleTouchMove, { passive: false });
+    targetEl.addEventListener('touchend', handleTouchEnd);
+    targetEl.addEventListener('touchcancel', handleTouchEnd);
+    targetEl.addEventListener('gesturestart', handleGestureStart, { passive: false });
+    targetEl.addEventListener('gesturechange', handleGestureChange, { passive: false });
+    targetEl.addEventListener('gestureend', handleGestureEnd, { passive: false });
 
     return () => {
-      svgEl.removeEventListener('wheel', handleWheel);
-      svgEl.removeEventListener('touchstart', handleTouchStart);
-      svgEl.removeEventListener('touchmove', handleTouchMove);
-      svgEl.removeEventListener('touchend', handleTouchEnd);
-      svgEl.removeEventListener('touchcancel', handleTouchEnd);
-      svgEl.removeEventListener('gesturestart', handleGesture);
-      svgEl.removeEventListener('gesturechange', handleGesture);
+      targetEl.removeEventListener('wheel', handleWheel);
+      targetEl.removeEventListener('touchstart', handleTouchStart);
+      targetEl.removeEventListener('touchmove', handleTouchMove);
+      targetEl.removeEventListener('touchend', handleTouchEnd);
+      targetEl.removeEventListener('touchcancel', handleTouchEnd);
+      targetEl.removeEventListener('gesturestart', handleGestureStart);
+      targetEl.removeEventListener('gesturechange', handleGestureChange);
+      targetEl.removeEventListener('gestureend', handleGestureEnd);
     };
-  }, [width, plotW, padLeft, processed.minBound, processed.maxBound, clampViewport, isLoadingChart]);
+  }, []);
 
   // Attach window-level mousemove & mouseup listeners for smooth drag-panning
   useEffect(() => {
@@ -1028,7 +1143,16 @@ export const PremiumTrajectoryChart = ({
       </div>
 
       {/* SVG Trajectory Canvas */}
-      <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
+      <div
+        ref={containerRef}
+        style={{
+          position: 'relative',
+          width: '100%',
+          touchAction: 'none',
+          WebkitUserSelect: 'none',
+          userSelect: 'none'
+        }}
+      >
         {isLoadingChart ? (
           <div
             style={{
@@ -1085,7 +1209,9 @@ export const PremiumTrajectoryChart = ({
                 height: `${height}px`,
                 display: 'block',
                 overflow: 'hidden',
-                touchAction: 'pan-y',
+                touchAction: 'none',
+                WebkitUserSelect: 'none',
+                userSelect: 'none',
                 cursor: isDragging ? 'grabbing' : 'grab'
               }}
               onMouseDown={(e) => {

@@ -37,11 +37,21 @@ export const EquityChart = ({
   });
   const pinchRef = useRef({
     active: false,
+    touchDriven: false,
     initialDist: 0,
     startSpan: 0,
     anchorTime: 0,
+    midRatio: 0.5,
   });
-  const activeWindowRef = useRef({ startMs: 0, endMs: 0, minMs: 0, maxMs: 0 });
+  const singleTouchRef = useRef({
+    active: false,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastY: 0,
+    mode: null,
+  });
+  const activeWindowRef = useRef({ startMs: 0, endMs: 0, minMs: 0, maxMs: 0, minSpanMs: 15000 });
   const [containerWidth, setContainerWidth] = useState(720);
 
   useEffect(() => {
@@ -253,12 +263,15 @@ export const EquityChart = ({
 
   // Non-passive wheel zoom + two-finger pinch-to-zoom + single-finger touch tooltip
   useEffect(() => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return;
+    const targetEl = chartContainerRef.current;
+    if (!targetEl) return;
+
+    const getRect = () => (svgRef.current || targetEl).getBoundingClientRect();
 
     const handleWheel = (e) => {
       e.preventDefault();
-      const rect = svgEl.getBoundingClientRect();
+      e.stopPropagation();
+      const rect = getRect();
       if (!rect.width) return;
       const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
@@ -271,39 +284,62 @@ export const EquityChart = ({
       return Math.hypot(dx, dy);
     };
 
+    const initPinch = (t0, t1) => {
+      const rect = getRect();
+      if (!rect.width) return;
+      const dist = Math.max(10, getTouchDist(t0, t1));
+      const midClientX = 0.5 * (t0.clientX + t1.clientX);
+      const midRatio = Math.max(0, Math.min(1, (midClientX - rect.left) / rect.width));
+      const { startMs, endMs } = activeWindowRef.current;
+      const curSpan = Math.max(1000, endMs - startMs);
+      pinchRef.current = {
+        active: true,
+        touchDriven: true,
+        initialDist: dist,
+        startSpan: curSpan,
+        anchorTime: startMs + midRatio * curSpan,
+        midRatio,
+      };
+      singleTouchRef.current.active = false;
+      setHoverRatio(null);
+    };
+
     const handleTouchStart = (e) => {
-      if (e.touches.length === 2) {
-        e.preventDefault();
-        const rect = svgEl.getBoundingClientRect();
-        if (!rect.width) return;
-        const dist = getTouchDist(e.touches[0], e.touches[1]);
-        if (dist < 8) return;
-        const midClientX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-        const midRatio = Math.max(0, Math.min(1, (midClientX - rect.left) / rect.width));
-        const { startMs, endMs } = activeWindowRef.current;
-        const curSpan = Math.max(1000, endMs - startMs);
-        pinchRef.current = {
-          active: true,
-          initialDist: dist,
-          startSpan: curSpan,
-          anchorTime: startMs + midRatio * curSpan,
-        };
-        setHoverRatio(null);
+      if (!e.touches) return;
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
+        e.stopPropagation();
+        initPinch(e.touches[0], e.touches[1]);
       } else if (e.touches.length === 1 && !pinchRef.current.active) {
-        const rect = svgEl.getBoundingClientRect();
+        const t0 = e.touches[0];
+        singleTouchRef.current = {
+          active: true,
+          startX: t0.clientX,
+          startY: t0.clientY,
+          lastX: t0.clientX,
+          lastY: t0.clientY,
+          mode: null,
+        };
+        const rect = getRect();
         if (!rect.width) return;
-        const relX = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
+        const relX = Math.max(0, Math.min(1, (t0.clientX - rect.left) / rect.width));
         setHoverRatio(relX);
       }
     };
 
     const handleTouchMove = (e) => {
-      if (e.touches.length === 2 && pinchRef.current.active) {
-        e.preventDefault();
-        const rect = svgEl.getBoundingClientRect();
+      if (!e.touches) return;
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
+        e.stopPropagation();
+        const t0 = e.touches[0];
+        const t1 = e.touches[1];
+        if (!pinchRef.current.active) {
+          initPinch(t0, t1);
+        }
+        const rect = getRect();
         if (!rect.width) return;
-        const curDist = getTouchDist(e.touches[0], e.touches[1]);
-        if (curDist < 8 || pinchRef.current.initialDist < 8) return;
+        const curDist = Math.max(10, getTouchDist(t0, t1));
 
         const { minMs, maxMs, minSpanMs } = activeWindowRef.current;
         const totalAvailable = Math.max(60000, maxMs - minMs);
@@ -318,7 +354,7 @@ export const EquityChart = ({
           return;
         }
 
-        const midClientX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midClientX = 0.5 * (t0.clientX + t1.clientX);
         const curMidRatio = Math.max(0, Math.min(1, (midClientX - rect.left) / rect.width));
         let nextStart = pinchRef.current.anchorTime - curMidRatio * nextSpan;
         let nextEnd = nextStart + nextSpan;
@@ -333,39 +369,115 @@ export const EquityChart = ({
         }
         setZoomWindow({ startMs: nextStart, endMs: nextEnd });
       } else if (e.touches.length === 1 && !pinchRef.current.active) {
-        const rect = svgEl.getBoundingClientRect();
+        const t0 = e.touches[0];
+        const st = singleTouchRef.current;
+        if (st.active) {
+          const totalDx = Math.abs(t0.clientX - st.startX);
+          const totalDy = Math.abs(t0.clientY - st.startY);
+          const dy = t0.clientY - st.lastY;
+          st.lastX = t0.clientX;
+          st.lastY = t0.clientY;
+          if (!st.mode && (totalDx > 5 || totalDy > 5)) {
+            st.mode = totalDy > totalDx * 1.15 ? 'scroll-y' : 'scrub-x';
+          }
+          if (st.mode === 'scroll-y') {
+            window.scrollBy(0, -dy);
+            return;
+          }
+        }
+        if (e.cancelable) e.preventDefault();
+        const rect = getRect();
         if (!rect.width) return;
-        const relX = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
+        const relX = Math.max(0, Math.min(1, (t0.clientX - rect.left) / rect.width));
         setHoverRatio(relX);
       }
     };
 
     const handleTouchEnd = (e) => {
-      if (e.touches.length < 2) {
+      if (!e.touches || e.touches.length < 2) {
+        pinchRef.current.active = false;
+        pinchRef.current.touchDriven = false;
+      }
+      if (!e.touches || e.touches.length === 0) {
+        singleTouchRef.current.active = false;
+        singleTouchRef.current.mode = null;
+      }
+    };
+
+    const handleGestureStart = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (!pinchRef.current.touchDriven) {
+        const rect = getRect();
+        const clientX = typeof e.clientX === 'number' ? e.clientX : rect.left + rect.width * 0.5;
+        const midRatio = rect.width
+          ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+          : 0.5;
+        const { startMs, endMs } = activeWindowRef.current;
+        const curSpan = Math.max(1000, endMs - startMs);
+        pinchRef.current = {
+          active: true,
+          touchDriven: false,
+          initialDist: 100,
+          startSpan: curSpan,
+          anchorTime: startMs + midRatio * curSpan,
+          midRatio,
+        };
+      }
+    };
+
+    const handleGestureChange = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (pinchRef.current.touchDriven) return;
+      const scaleVal = typeof e.scale === 'number' && e.scale > 0.05 ? e.scale : 1;
+      const { minMs, maxMs, minSpanMs } = activeWindowRef.current;
+      const totalAvailable = Math.max(60000, maxMs - minMs);
+      const nextSpan = Math.max(
+        minSpanMs,
+        Math.min(totalAvailable, pinchRef.current.startSpan / scaleVal)
+      );
+      if (nextSpan >= totalAvailable * 0.999) {
+        setZoomWindow(null);
+        return;
+      }
+      const midRatio = pinchRef.current.midRatio ?? 0.5;
+      let nextStart = pinchRef.current.anchorTime - midRatio * nextSpan;
+      let nextEnd = nextStart + nextSpan;
+      if (nextStart < minMs) {
+        nextStart = minMs;
+        nextEnd = minMs + nextSpan;
+      }
+      if (nextEnd > maxMs) {
+        nextEnd = maxMs;
+        nextStart = Math.max(minMs, maxMs - nextSpan);
+      }
+      setZoomWindow({ startMs: nextStart, endMs: nextEnd });
+    };
+
+    const handleGestureEnd = (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (!pinchRef.current.touchDriven) {
         pinchRef.current.active = false;
       }
     };
 
-    const handleGesture = (e) => {
-      e.preventDefault();
-    };
-
-    svgEl.addEventListener('wheel', handleWheel, { passive: false });
-    svgEl.addEventListener('touchstart', handleTouchStart, { passive: false });
-    svgEl.addEventListener('touchmove', handleTouchMove, { passive: false });
-    svgEl.addEventListener('touchend', handleTouchEnd);
-    svgEl.addEventListener('touchcancel', handleTouchEnd);
-    svgEl.addEventListener('gesturestart', handleGesture, { passive: false });
-    svgEl.addEventListener('gesturechange', handleGesture, { passive: false });
+    targetEl.addEventListener('wheel', handleWheel, { passive: false });
+    targetEl.addEventListener('touchstart', handleTouchStart, { passive: false });
+    targetEl.addEventListener('touchmove', handleTouchMove, { passive: false });
+    targetEl.addEventListener('touchend', handleTouchEnd);
+    targetEl.addEventListener('touchcancel', handleTouchEnd);
+    targetEl.addEventListener('gesturestart', handleGestureStart, { passive: false });
+    targetEl.addEventListener('gesturechange', handleGestureChange, { passive: false });
+    targetEl.addEventListener('gestureend', handleGestureEnd, { passive: false });
 
     return () => {
-      svgEl.removeEventListener('wheel', handleWheel);
-      svgEl.removeEventListener('touchstart', handleTouchStart);
-      svgEl.removeEventListener('touchmove', handleTouchMove);
-      svgEl.removeEventListener('touchend', handleTouchEnd);
-      svgEl.removeEventListener('touchcancel', handleTouchEnd);
-      svgEl.removeEventListener('gesturestart', handleGesture);
-      svgEl.removeEventListener('gesturechange', handleGesture);
+      targetEl.removeEventListener('wheel', handleWheel);
+      targetEl.removeEventListener('touchstart', handleTouchStart);
+      targetEl.removeEventListener('touchmove', handleTouchMove);
+      targetEl.removeEventListener('touchend', handleTouchEnd);
+      targetEl.removeEventListener('touchcancel', handleTouchEnd);
+      targetEl.removeEventListener('gesturestart', handleGestureStart);
+      targetEl.removeEventListener('gesturechange', handleGestureChange);
+      targetEl.removeEventListener('gestureend', handleGestureEnd);
     };
   }, []);
 
@@ -456,7 +568,7 @@ export const EquityChart = ({
     const height = 195;
     const padX = 8;
     const padTop = 18;
-    const padBottom = 14;
+    const padBottom = 22;
     const usableW = width - padX * 2;
     const usableH = height - padTop - padBottom;
     const bottomY = padTop + usableH;
@@ -499,7 +611,24 @@ export const EquityChart = ({
       { value: 0, y: bottomY },
     ];
 
-    return { width, height, padX, bottomY, coords, linePath, areaPath, yTicks, toX, toY };
+    const tickRatios = width < 420 ? [0.18, 0.5, 0.82] : [0.15, 0.38, 0.62, 0.85];
+    const showDate = timeSpan > 26 * 3600 * 1000;
+    const showSeconds = timeSpan < 10 * 60 * 1000;
+    const xTicks = tickRatios.map((r) => {
+      const tMs = winStartMs + r * timeSpan;
+      const d = new Date(tMs);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      const label = showDate
+        ? `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`
+        : showSeconds
+          ? `${hh}:${mm}:${ss}`
+          : `${hh}:${mm}`;
+      return { x: padX + r * usableW, ratio: r, label };
+    });
+
+    return { width, height, padX, padTop, bottomY, coords, linePath, areaPath, yTicks, xTicks, toX, toY };
   }, [visibleSeries, containerWidth, winStartMs, winEndMs]);
 
   const strokeColor = isPositive ? '#3b82f6' : '#f43f5e';
@@ -591,7 +720,14 @@ export const EquityChart = ({
       {/* Interactive Coinbase-Style Glowing SVG Area Chart */}
       <div
         ref={chartContainerRef}
-        style={{ position: 'relative', width: '100%', height: '195px' }}
+        style={{
+          position: 'relative',
+          width: '100%',
+          height: '195px',
+          touchAction: 'none',
+          WebkitUserSelect: 'none',
+          userSelect: 'none',
+        }}
         onMouseLeave={() => setHoverRatio(null)}
       >
         <svg
@@ -604,8 +740,9 @@ export const EquityChart = ({
             overflow: 'visible',
             display: 'block',
             cursor: isDragging ? 'grabbing' : 'crosshair',
+            WebkitUserSelect: 'none',
             userSelect: 'none',
-            touchAction: 'pan-y',
+            touchAction: 'none',
           }}
           data-testid="equity-area-chart"
           onMouseDown={(e) => {
@@ -654,6 +791,20 @@ export const EquityChart = ({
             fill="url(#coinbaseDotGrid)"
           />
 
+          {/* Vertical X-Axis Time Guide Lines */}
+          {svgGeometry.xTicks.map((xt, idx) => (
+            <line
+              key={`xt-${idx}`}
+              x1={xt.x}
+              y1={svgGeometry.padTop}
+              x2={xt.x}
+              y2={svgGeometry.bottomY}
+              stroke="rgba(148, 163, 184, 0.08)"
+              strokeDasharray="3 3"
+              strokeWidth="1"
+            />
+          ))}
+
           {/* Horizontal Y-Axis Guide Lines (Peak, Mid, and 0 at bottom) */}
           {svgGeometry.yTicks.map((tick, idx) => (
             <line
@@ -683,7 +834,7 @@ export const EquityChart = ({
               x1={hoveredCoord.x}
               y1={0}
               x2={hoveredCoord.x}
-              y2={svgGeometry.height}
+              y2={svgGeometry.bottomY}
               stroke="rgba(148, 163, 184, 0.35)"
               strokeDasharray="3 3"
               strokeWidth="1.2"
@@ -732,6 +883,26 @@ export const EquityChart = ({
           </div>
         ))}
 
+        {/* Crisp X-Axis Time Labels along bottom */}
+        {svgGeometry.xTicks.map((xt, idx) => (
+          <div
+            key={`xt-lbl-${idx}`}
+            className="mono"
+            style={{
+              position: 'absolute',
+              left: `${(xt.x / svgGeometry.width) * 100}%`,
+              bottom: '1px',
+              transform: 'translateX(-50%)',
+              fontSize: '10px',
+              color: 'rgba(148, 163, 184, 0.72)',
+              pointerEvents: 'none',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {xt.label}
+          </div>
+        ))}
+
         {hoveredCoord && hoveredCoord.pt?.timestamp && (
           <div
             className="mono"
@@ -756,24 +927,62 @@ export const EquityChart = ({
         )}
       </div>
 
-      {/* Coinbase-Style Timeframe Selector Bar */}
-      <div className="timeframe-tabs" role="tablist" aria-label="Chart Timeframe">
-        {TIMEFRAMES.map((tf) => (
+      {/* Coinbase-Style Timeframe Selector Bar + Zoom Controls */}
+      <div
+        className="timeframe-tabs"
+        role="tablist"
+        aria-label="Chart Timeframe"
+        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+          {TIMEFRAMES.map((tf) => (
+            <button
+              key={tf}
+              type="button"
+              role="tab"
+              aria-selected={range === tf}
+              data-testid={`timeframe-tab-${tf}`}
+              className={`timeframe-tab mono ${range === tf && !zoomWindow ? 'active' : ''}`}
+              onClick={() => {
+                setRange(tf);
+                setZoomWindow(null);
+              }}
+            >
+              {tf}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <button
-            key={tf}
             type="button"
-            role="tab"
-            aria-selected={range === tf}
-            data-testid={`timeframe-tab-${tf}`}
-            className={`timeframe-tab mono ${range === tf ? 'active' : ''}`}
-            onClick={() => {
-              setRange(tf);
-              setZoomWindow(null);
-            }}
+            className="timeframe-tab mono"
+            onClick={() => applyZoomFactor(0.7, 0.5)}
+            title={lang === 'ko' ? '확대' : 'Zoom In'}
+            style={{ padding: '4px 9px', fontWeight: 700 }}
           >
-            {tf}
+            +
           </button>
-        ))}
+          <button
+            type="button"
+            className="timeframe-tab mono"
+            onClick={() => applyZoomFactor(1.4, 0.5)}
+            title={lang === 'ko' ? '축소' : 'Zoom Out'}
+            style={{ padding: '4px 9px', fontWeight: 700 }}
+          >
+            −
+          </button>
+          {zoomWindow && (
+            <button
+              type="button"
+              className="timeframe-tab mono"
+              onClick={() => setZoomWindow(null)}
+              style={{ fontSize: '11px', color: 'var(--sky)' }}
+            >
+              {lang === 'ko' ? '초기화' : 'Reset'}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
