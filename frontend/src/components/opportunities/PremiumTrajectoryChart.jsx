@@ -4,9 +4,13 @@ import { apiClient } from '../../services/api';
 const PRESET_OPTIONS = [
   { id: '1H', label: '1H', start: -60, end: 120 },
   { id: '6H', label: '6H', start: -360, end: 480 },
-  { id: '24H', label: '24H', start: -1440, end: 480 }
+  { id: '24H', label: '24H', start: -1440, end: 480 },
+  { id: '7D', label: '7D', start: -10080, end: 480 },
+  { id: '1M', label: '1M', start: -43200, end: 480 },
+  { id: '1Y', label: '1Y', start: -525600, end: 480 }
 ];
 
+const MAX_HISTORY_MINUTES = -525600;
 const chartDataCache = new Map();
 
 const formatOffsetLabel = (mins, lang = 'ko') => {
@@ -17,8 +21,20 @@ const formatOffsetLabel = (mins, lang = 'ko') => {
   if (absM < 60) {
     return lang === 'ko' ? `${sign}${absM}분` : `${sign}${absM}m`;
   }
-  const h = (absM / 60).toFixed(1).replace(/\.0$/, '');
-  return lang === 'ko' ? `${sign}${h}시간` : `${sign}${h}h`;
+  if (absM < 2880) {
+    const h = (absM / 60).toFixed(1).replace(/\.0$/, '');
+    return lang === 'ko' ? `${sign}${h}시간` : `${sign}${h}h`;
+  }
+  if (absM < 86400) {
+    const d = (absM / 1440).toFixed(1).replace(/\.0$/, '');
+    return lang === 'ko' ? `${sign}${d}일` : `${sign}${d}d`;
+  }
+  if (absM < 525600) {
+    const mo = (absM / 43200).toFixed(1).replace(/\.0$/, '');
+    return lang === 'ko' ? `${sign}${mo}개월` : `${sign}${mo}mo`;
+  }
+  const y = (absM / 525600).toFixed(1).replace(/\.0$/, '');
+  return lang === 'ko' ? `${sign}${y}년` : `${sign}${y}y`;
 };
 
 export const PremiumTrajectoryChart = ({
@@ -31,12 +47,24 @@ export const PremiumTrajectoryChart = ({
   simStatus,
   lang = 'ko'
 }) => {
-  const cacheKey = `${baseExchange}:${baseSymbol}:${foreignExchange}:${foreignSymbol}:${viewMode}`;
-  const [chartData, setChartData] = useState(() => chartDataCache.get(cacheKey) || null);
   const [hoverX, setHoverX] = useState(null);
   const [viewWindow, setViewWindow] = useState({ start: -360, end: 480 });
   const [activePreset, setActivePreset] = useState('6H');
   const [isDragging, setIsDragging] = useState(false);
+
+  const requiredDataRange =
+    viewWindow.start >= -1445
+      ? '24H'
+      : viewWindow.start >= -10100
+        ? '7D'
+        : viewWindow.start >= -43300
+          ? '1M'
+          : '1Y';
+  const basePairKey = `${baseExchange}:${baseSymbol}:${foreignExchange}:${foreignSymbol}:${viewMode}`;
+  const cacheKey = `${basePairKey}:${requiredDataRange}`;
+  const [chartData, setChartData] = useState(
+    () => chartDataCache.get(cacheKey) || chartDataCache.get(`${basePairKey}:24H`) || null
+  );
 
   const rootRef = useRef(null);
   const containerRef = useRef(null);
@@ -118,13 +146,15 @@ export const PremiumTrajectoryChart = ({
     };
   }, []);
 
-  const isLoadingChart =
-    !chartData ||
-    Boolean(chartData.is_fallback) ||
-    !Array.isArray(chartData.history) ||
-    chartData.history.length === 0;
+  const activeChartData = chartDataCache.get(cacheKey) || chartData;
 
-  // Always fetch the full 24H history + 8H forecast so the user can freely zoom and pan anywhere
+  const isLoadingChart =
+    !activeChartData ||
+    Boolean(activeChartData.is_fallback) ||
+    !Array.isArray(activeChartData.history) ||
+    activeChartData.history.length === 0;
+
+  // Fetch the active resolution (24H / 7D / 1M / 1Y) and poll for live updates
   useEffect(() => {
     let active = true;
     const cached = chartDataCache.get(cacheKey);
@@ -139,7 +169,7 @@ export const PremiumTrajectoryChart = ({
             base_symbol: baseSymbol,
             foreign_exchange: foreignExchange,
             foreign_symbol: foreignSymbol,
-            range: '24H',
+            range: requiredDataRange,
             mode: viewMode
           }
         });
@@ -154,7 +184,7 @@ export const PremiumTrajectoryChart = ({
           setChartData(res.data);
         }
       } catch {
-        // Keep loading state until valid chart data arrives
+        // Keep current chart state until valid data arrives
       }
     };
 
@@ -173,6 +203,7 @@ export const PremiumTrajectoryChart = ({
     foreignExchange,
     foreignSymbol,
     viewMode,
+    requiredDataRange,
     cacheKey,
     isLoadingChart,
     simStatus?.started_at,
@@ -180,6 +211,45 @@ export const PremiumTrajectoryChart = ({
     simStatus?.ramp_minutes,
     simStatus?.is_ramping
   ]);
+
+  // Background prefetch of multi-resolution levels (24H, 7D, 1M, 1Y) for zero-latency LOD zoom switching
+  useEffect(() => {
+    let active = true;
+    const rangesToPrefetch = ['24H', '7D', '1M', '1Y'];
+    const timer = setTimeout(() => {
+      rangesToPrefetch.forEach(async (rng) => {
+        const key = `${basePairKey}:${rng}`;
+        if (chartDataCache.has(key)) return;
+        try {
+          const res = await apiClient.get('/opportunities/chart', {
+            params: {
+              base_exchange: baseExchange,
+              base_symbol: baseSymbol,
+              foreign_exchange: foreignExchange,
+              foreign_symbol: foreignSymbol,
+              range: rng,
+              mode: viewMode
+            }
+          });
+          if (
+            active &&
+            res.data &&
+            !res.data.is_fallback &&
+            Array.isArray(res.data.history) &&
+            res.data.history.length > 0
+          ) {
+            chartDataCache.set(key, res.data);
+          }
+        } catch {
+          // Ignore background prefetch errors
+        }
+      });
+    }, 300);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [baseExchange, baseSymbol, foreignExchange, foreignSymbol, viewMode, basePairKey]);
 
   const width = Math.max(260, containerWidth);
   const isMobile = width < 560;
@@ -192,9 +262,10 @@ export const PremiumTrajectoryChart = ({
   const plotH = height - padTop - padBottom;
 
   const processed = useMemo(() => {
-    const rawHistory = Array.isArray(chartData?.history) ? chartData.history : [];
-    const rawForecast = Array.isArray(chartData?.forecast) ? chartData.forecast : [];
-    const summary = chartData?.summary || {};
+    const rawHistory = Array.isArray(activeChartData?.history) ? activeChartData.history : [];
+    const rawForecast = Array.isArray(activeChartData?.forecast) ? activeChartData.forecast : [];
+    const summary = activeChartData?.summary || {};
+    const stepMin = Math.max(1, Number(activeChartData?.step_min || 1));
 
     const curPct =
       typeof livePremiumPct === 'number' && !Number.isNaN(livePremiumPct)
@@ -208,7 +279,7 @@ export const PremiumTrajectoryChart = ({
       viewMode === 'PAPER'
         ? simStatus && simStatus.started_at !== undefined
           ? simStatus
-          : chartData?.sim_status
+          : activeChartData?.sim_status
         : null;
     const simEx = String(activeSim?.exchange || 'UPBIT').toUpperCase();
     const simSign =
@@ -246,7 +317,10 @@ export const PremiumTrajectoryChart = ({
     const unoffsetPoints =
       rawHistory.length > 0
         ? rawHistory.map((pt, i) => {
-            const offsetMin = -(rawHistory.length - 1 - i);
+            const offsetMin =
+              pt.offset_min !== undefined
+                ? Number(pt.offset_min)
+                : -(rawHistory.length - 1 - i) * stepMin;
             const rawAct = hasRawBaseline
               ? Number(pt.raw_actual_pct ?? pt.actual_pct ?? curPct)
               : Number(pt.actual_pct ?? curPct);
@@ -273,7 +347,7 @@ export const PremiumTrajectoryChart = ({
             };
           });
 
-    // Smoothly anchor the final 18 minutes of the un-offset past AI trajectory to un-offset rawAct at NOW
+    // Smoothly anchor the final tail of the un-offset past AI trajectory to un-offset rawAct at NOW
     const lastUnoffAct =
       unoffsetPoints.length > 0
         ? unoffsetPoints[unoffsetPoints.length - 1].rawAct
@@ -283,7 +357,7 @@ export const PremiumTrajectoryChart = ({
         ? unoffsetPoints[unoffsetPoints.length - 1].rawPred
         : lastUnoffAct;
     const rawTailDiff = lastUnoffAct - lastUnoffPred;
-    const tailWindow = 18;
+    const tailWindow = Math.max(18, stepMin * 3);
     const smoothedUnoffset = unoffsetPoints.map((pt, idx) => {
       if (idx === unoffsetPoints.length - 1) {
         return { ...pt, rawPredSmoothed: lastUnoffAct };
@@ -451,20 +525,24 @@ export const PremiumTrajectoryChart = ({
     const maxPt = forecast[maxIdx] || forecast[0];
     const minPt = forecast[minIdx] || forecast[0];
 
-    const minBound = history.length > 0 ? history[0].offsetMin : -1440;
+    const minBound = Math.min(
+      MAX_HISTORY_MINUTES,
+      history.length > 0 ? history[0].offsetMin : -1440
+    );
     const maxBound = forecast.length > 0 ? forecast[forecast.length - 1].offsetMin : 480;
 
     // Auto-scale Y-axis to the currently visible [viewWindow.start, viewWindow.end] range
+    const yPadMin = Math.max(5, stepMin * 1.5);
     const visibleVals = [];
     for (let i = 0; i < history.length; i++) {
       const h = history[i];
-      if (h.offsetMin >= viewWindow.start - 5 && h.offsetMin <= viewWindow.end + 5) {
+      if (h.offsetMin >= viewWindow.start - yPadMin && h.offsetMin <= viewWindow.end + yPadMin) {
         visibleVals.push(h.actual_pct, h.ai_past_pred_pct);
       }
     }
     for (let i = 0; i < forecast.length; i++) {
       const f = forecast[i];
-      if (f.offsetMin >= viewWindow.start - 5 && f.offsetMin <= viewWindow.end + 5) {
+      if (f.offsetMin >= viewWindow.start - yPadMin && f.offsetMin <= viewWindow.end + yPadMin) {
         visibleVals.push(f.predicted_pct);
       }
     }
@@ -500,7 +578,7 @@ export const PremiumTrajectoryChart = ({
       mean8hPct: Number(summary.mean_8h_pct ?? curPct)
     };
   }, [
-    chartData,
+    activeChartData,
     livePremiumPct,
     simStatus,
     viewMode,
@@ -922,7 +1000,21 @@ export const PremiumTrajectoryChart = ({
           ? 60
           : viewSpan <= 900
             ? 120
-            : 240;
+            : viewSpan <= 2160
+              ? 240
+              : viewSpan <= 5760
+                ? 720
+                : viewSpan <= 14400
+                  ? 1440
+                  : viewSpan <= 30240
+                    ? 4320
+                    : viewSpan <= 64800
+                      ? 7200
+                      : viewSpan <= 180000
+                        ? 21600
+                        : viewSpan <= 360000
+                          ? 43200
+                          : 86400;
   const xTickStep = isMobile ? baseTickStep * 2 : baseTickStep;
   const firstTick = Math.ceil(viewWindow.start / xTickStep) * xTickStep;
   const xTicks = [];
@@ -1070,7 +1162,7 @@ export const PremiumTrajectoryChart = ({
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: isMobile ? '4px' : '6px',
+            gap: isMobile ? '3px' : '6px',
             flexWrap: 'wrap'
           }}
         >
@@ -1097,9 +1189,9 @@ export const PremiumTrajectoryChart = ({
             }}
             className="btn btn-sm btn-ghost mono"
             style={{
-              padding: isMobile ? '2px 7px' : '2px 8px',
-              fontSize: isMobile ? '12px' : '13px',
-              height: isMobile ? '24px' : '26px'
+              padding: isMobile ? '2px 6px' : '2px 8px',
+              fontSize: isMobile ? '11.5px' : '13px',
+              height: isMobile ? '22px' : '26px'
             }}
           >
             +
@@ -1113,9 +1205,9 @@ export const PremiumTrajectoryChart = ({
             }}
             className="btn btn-sm btn-ghost mono"
             style={{
-              padding: isMobile ? '2px 7px' : '2px 8px',
-              fontSize: isMobile ? '12px' : '13px',
-              height: isMobile ? '24px' : '26px'
+              padding: isMobile ? '2px 6px' : '2px 8px',
+              fontSize: isMobile ? '11.5px' : '13px',
+              height: isMobile ? '22px' : '26px'
             }}
           >
             −
@@ -1131,9 +1223,9 @@ export const PremiumTrajectoryChart = ({
               }}
               className={`btn btn-sm ${activePreset === opt.id ? 'btn-primary' : 'btn-ghost'}`}
               style={{
-                padding: isMobile ? '2px 8px' : '3px 10px',
-                fontSize: isMobile ? '11px' : '12px',
-                height: isMobile ? '24px' : '26px'
+                padding: isMobile ? '2px 6px' : '3px 10px',
+                fontSize: isMobile ? '10.5px' : '12px',
+                height: isMobile ? '22px' : '26px'
               }}
             >
               {opt.label}
@@ -1552,10 +1644,20 @@ export const PremiumTrajectoryChart = ({
                   <>
                     <span style={{ color: 'var(--text-secondary)' }}>
                       {hoveredPoint.timestamp
-                        ? new Date(hoveredPoint.timestamp).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit'
-                          })
+                        ? viewSpan > 86400
+                          ? new Date(hoveredPoint.timestamp).toLocaleDateString(
+                              lang === 'ko' ? 'ko-KR' : 'en-US',
+                              { year: '2-digit', month: '2-digit', day: '2-digit' }
+                            )
+                          : viewSpan > 1500
+                            ? new Date(hoveredPoint.timestamp).toLocaleString(
+                                lang === 'ko' ? 'ko-KR' : 'en-US',
+                                { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }
+                              )
+                            : new Date(hoveredPoint.timestamp).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit'
+                              })
                         : formatOffsetLabel(hoveredPoint.offsetMin, lang)}
                     </span>
                     <span style={{ color: '#38bdf8', fontWeight: 700 }}>

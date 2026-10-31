@@ -483,7 +483,9 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 		foreignSym = "BTC-USD"
 	}
 	rangeParam := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("range")))
-	if rangeParam != "1H" && rangeParam != "6H" && rangeParam != "24H" {
+	switch rangeParam {
+	case "1H", "6H", "24H", "7D", "1M", "1Y":
+	default:
 		rangeParam = "6H"
 	}
 	mode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("mode")))
@@ -492,16 +494,28 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 	}
 
 	maxHistoryPoints := 360
+	stepMin := 1
 	switch rangeParam {
 	case "1H":
 		maxHistoryPoints = 60
+		stepMin = 1
 	case "24H":
 		maxHistoryPoints = 1440
+		stepMin = 1
+	case "7D":
+		maxHistoryPoints = 672
+		stepMin = 15
+	case "1M":
+		maxHistoryPoints = 720
+		stepMin = 60
+	case "1Y":
+		maxHistoryPoints = 365
+		stepMin = 1440
 	}
 
 	var payload map[string]interface{}
 	if s.Redis != nil {
-		if rawBytes, err := s.Redis.GetPremiumChart(r.Context(), baseEx, baseSym, foreignEx, foreignSym); err == nil && len(rawBytes) > 0 {
+		if rawBytes, err := s.Redis.GetPremiumChartByRange(r.Context(), rangeParam, baseEx, baseSym, foreignEx, foreignSym); err == nil && len(rawBytes) > 0 {
 			_ = json.Unmarshal(rawBytes, &payload)
 		}
 	}
@@ -510,10 +524,12 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 		now := time.Now().UTC()
 		history := make([]map[string]interface{}, 0, maxHistoryPoints+1)
 		for i := maxHistoryPoints; i >= 0; i-- {
-			ts := now.Add(-time.Duration(i) * time.Minute)
+			offMin := -i * stepMin
+			ts := now.Add(time.Duration(offMin) * time.Minute)
 			history = append(history, map[string]interface{}{
 				"timestamp":        ts.Format(time.RFC3339),
 				"minute_bucket":    ts.Unix() / 60,
+				"offset_min":       offMin,
 				"actual_pct":       0.25,
 				"ai_past_pred_pct": 0.25,
 				"pred_1h_pct":      0.25,
@@ -537,6 +553,7 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 			"foreign_exchange": foreignEx,
 			"foreign_symbol":   foreignSym,
 			"range":            rangeParam,
+			"step_min":         stepMin,
 			"is_fallback":      true,
 			"summary": map[string]interface{}{
 				"current_pct":           0.25,
@@ -556,21 +573,31 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 		}
 	} else {
 		payload["range"] = rangeParam
+		payloadStepMin := stepMin
+		if sm, ok := payload["step_min"].(float64); ok && sm >= 1 {
+			payloadStepMin = int(sm)
+		} else {
+			payload["step_min"] = stepMin
+		}
 		predKey := "pred_6h_pct"
 		switch rangeParam {
 		case "1H":
 			predKey = "pred_1h_pct"
-		case "24H":
+		case "24H", "7D", "1M", "1Y":
 			predKey = "pred_24h_pct"
 		}
 		if histRaw, ok := payload["history"].([]interface{}); ok {
-			if len(histRaw) > maxHistoryPoints {
+			if (rangeParam == "1H" || rangeParam == "6H" || rangeParam == "24H") && len(histRaw) > maxHistoryPoints {
 				histRaw = histRaw[len(histRaw)-maxHistoryPoints:]
 			}
-			for _, item := range histRaw {
+			nHist := len(histRaw)
+			for idx, item := range histRaw {
 				if pt, ok := item.(map[string]interface{}); ok {
 					if v, has := pt[predKey]; has {
 						pt["ai_past_pred_pct"] = v
+					}
+					if _, hasOff := pt["offset_min"]; !hasOff {
+						pt["offset_min"] = -(nHist - 1 - idx) * payloadStepMin
 					}
 				}
 			}
@@ -623,7 +650,13 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 						if !ok {
 							continue
 						}
-						ptSec := nowSec - float64(n-1-i)*60.0
+						offMinFloat := -float64(n-1-i) * float64(stepMin)
+						if om, ok := pt["offset_min"].(float64); ok {
+							offMinFloat = om
+						} else if omInt, ok := pt["offset_min"].(int); ok {
+							offMinFloat = float64(omInt)
+						}
+						ptSec := nowSec + offMinFloat*60.0
 						ptDelta := 0.0
 						if settings.SimStartedAt <= 0 {
 							ptDelta = targetDelta

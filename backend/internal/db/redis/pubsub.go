@@ -327,3 +327,15 @@ func (p *PubSubClient) GetPremiumChart(ctx context.Context, baseEx, baseSym, for
 	key := "market:premium_chart:" + baseEx + ":" + baseSym + ":" + foreignEx + ":" + foreignSym
 	return p.client.Get(ctx, key).Bytes()
 }
+
+// GetPremiumChartByRange retrieves a resolution-specific chart payload (7D, 1M, 1Y) or the default 1m 24H payload.
+func (p *PubSubClient) GetPremiumChartByRange(ctx context.Context, rangeCode, baseEx, baseSym, foreignEx, foreignSym string) ([]byte, error) {
+	rc := rangeCode
+	if rc == "7D" || rc == "1M" || rc == "1Y" {
+		key := "market:premium_chart:" + rc + ":" + baseEx + ":" + baseSym + ":" + foreignEx + ":" + foreignSym
+		if b, err := p.client.Get(ctx, key).Bytes(); err == nil && len(b) > 0 {
+			return b, nil
+		}
+	}
+	return p.GetPremiumChart(ctx, baseEx, baseSym, foreignEx, foreignSym)
+}

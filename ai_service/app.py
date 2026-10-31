@@ -283,6 +283,7 @@ def build_chart_payload(
         history_points.append({
             "timestamp": ts_iso,
             "minute_bucket": mb,
+            "offset_min": -(n_hist - 1 - idx),
             "actual_pct": round(act_spread * 100.0, 4),
             "ai_past_pred_pct": round(p6 * 100.0, 4),
             "pred_1h_pct": round(p1 * 100.0, 4),
@@ -294,6 +295,7 @@ def build_chart_payload(
     if history_points:
         history_points[-1]["actual_pct"] = round(current_spread * 100.0, 4)
         history_points[-1]["timestamp"] = now_dt.isoformat()
+        history_points[-1]["offset_min"] = 0
 
     traj = metrics.get("traj", [])
     pred_len = len(traj)
@@ -331,6 +333,7 @@ def build_chart_payload(
         "base_symbol": pair_key[1],
         "foreign_exchange": pair_key[2],
         "foreign_symbol": pair_key[3],
+        "step_min": 1,
         "updated_at": now_ts,
         "summary": {
             "current_pct": round(current_spread * 100.0, 4),
@@ -348,6 +351,141 @@ def build_chart_payload(
         "history": history_points,
         "forecast": forecast_points,
     }
+
+
+class LongRangeChartManager:
+    """
+    Asynchronously builds and refreshes downsampled multi-resolution chart histories:
+      - 7D: 15-minute buckets (672 points, refreshed every 5m)
+      - 1M: 60-minute buckets (720 points, refreshed every 15m)
+      - 1Y: 1440-minute buckets (365 points, refreshed every 60m)
+    Stores them in Redis under market:premium_chart:{range}:{baseEx}:{baseSym}:{foreignEx}:{foreignSym}.
+    """
+
+    REFRESH_INTERVALS = {
+        "7D": (300.0, 15, 7200),
+        "1M": (900.0, 60, 14400),
+        "1Y": (3600.0, 1440, 28800),
+    }
+
+    def __init__(self, fetcher: MarketDataFetcher, r_client):
+        self.fetcher = fetcher
+        self.r = r_client
+        self.lock = threading.Lock()
+        self.cached_histories = {}  # (pair_key, range_code) -> {"points": list, "step_min": int, "fetched_at": float}
+        self.inflight = set()
+        self.last_redis_push = {}  # (pair_key, range_code) -> float
+
+    def _build_range_points(self, pair_key: tuple, range_code: str, fx_rate: float):
+        try:
+            if not self.fetcher:
+                return
+            df = self.fetcher.fetch_long_range_spreads(
+                local_exchange=pair_key[0],
+                local_symbol=pair_key[1],
+                foreign_exchange=pair_key[2],
+                foreign_symbol=pair_key[3],
+                range_code=range_code,
+                default_fx=fx_rate,
+            )
+            if df is None or df.empty:
+                return
+
+            spreads = df["exchange_premium_spread"].astype(float).values.astype(np.float32)
+            eq_target = _compute_causal_equilibrium_target(spreads)
+            _, step_min, _ = self.REFRESH_INTERVALS[range_code]
+
+            pts = []
+            for idx, row in df.iterrows():
+                ts_val = row["_time"]
+                ts_iso = (
+                    ts_val.isoformat()
+                    if hasattr(ts_val, "isoformat")
+                    else str(ts_val)
+                )
+                act_pct = round(float(row["exchange_premium_spread"]) * 100.0, 4)
+                pred_pct = round(float(eq_target[idx]) * 100.0, 4)
+                pts.append({
+                    "timestamp": ts_iso,
+                    "minute_bucket": int(row["minute_bucket"]),
+                    "offset_min": int(row["offset_min"]),
+                    "actual_pct": act_pct,
+                    "ai_past_pred_pct": pred_pct,
+                    "pred_1h_pct": pred_pct,
+                    "pred_6h_pct": pred_pct,
+                    "pred_24h_pct": pred_pct,
+                })
+
+            with self.lock:
+                self.cached_histories[(pair_key, range_code)] = {
+                    "points": pts,
+                    "step_min": step_min,
+                    "fetched_at": time.time(),
+                }
+            logger.info(
+                f"[LongRangeChart] Built {range_code} ({step_min}m) history for {pair_key}: {len(pts)} points."
+            )
+        except Exception as e:
+            logger.warning(f"[LongRangeChart] Failed building {range_code} for {pair_key}: {e}")
+        finally:
+            with self.lock:
+                self.inflight.discard((pair_key, range_code))
+
+    def sync_and_publish(self, pair_key: tuple, base_chart_payload: dict, fx_rate: float, now_ts: float):
+        for range_code, (refresh_sec, step_min, ttl_sec) in self.REFRESH_INTERVALS.items():
+            key_tuple = (pair_key, range_code)
+            with self.lock:
+                entry = self.cached_histories.get(key_tuple)
+                needs_fetch = (
+                    entry is None or (now_ts - entry["fetched_at"] >= refresh_sec)
+                ) and (key_tuple not in self.inflight)
+                if needs_fetch:
+                    self.inflight.add(key_tuple)
+
+            if needs_fetch:
+                t = threading.Thread(
+                    target=self._build_range_points,
+                    args=(pair_key, range_code, fx_rate),
+                    daemon=True,
+                )
+                t.start()
+
+            with self.lock:
+                entry = self.cached_histories.get(key_tuple)
+
+            if not entry or not entry.get("points"):
+                continue
+
+            last_push = self.last_redis_push.get(key_tuple, 0.0)
+            if now_ts - last_push < 6.0 and last_push >= entry["fetched_at"]:
+                continue
+
+            pts_copy = [dict(p) for p in entry["points"]]
+            if pts_copy and base_chart_payload.get("history"):
+                live_tail = base_chart_payload["history"][-1]
+                pts_copy[-1]["actual_pct"] = live_tail["actual_pct"]
+                pts_copy[-1]["ai_past_pred_pct"] = live_tail["actual_pct"]
+                pts_copy[-1]["timestamp"] = live_tail["timestamp"]
+                pts_copy[-1]["offset_min"] = 0
+
+            range_payload = {
+                "base_exchange": pair_key[0],
+                "base_symbol": pair_key[1],
+                "foreign_exchange": pair_key[2],
+                "foreign_symbol": pair_key[3],
+                "range": range_code,
+                "step_min": step_min,
+                "updated_at": now_ts,
+                "summary": base_chart_payload.get("summary", {}),
+                "history": pts_copy,
+                "forecast": base_chart_payload.get("forecast", []),
+            }
+            redis_key = f"market:premium_chart:{range_code}:{pair_key[0]}:{pair_key[1]}:{pair_key[2]}:{pair_key[3]}"
+            try:
+                self.r.set(redis_key, json.dumps(range_payload), ex=ttl_sec)
+                self.last_redis_push[key_tuple] = now_ts
+            except Exception as e:
+                logger.warning(f"Failed writing {redis_key} to Redis: {e}")
 
 
 def run_daemon():
@@ -372,6 +510,7 @@ def run_daemon():
     fetcher = None
     if INFLUX_TOKEN:
         fetcher = MarketDataFetcher(url=INFLUX_URL, token=INFLUX_TOKEN, org=ORG, bucket=BUCKET)
+    long_range_mgr = LongRangeChartManager(fetcher=fetcher, r_client=r)
 
     pubsub = r.pubsub()
     pubsub.subscribe("broadcast:opportunities:raw")
@@ -595,6 +734,8 @@ def run_daemon():
                         last_chart_publish[pair_key] = now_ts
                     except Exception as e:
                         logger.warning(f"Failed to write chart payload to Redis: {e}")
+
+                    long_range_mgr.sync_and_publish(pair_key, chart_payload, fx_rate, now_ts)
 
                 # Compute rolling features on 1-minute steps (60 = 1h, 1440 = 24h)
                 context_df["sma_1h"] = context_df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
