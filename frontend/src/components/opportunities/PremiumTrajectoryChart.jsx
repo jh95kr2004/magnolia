@@ -38,9 +38,13 @@ export const PremiumTrajectoryChart = ({
   const [activePreset, setActivePreset] = useState('6H');
   const [isDragging, setIsDragging] = useState(false);
 
+  const rootRef = useRef(null);
   const containerRef = useRef(null);
   const svgRef = useRef(null);
-  const [containerWidth, setContainerWidth] = useState(1240);
+  const [stickyWrapWidth, setStickyWrapWidth] = useState(null);
+  const [containerWidth, setContainerWidth] = useState(() =>
+    typeof window !== 'undefined' ? Math.max(280, Math.min(1240, window.innerWidth - 36)) : 1240
+  );
   const dragRef = useRef({
     active: false,
     startClientX: 0,
@@ -49,10 +53,19 @@ export const PremiumTrajectoryChart = ({
   });
 
   useEffect(() => {
+    const rootEl = rootRef.current;
     const el = containerRef.current;
-    if (!el) return;
+    if (!el && !rootEl) return;
+
+    const scrollWrap = rootEl?.closest('.table-wrap') || el?.closest('.table-wrap');
+
     const measure = () => {
-      if (el.clientWidth && el.clientWidth > 200) {
+      const wrapW = scrollWrap?.clientWidth || rootEl?.parentElement?.clientWidth || window.innerWidth;
+      if (wrapW && wrapW > 200) {
+        setStickyWrapWidth(wrapW);
+        const horizPad = wrapW < 560 ? 20 : 24;
+        setContainerWidth(Math.max(260, wrapW - horizPad));
+      } else if (el?.clientWidth && el.clientWidth > 200) {
         setContainerWidth(el.clientWidth);
       }
     };
@@ -60,7 +73,9 @@ export const PremiumTrajectoryChart = ({
     let ro = null;
     if (typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(measure);
-      ro.observe(el);
+      if (scrollWrap) ro.observe(scrollWrap);
+      if (rootEl) ro.observe(rootEl);
+      if (el) ro.observe(el);
     }
     window.addEventListener('resize', measure);
     return () => {
@@ -132,12 +147,13 @@ export const PremiumTrajectoryChart = ({
     simStatus?.is_ramping
   ]);
 
-  const width = Math.max(640, containerWidth);
-  const height = 246;
-  const padLeft = 48;
-  const padRight = 12;
-  const padTop = 26;
-  const padBottom = 32;
+  const width = Math.max(260, containerWidth);
+  const isMobile = width < 560;
+  const height = isMobile ? 216 : 246;
+  const padLeft = isMobile ? 42 : 48;
+  const padRight = isMobile ? 8 : 12;
+  const padTop = isMobile ? 24 : 26;
+  const padBottom = isMobile ? 26 : 32;
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
@@ -680,8 +696,8 @@ export const PremiumTrajectoryChart = ({
     processed.minVal + (processed.maxVal - processed.minVal) * 0.12
   ];
 
-  // Dynamic X-axis time grid ticks based on current zoom span
-  const xTickStep =
+  // Dynamic X-axis time grid ticks based on current zoom span & mobile width
+  const baseTickStep =
     viewSpan <= 60
       ? 10
       : viewSpan <= 180
@@ -691,6 +707,7 @@ export const PremiumTrajectoryChart = ({
           : viewSpan <= 900
             ? 120
             : 240;
+  const xTickStep = isMobile ? baseTickStep * 2 : baseTickStep;
   const firstTick = Math.ceil(viewWindow.start / xTickStep) * xTickStep;
   const xTicks = [];
   for (let m = firstTick; m <= viewWindow.end; m += xTickStep) {
@@ -701,9 +718,15 @@ export const PremiumTrajectoryChart = ({
 
   return (
     <div
+      ref={rootRef}
       data-testid="premium-trajectory-chart"
       style={{
-        padding: '14px 12px',
+        position: 'sticky',
+        left: 0,
+        width: stickyWrapWidth ? `${stickyWrapWidth}px` : '100%',
+        maxWidth: stickyWrapWidth ? `${stickyWrapWidth}px` : '100%',
+        boxSizing: 'border-box',
+        padding: isMobile ? '10px 10px' : '14px 12px',
         background: 'rgba(15, 23, 42, 0.72)',
         borderTop: '1px solid rgba(148, 163, 184, 0.14)',
         borderBottom: '1px solid rgba(148, 163, 184, 0.14)',
@@ -717,88 +740,137 @@ export const PremiumTrajectoryChart = ({
           alignItems: 'center',
           justifyContent: 'space-between',
           flexWrap: 'wrap',
-          gap: '12px',
-          marginBottom: '10px'
+          gap: isMobile ? '8px' : '12px',
+          marginBottom: isMobile ? '8px' : '10px'
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
-          <div style={{ fontWeight: 700, fontSize: '14px', color: 'var(--text-primary)' }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: isMobile ? '8px' : '16px',
+            width: isMobile ? '100%' : 'auto',
+            justifyContent: isMobile ? 'space-between' : 'flex-start'
+          }}
+        >
+          <div
+            style={{
+              fontWeight: 700,
+              fontSize: isMobile ? '13px' : '14px',
+              color: 'var(--text-primary)'
+            }}
+          >
             {baseSymbol.split('-')[0]} ({baseExchange} ↔ {foreignExchange}){' '}
-            {lang === 'ko'
-              ? '실제 프리미엄 추이 & AI 8시간 예측 궤적'
-              : 'Historical Spread & 8H AI Forecast Trajectory'}
+            {!isMobile &&
+              (lang === 'ko'
+                ? '실제 프리미엄 추이 & AI 8시간 예측 궤적'
+                : 'Historical Spread & 8H AI Forecast Trajectory')}
           </div>
 
           {/* Legend Items */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '14px', fontSize: '12px' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: isMobile ? '10px' : '14px',
+              fontSize: isMobile ? '11px' : '12px'
+            }}
+          >
             <span
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#38bdf8' }}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#38bdf8' }}
             >
               <span
                 style={{
-                  width: '14px',
+                  width: isMobile ? '10px' : '14px',
                   height: '2.5px',
                   background: '#38bdf8',
                   display: 'inline-block',
                   borderRadius: '2px'
                 }}
               />
-              {lang === 'ko' ? '실제 과거 프리미엄' : 'Actual Spread'}
+              {lang === 'ko'
+                ? isMobile
+                  ? '과거 실제'
+                  : '실제 과거 프리미엄'
+                : isMobile
+                  ? 'Actual'
+                  : 'Actual Spread'}
             </span>
 
             <span
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: '6px',
+                gap: '5px',
                 color: 'rgba(192, 132, 252, 0.85)'
               }}
             >
               <span
                 style={{
-                  width: '14px',
+                  width: isMobile ? '10px' : '14px',
                   borderTop: '2px dashed rgba(192, 132, 252, 0.75)',
                   display: 'inline-block'
                 }}
               />
               {lang === 'ko'
-                ? '과거 AI 예측 (연속 추세·수렴 궤적)'
-                : 'Past AI Forecast (Continuous Equilibrium Trajectory)'}
+                ? isMobile
+                  ? '과거 AI 예측'
+                  : '과거 AI 예측 (연속 추세·수렴 궤적)'
+                : isMobile
+                  ? 'Past AI'
+                  : 'Past AI Forecast (Continuous Equilibrium Trajectory)'}
             </span>
 
             <span
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: '6px',
+                gap: '5px',
                 color: forecastColor
               }}
             >
               <span
                 style={{
-                  width: '14px',
+                  width: isMobile ? '10px' : '14px',
                   borderTop: `2.5px dashed ${forecastColor}`,
                   display: 'inline-block'
                 }}
               />
-              {lang === 'ko' ? '향후 8시간 AI 예측 궤적' : 'Future 8H AI Trajectory'}
+              {lang === 'ko'
+                ? isMobile
+                  ? '향후 8H 예측'
+                  : '향후 8시간 AI 예측 궤적'
+                : isMobile
+                  ? '8H Forecast'
+                  : 'Future 8H AI Trajectory'}
             </span>
           </div>
         </div>
 
         {/* Zoom / Pan Hint + Quick Preset Buttons */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-          <span
-            style={{
-              fontSize: '11.5px',
-              color: 'rgba(148, 163, 184, 0.75)',
-              marginRight: '6px'
-            }}
-          >
-            {lang === 'ko'
-              ? '휠: 확대/축소 · 드래그: 이동 · 더블클릭: 초기화'
-              : 'Wheel: Zoom · Drag: Pan · DblClick: Reset'}
-          </span>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: isMobile ? '4px' : '6px',
+            flexWrap: 'wrap'
+          }}
+        >
+          {!isMobile && (
+            <span
+              style={{
+                fontSize: '11.5px',
+                color: 'rgba(148, 163, 184, 0.75)',
+                marginRight: '6px'
+              }}
+            >
+              {lang === 'ko'
+                ? '휠: 확대/축소 · 드래그: 이동 · 더블클릭: 초기화'
+                : 'Wheel: Zoom · Drag: Pan · DblClick: Reset'}
+            </span>
+          )}
 
           <button
             type="button"
@@ -808,7 +880,11 @@ export const PremiumTrajectoryChart = ({
               zoomByButton(0.75);
             }}
             className="btn btn-sm btn-ghost mono"
-            style={{ padding: '2px 8px', fontSize: '13px', height: '26px' }}
+            style={{
+              padding: isMobile ? '2px 7px' : '2px 8px',
+              fontSize: isMobile ? '12px' : '13px',
+              height: isMobile ? '24px' : '26px'
+            }}
           >
             +
           </button>
@@ -820,7 +896,11 @@ export const PremiumTrajectoryChart = ({
               zoomByButton(1.35);
             }}
             className="btn btn-sm btn-ghost mono"
-            style={{ padding: '2px 8px', fontSize: '13px', height: '26px' }}
+            style={{
+              padding: isMobile ? '2px 7px' : '2px 8px',
+              fontSize: isMobile ? '12px' : '13px',
+              height: isMobile ? '24px' : '26px'
+            }}
           >
             −
           </button>
@@ -834,7 +914,11 @@ export const PremiumTrajectoryChart = ({
                 applyPreset(opt);
               }}
               className={`btn btn-sm ${activePreset === opt.id ? 'btn-primary' : 'btn-ghost'}`}
-              style={{ padding: '3px 10px', fontSize: '12px', height: '26px' }}
+              style={{
+                padding: isMobile ? '2px 8px' : '3px 10px',
+                fontSize: isMobile ? '11px' : '12px',
+                height: isMobile ? '24px' : '26px'
+              }}
             >
               {opt.label}
             </button>
@@ -894,366 +978,399 @@ export const PremiumTrajectoryChart = ({
             <svg
               ref={svgRef}
               viewBox={`0 0 ${width} ${height}`}
-          preserveAspectRatio="none"
-          style={{
-            width: '100%',
-            height: `${height}px`,
-            display: 'block',
-            overflow: 'hidden',
-            cursor: isDragging ? 'grabbing' : 'grab'
-          }}
-          onMouseDown={(e) => {
-            if (e.button !== 0) return;
-            e.stopPropagation();
-            dragRef.current = {
-              active: true,
-              startClientX: e.clientX,
-              startViewStart: viewWindow.start,
-              startViewEnd: viewWindow.end
-            };
-            setIsDragging(true);
-          }}
-          onDoubleClick={(e) => {
-            e.stopPropagation();
-            applyPreset(PRESET_OPTIONS[1]); // Reset to default 6H + 8H view
-          }}
-          onMouseLeave={() => setHoverX(null)}
-          onMouseMove={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
-            setHoverX(relX);
-          }}
-        >
-          <defs>
-            <linearGradient id={`actualGrad-${baseSymbol}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.24" />
-              <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.01" />
-            </linearGradient>
-            <linearGradient id={`futGrad-${baseSymbol}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={forecastColor} stopOpacity="0.22" />
-              <stop offset="100%" stopColor={forecastColor} stopOpacity="0.01" />
-            </linearGradient>
-            <clipPath id={clipId}>
-              <rect x={padLeft} y={padTop - 8} width={plotW} height={plotH + 14} />
-            </clipPath>
-          </defs>
+              preserveAspectRatio="none"
+              style={{
+                width: '100%',
+                height: `${height}px`,
+                display: 'block',
+                overflow: 'hidden',
+                cursor: isDragging ? 'grabbing' : 'grab'
+              }}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return;
+                e.stopPropagation();
+                dragRef.current = {
+                  active: true,
+                  startClientX: e.clientX,
+                  startViewStart: viewWindow.start,
+                  startViewEnd: viewWindow.end
+                };
+                setIsDragging(true);
+              }}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                applyPreset(PRESET_OPTIONS[1]); // Reset to default 6H + 8H view
+              }}
+              onMouseLeave={() => setHoverX(null)}
+              onMouseMove={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
+                setHoverX(relX);
+              }}
+              onTouchStart={(e) => {
+                if (!e.touches || e.touches.length === 0) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+                setHoverX(relX);
+              }}
+              onTouchMove={(e) => {
+                if (!e.touches || e.touches.length === 0) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+                setHoverX(relX);
+              }}
+            >
+              <defs>
+                <linearGradient id={`actualGrad-${baseSymbol}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.24" />
+                  <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.01" />
+                </linearGradient>
+                <linearGradient id={`futGrad-${baseSymbol}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={forecastColor} stopOpacity="0.22" />
+                  <stop offset="100%" stopColor={forecastColor} stopOpacity="0.01" />
+                </linearGradient>
+                <clipPath id={clipId}>
+                  <rect x={padLeft} y={padTop - 8} width={plotW} height={plotH + 14} />
+                </clipPath>
+              </defs>
 
-          {/* Future 8H Shaded Zone Tint */}
-          {futZoneWidth > 0 && (
-            <rect
-              x={futZoneLeft}
-              y={padTop}
-              width={futZoneWidth}
-              height={plotH}
-              fill="rgba(30, 41, 59, 0.38)"
-              rx="4"
-            />
-          )}
+              {/* Future 8H Shaded Zone Tint */}
+              {futZoneWidth > 0 && (
+                <rect
+                  x={futZoneLeft}
+                  y={padTop}
+                  width={futZoneWidth}
+                  height={plotH}
+                  fill="rgba(30, 41, 59, 0.38)"
+                  rx="4"
+                />
+              )}
 
-          {/* Horizontal Grid Lines & Y-Axis Labels */}
-          {yTicks.map((val, idx) => {
-            const y = toY(val);
-            return (
-              <g key={idx}>
+              {/* Horizontal Grid Lines & Y-Axis Labels */}
+              {yTicks.map((val, idx) => {
+                const y = toY(val);
+                return (
+                  <g key={idx}>
+                    <line
+                      x1={padLeft}
+                      y1={y}
+                      x2={width - padRight}
+                      y2={y}
+                      stroke="rgba(148, 163, 184, 0.12)"
+                      strokeDasharray="3 3"
+                    />
+                    <text
+                      x={padLeft - (isMobile ? 5 : 8)}
+                      y={y + 4}
+                      textAnchor="end"
+                      fill={
+                        Math.abs(val) < 1e-4
+                          ? 'rgba(226, 232, 240, 0.9)'
+                          : 'rgba(148, 163, 184, 0.75)'
+                      }
+                      fontWeight={Math.abs(val) < 1e-4 ? '600' : '400'}
+                      fontSize={isMobile ? '9.5' : '11'}
+                      fontFamily="monospace"
+                    >
+                      {val > 1e-4 ? '+' : ''}
+                      {Math.abs(val) < 1e-4 ? '0.00' : val.toFixed(2)}%
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* Vertical X-Axis Time Grid & Labels */}
+              {xTicks.map((m) => {
+                const x = toX(m);
+                if (x < padLeft + 16 || x > width - padRight - 16) return null;
+                return (
+                  <g key={m}>
+                    <line
+                      x1={x}
+                      y1={padTop}
+                      x2={x}
+                      y2={padTop + plotH}
+                      stroke="rgba(148, 163, 184, 0.07)"
+                    />
+                    <text
+                      x={x}
+                      y={height - (isMobile ? 6 : 8)}
+                      textAnchor="middle"
+                      fill={m === 0 ? '#38bdf8' : 'rgba(148, 163, 184, 0.7)'}
+                      fontWeight={m === 0 ? '700' : '400'}
+                      fontSize={isMobile ? '9.5' : '10.5'}
+                      fontFamily="monospace"
+                    >
+                      {formatOffsetLabel(m, lang)}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* 0.00% Parity Baseline */}
+              {zeroY >= padTop && zeroY <= padTop + plotH && (
                 <line
                   x1={padLeft}
-                  y1={y}
+                  y1={zeroY}
                   x2={width - padRight}
-                  y2={y}
-                  stroke="rgba(148, 163, 184, 0.12)"
-                  strokeDasharray="3 3"
+                  y2={zeroY}
+                  stroke="rgba(255, 255, 255, 0.18)"
+                  strokeWidth="1"
                 />
-                <text
-                  x={padLeft - 8}
-                  y={y + 4}
-                  textAnchor="end"
-                  fill={Math.abs(val) < 1e-4 ? 'rgba(226, 232, 240, 0.9)' : 'rgba(148, 163, 184, 0.75)'}
-                  fontWeight={Math.abs(val) < 1e-4 ? '600' : '400'}
-                  fontSize="11"
-                  fontFamily="monospace"
-                >
-                  {val > 1e-4 ? '+' : ''}
-                  {Math.abs(val) < 1e-4 ? '0.00' : val.toFixed(2)}%
-                </text>
+              )}
+
+              {/* Clipped Plot Curves & Markers */}
+              <g clipPath={`url(#${clipId})`}>
+                {actualAreaPath && (
+                  <path d={actualAreaPath} fill={`url(#actualGrad-${baseSymbol})`} />
+                )}
+                {futureAreaPath && (
+                  <path d={futureAreaPath} fill={`url(#futGrad-${baseSymbol})`} />
+                )}
+
+                {/* 1. Dimmed Past AI Prediction Line */}
+                {pastAiPath && (
+                  <path
+                    d={pastAiPath}
+                    fill="none"
+                    stroke="rgba(192, 132, 252, 0.68)"
+                    strokeWidth="1.9"
+                    strokeDasharray="4 4"
+                  />
+                )}
+
+                {/* 2. Solid Vivid Actual Past Premium Line */}
+                {actualPath && (
+                  <path
+                    d={actualPath}
+                    fill="none"
+                    stroke="#38bdf8"
+                    strokeWidth={isMobile ? '2.0' : '2.4'}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                )}
+
+                {/* 3. Future 8H AI Forecast Trajectory Curve */}
+                {futureAiPath && (
+                  <path
+                    d={futureAiPath}
+                    fill="none"
+                    stroke={forecastColor}
+                    strokeWidth={isMobile ? '2.1' : '2.5'}
+                    strokeDasharray="6 4"
+                    strokeLinecap="round"
+                  />
+                )}
+
+                {/* 4. NOW Vertical Divider Line */}
+                {nowVisible && (
+                  <>
+                    <line
+                      x1={nowX}
+                      y1={padTop - 8}
+                      x2={nowX}
+                      y2={padTop + plotH}
+                      stroke="rgba(226, 232, 240, 0.45)"
+                      strokeWidth="1.5"
+                      strokeDasharray="4 3"
+                    />
+                    <circle
+                      cx={nowX}
+                      cy={nowY}
+                      r={isMobile ? '4' : '4.5'}
+                      fill="#38bdf8"
+                      stroke="#0f172a"
+                      strokeWidth="2"
+                    />
+                  </>
+                )}
+
+                {/* 5. Future 8H MAX & MIN Inflection Markers */}
+                {maxFutCoord &&
+                  maxFutCoord.x >= padLeft &&
+                  maxFutCoord.x <= width - padRight && (
+                    <g>
+                      <circle
+                        cx={maxFutCoord.x}
+                        cy={maxFutCoord.yPred}
+                        r={isMobile ? '3.5' : '4'}
+                        fill="#10b981"
+                        stroke="#0f172a"
+                        strokeWidth="1.5"
+                      />
+                      <text
+                        x={Math.min(
+                          width - padRight - (isMobile ? 54 : 65),
+                          Math.max(padLeft + (isMobile ? 54 : 65), maxFutCoord.x)
+                        )}
+                        y={Math.max(padTop + 14, maxFutCoord.yPred - 8)}
+                        textAnchor="middle"
+                        fill="#10b981"
+                        fontSize={isMobile ? '9.5' : '10.5'}
+                        fontWeight="700"
+                        fontFamily="monospace"
+                      >
+                        MAX {maxFutCoord.predictedPct >= 0 ? '+' : ''}
+                        {maxFutCoord.predictedPct.toFixed(2)}% (
+                        {formatOffsetLabel(maxFutCoord.offsetMin, lang)})
+                      </text>
+                    </g>
+                  )}
+
+                {minFutCoord &&
+                  minFutCoord.x >= padLeft &&
+                  minFutCoord.x <= width - padRight && (
+                    <g>
+                      <circle
+                        cx={minFutCoord.x}
+                        cy={minFutCoord.yPred}
+                        r={isMobile ? '3.5' : '4'}
+                        fill="#f59e0b"
+                        stroke="#0f172a"
+                        strokeWidth="1.5"
+                      />
+                      <text
+                        x={Math.min(
+                          width - padRight - (isMobile ? 54 : 65),
+                          Math.max(padLeft + (isMobile ? 54 : 65), minFutCoord.x)
+                        )}
+                        y={Math.min(padTop + plotH - 4, minFutCoord.yPred + 15)}
+                        textAnchor="middle"
+                        fill="#f59e0b"
+                        fontSize={isMobile ? '9.5' : '10.5'}
+                        fontWeight="700"
+                        fontFamily="monospace"
+                      >
+                        MIN {minFutCoord.predictedPct >= 0 ? '+' : ''}
+                        {minFutCoord.predictedPct.toFixed(2)}% (
+                        {formatOffsetLabel(minFutCoord.offsetMin, lang)})
+                      </text>
+                    </g>
+                  )}
               </g>
-            );
-          })}
 
-          {/* Vertical X-Axis Time Grid & Labels */}
-          {xTicks.map((m) => {
-            const x = toX(m);
-            if (x < padLeft + 18 || x > width - padRight - 18) return null;
-            return (
-              <g key={m}>
-                <line
-                  x1={x}
-                  y1={padTop}
-                  x2={x}
-                  y2={padTop + plotH}
-                  stroke="rgba(148, 163, 184, 0.07)"
-                />
-                <text
-                  x={x}
-                  y={height - 8}
-                  textAnchor="middle"
-                  fill={m === 0 ? '#38bdf8' : 'rgba(148, 163, 184, 0.7)'}
-                  fontWeight={m === 0 ? '700' : '400'}
-                  fontSize="10.5"
-                  fontFamily="monospace"
-                >
-                  {formatOffsetLabel(m, lang)}
-                </text>
-              </g>
-            );
-          })}
-
-          {/* 0.00% Parity Baseline */}
-          {zeroY >= padTop && zeroY <= padTop + plotH && (
-            <line
-              x1={padLeft}
-              y1={zeroY}
-              x2={width - padRight}
-              y2={zeroY}
-              stroke="rgba(255, 255, 255, 0.18)"
-              strokeWidth="1"
-            />
-          )}
-
-          {/* Clipped Plot Curves & Markers */}
-          <g clipPath={`url(#${clipId})`}>
-            {actualAreaPath && (
-              <path d={actualAreaPath} fill={`url(#actualGrad-${baseSymbol})`} />
-            )}
-            {futureAreaPath && (
-              <path d={futureAreaPath} fill={`url(#futGrad-${baseSymbol})`} />
-            )}
-
-            {/* 1. Dimmed Past AI Prediction Line */}
-            {pastAiPath && (
-              <path
-                d={pastAiPath}
-                fill="none"
-                stroke="rgba(192, 132, 252, 0.68)"
-                strokeWidth="1.9"
-                strokeDasharray="4 4"
-              />
-            )}
-
-            {/* 2. Solid Vivid Actual Past Premium Line */}
-            {actualPath && (
-              <path
-                d={actualPath}
-                fill="none"
-                stroke="#38bdf8"
-                strokeWidth="2.4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            )}
-
-            {/* 3. Future 8H AI Forecast Trajectory Curve */}
-            {futureAiPath && (
-              <path
-                d={futureAiPath}
-                fill="none"
-                stroke={forecastColor}
-                strokeWidth="2.5"
-                strokeDasharray="6 4"
-                strokeLinecap="round"
-              />
-            )}
-
-            {/* 4. NOW Vertical Divider Line */}
-            {nowVisible && (
-              <>
-                <line
-                  x1={nowX}
-                  y1={padTop - 8}
-                  x2={nowX}
-                  y2={padTop + plotH}
-                  stroke="rgba(226, 232, 240, 0.45)"
-                  strokeWidth="1.5"
-                  strokeDasharray="4 3"
-                />
-                <circle
-                  cx={nowX}
-                  cy={nowY}
-                  r="4.5"
-                  fill="#38bdf8"
-                  stroke="#0f172a"
-                  strokeWidth="2"
-                />
-              </>
-            )}
-
-            {/* 5. Future 8H MAX & MIN Inflection Markers */}
-            {maxFutCoord &&
-              maxFutCoord.x >= padLeft &&
-              maxFutCoord.x <= width - padRight && (
+              {/* NOW Top Badge (rendered above clipPath when NOW is visible) */}
+              {nowVisible && (
                 <g>
-                  <circle
-                    cx={maxFutCoord.x}
-                    cy={maxFutCoord.yPred}
-                    r="4"
-                    fill="#10b981"
-                    stroke="#0f172a"
-                    strokeWidth="1.5"
+                  <rect
+                    x={Math.min(
+                      width - padRight - (isMobile ? 92 : 108),
+                      Math.max(padLeft, nowX - (isMobile ? 46 : 54))
+                    )}
+                    y={4}
+                    width={isMobile ? 92 : 108}
+                    height={isMobile ? 16 : 18}
+                    rx="8"
+                    fill="rgba(15, 23, 42, 0.92)"
+                    stroke="rgba(56, 189, 248, 0.55)"
                   />
                   <text
-                    x={Math.min(width - padRight - 65, Math.max(padLeft + 65, maxFutCoord.x))}
-                    y={Math.max(padTop + 14, maxFutCoord.yPred - 8)}
+                    x={Math.min(
+                      width - padRight - (isMobile ? 46 : 54),
+                      Math.max(padLeft + (isMobile ? 46 : 54), nowX)
+                    )}
+                    y={isMobile ? 15 : 16}
                     textAnchor="middle"
-                    fill="#10b981"
-                    fontSize="10.5"
+                    fill="#e2e8f0"
+                    fontSize={isMobile ? '9.5' : '10.5'}
                     fontWeight="700"
                     fontFamily="monospace"
                   >
-                    MAX {maxFutCoord.predictedPct >= 0 ? '+' : ''}
-                    {maxFutCoord.predictedPct.toFixed(2)}% (
-                    {formatOffsetLabel(maxFutCoord.offsetMin, lang)})
+                    NOW {processed.curPct >= 0 ? '+' : ''}
+                    {processed.curPct.toFixed(2)}%
                   </text>
                 </g>
               )}
 
-            {minFutCoord &&
-              minFutCoord.x >= padLeft &&
-              minFutCoord.x <= width - padRight && (
+              {/* Hover Crosshair & Active Curve Tracking Dot */}
+              {hoveredPoint && (
                 <g>
-                  <circle
-                    cx={minFutCoord.x}
-                    cy={minFutCoord.yPred}
-                    r="4"
-                    fill="#f59e0b"
-                    stroke="#0f172a"
-                    strokeWidth="1.5"
+                  <line
+                    x1={hoveredPoint.xPos}
+                    y1={padTop}
+                    x2={hoveredPoint.xPos}
+                    y2={padTop + plotH}
+                    stroke="rgba(255, 255, 255, 0.45)"
+                    strokeWidth="1.2"
+                    strokeDasharray="3 3"
                   />
-                  <text
-                    x={Math.min(width - padRight - 65, Math.max(padLeft + 65, minFutCoord.x))}
-                    y={Math.min(padTop + plotH - 4, minFutCoord.yPred + 15)}
-                    textAnchor="middle"
-                    fill="#f59e0b"
-                    fontSize="10.5"
-                    fontWeight="700"
-                    fontFamily="monospace"
-                  >
-                    MIN {minFutCoord.predictedPct >= 0 ? '+' : ''}
-                    {minFutCoord.predictedPct.toFixed(2)}% (
-                    {formatOffsetLabel(minFutCoord.offsetMin, lang)})
-                  </text>
+                  <circle
+                    cx={hoveredPoint.xPos}
+                    cy={hoveredPoint.dotY}
+                    r={isMobile ? '4' : '4.5'}
+                    fill={hoveredPoint.dotColor}
+                    stroke="#0f172a"
+                    strokeWidth="2"
+                  />
                 </g>
               )}
-          </g>
+            </svg>
 
-          {/* NOW Top Badge (rendered above clipPath when NOW is visible) */}
-          {nowVisible && (
-            <g>
-              <rect
-                x={Math.min(width - padRight - 108, Math.max(padLeft, nowX - 54))}
-                y={4}
-                width={108}
-                height={18}
-                rx="9"
-                fill="rgba(15, 23, 42, 0.92)"
-                stroke="rgba(56, 189, 248, 0.55)"
-              />
-              <text
-                x={Math.min(width - padRight - 54, Math.max(padLeft + 54, nowX))}
-                y={16}
-                textAnchor="middle"
-                fill="#e2e8f0"
-                fontSize="10.5"
-                fontWeight="700"
-                fontFamily="monospace"
+            {/* Interactive Hover Tooltip Pill */}
+            {hoveredPoint && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '4px',
+                  left: `${Math.min(
+                    Math.max(6, width - (isMobile ? 210 : 270)),
+                    Math.max(padLeft + 4, hoveredPoint.xPos - (isMobile ? 75 : 95))
+                  )}px`,
+                  maxWidth: `${width - 12}px`,
+                  background: 'rgba(15, 23, 42, 0.94)',
+                  border: '1px solid rgba(148, 163, 184, 0.28)',
+                  borderRadius: '8px',
+                  padding: isMobile ? '4px 8px' : '5px 11px',
+                  fontSize: isMobile ? '11px' : '12px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: isMobile ? '8px' : '12px',
+                  pointerEvents: 'none',
+                  whiteSpace: 'nowrap',
+                  zIndex: 5
+                }}
+                className="mono"
               >
-                NOW {processed.curPct >= 0 ? '+' : ''}
-                {processed.curPct.toFixed(2)}%
-              </text>
-            </g>
-          )}
-
-          {/* Hover Crosshair & Active Curve Tracking Dot */}
-          {hoveredPoint && (
-            <g>
-              <line
-                x1={hoveredPoint.xPos}
-                y1={padTop}
-                x2={hoveredPoint.xPos}
-                y2={padTop + plotH}
-                stroke="rgba(255, 255, 255, 0.45)"
-                strokeWidth="1.2"
-                strokeDasharray="3 3"
-              />
-              <circle
-                cx={hoveredPoint.xPos}
-                cy={hoveredPoint.dotY}
-                r="4.5"
-                fill={hoveredPoint.dotColor}
-                stroke="#0f172a"
-                strokeWidth="2"
-              />
-            </g>
-          )}
-        </svg>
-
-        {/* Interactive Hover Tooltip Pill */}
-        {hoveredPoint && (
-          <div
-            style={{
-              position: 'absolute',
-              top: '6px',
-              left: `${Math.min(
-                Math.max(12, width - 270),
-                Math.max(padLeft + 4, hoveredPoint.xPos - 95)
-              )}px`,
-              background: 'rgba(15, 23, 42, 0.94)',
-              border: '1px solid rgba(148, 163, 184, 0.28)',
-              borderRadius: '8px',
-              padding: '5px 11px',
-              fontSize: '12px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '12px',
-              pointerEvents: 'none',
-              whiteSpace: 'nowrap',
-              zIndex: 5
-            }}
-            className="mono"
-          >
-            {hoveredPoint.zone === 'PAST' ? (
-              <>
-                <span style={{ color: 'var(--text-secondary)' }}>
-                  {hoveredPoint.timestamp
-                    ? new Date(hoveredPoint.timestamp).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit'
-                      })
-                    : formatOffsetLabel(hoveredPoint.offsetMin, lang)}
-                </span>
-                <span style={{ color: '#38bdf8', fontWeight: 700 }}>
-                  {lang === 'ko' ? '실제:' : 'Actual:'}{' '}
-                  {hoveredPoint.actualPct >= 0 ? '+' : ''}
-                  {hoveredPoint.actualPct.toFixed(2)}%
-                </span>
-                <span style={{ color: '#c084fc' }}>
-                  {lang === 'ko' ? 'AI 예측 궤적:' : 'Past AI:'}{' '}
-                  {hoveredPoint.aiPastPct >= 0 ? '+' : ''}
-                  {hoveredPoint.aiPastPct.toFixed(2)}%
-                </span>
-              </>
-            ) : (
-              <>
-                <span style={{ color: 'var(--text-secondary)' }}>
-                  {formatOffsetLabel(hoveredPoint.offsetMin, lang)}
-                </span>
-                <span style={{ color: forecastColor, fontWeight: 700 }}>
-                  {lang === 'ko' ? 'AI 예측:' : 'Forecast:'}{' '}
-                  {hoveredPoint.predictedPct >= 0 ? '+' : ''}
-                  {hoveredPoint.predictedPct.toFixed(2)}%
-                </span>
-              </>
+                {hoveredPoint.zone === 'PAST' ? (
+                  <>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {hoveredPoint.timestamp
+                        ? new Date(hoveredPoint.timestamp).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit'
+                          })
+                        : formatOffsetLabel(hoveredPoint.offsetMin, lang)}
+                    </span>
+                    <span style={{ color: '#38bdf8', fontWeight: 700 }}>
+                      {lang === 'ko' ? '실제:' : 'Actual:'}{' '}
+                      {hoveredPoint.actualPct >= 0 ? '+' : ''}
+                      {hoveredPoint.actualPct.toFixed(2)}%
+                    </span>
+                    <span style={{ color: '#c084fc' }}>
+                      {lang === 'ko'
+                        ? isMobile
+                          ? 'AI:'
+                          : 'AI 예측 궤적:'
+                        : 'Past AI:'}{' '}
+                      {hoveredPoint.aiPastPct >= 0 ? '+' : ''}
+                      {hoveredPoint.aiPastPct.toFixed(2)}%
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {formatOffsetLabel(hoveredPoint.offsetMin, lang)}
+                    </span>
+                    <span style={{ color: forecastColor, fontWeight: 700 }}>
+                      {lang === 'ko' ? 'AI 예측:' : 'Forecast:'}{' '}
+                      {hoveredPoint.predictedPct >= 0 ? '+' : ''}
+                      {hoveredPoint.predictedPct.toFixed(2)}%
+                    </span>
+                  </>
+                )}
+              </div>
             )}
-          </div>
-        )}
           </>
         )}
       </div>
