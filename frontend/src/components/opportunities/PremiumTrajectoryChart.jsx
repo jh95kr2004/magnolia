@@ -57,16 +57,24 @@ export const PremiumTrajectoryChart = ({
     const el = containerRef.current;
     if (!el && !rootEl) return;
 
-    const scrollWrap = rootEl?.closest('.table-wrap') || el?.closest('.table-wrap');
+    const scrollWrap =
+      rootEl?.closest('.table-surface, .table-wrap') ||
+      el?.closest('.table-surface, .table-wrap');
 
     const measure = () => {
-      const wrapW = scrollWrap?.clientWidth || rootEl?.parentElement?.clientWidth || window.innerWidth;
+      const viewportW =
+        typeof document !== 'undefined' && document.documentElement?.clientWidth
+          ? document.documentElement.clientWidth
+          : window.innerWidth;
+      const rawWrapW =
+        scrollWrap?.clientWidth ||
+        rootEl?.closest('.section-block')?.clientWidth ||
+        Math.max(260, viewportW - 32);
+      const wrapW = Math.min(rawWrapW, Math.max(260, viewportW - 24));
       if (wrapW && wrapW > 200) {
         setStickyWrapWidth(wrapW);
         const horizPad = wrapW < 560 ? 20 : 24;
-        setContainerWidth(Math.max(260, wrapW - horizPad));
-      } else if (el?.clientWidth && el.clientWidth > 200) {
-        setContainerWidth(el.clientWidth);
+        setContainerWidth(Math.max(240, wrapW - horizPad));
       }
     };
     measure();
