@@ -51,6 +51,14 @@ export const PremiumTrajectoryChart = ({
     startViewStart: -360,
     startViewEnd: 480
   });
+  const pinchRef = useRef({
+    active: false,
+    initialDist: 0,
+    startSpan: 840,
+    anchorTime: 0
+  });
+  const viewWindowRef = useRef(viewWindow);
+  viewWindowRef.current = viewWindow;
 
   useEffect(() => {
     const rootEl = rootRef.current;
@@ -505,7 +513,7 @@ export const PremiumTrajectoryChart = ({
     [processed.minBound, processed.maxBound]
   );
 
-  // Attach non-passive wheel listener for smooth cursor-centered zoom
+  // Attach non-passive wheel & two-finger touch pinch listeners for smooth zoom
   useEffect(() => {
     const svgEl = svgRef.current;
     if (!svgEl) return;
@@ -532,9 +540,94 @@ export const PremiumTrajectoryChart = ({
       setActivePreset(null);
     };
 
+    const initPinch = (t0, t1) => {
+      const dist = Math.max(12, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+      const midClientX = 0.5 * (t0.clientX + t1.clientX);
+      const rect = svgEl.getBoundingClientRect();
+      const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * width;
+      const midRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+      const curStart = viewWindowRef.current.start;
+      const curEnd = viewWindowRef.current.end;
+      const curSpan = Math.max(20, curEnd - curStart);
+      pinchRef.current = {
+        active: true,
+        initialDist: dist,
+        startSpan: curSpan,
+        anchorTime: curStart + midRatio * curSpan
+      };
+      setHoverX(null);
+    };
+
+    const handleTouchStart = (e) => {
+      if (!e.touches) return;
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        e.stopPropagation();
+        initPinch(e.touches[0], e.touches[1]);
+      } else if (e.touches.length === 1 && !pinchRef.current.active) {
+        const rect = svgEl.getBoundingClientRect();
+        const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+        setHoverX(relX);
+      }
+    };
+
+    const handleTouchMove = (e) => {
+      if (!e.touches) return;
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        e.stopPropagation();
+        const t0 = e.touches[0];
+        const t1 = e.touches[1];
+        if (!pinchRef.current.active) {
+          initPinch(t0, t1);
+        }
+        const curDist = Math.max(12, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+        const midClientX = 0.5 * (t0.clientX + t1.clientX);
+        const rect = svgEl.getBoundingClientRect();
+        const relX = ((midClientX - rect.left) / Math.max(1, rect.width)) * width;
+        const midRatio = Math.min(1, Math.max(0, (relX - padLeft) / Math.max(1, plotW)));
+
+        const scale = pinchRef.current.initialDist / curDist;
+        const minB = Math.min(-60, processed.minBound);
+        const maxB = Math.max(60, processed.maxBound);
+        const nextSpan = Math.min(maxB - minB, Math.max(20, pinchRef.current.startSpan * scale));
+        const nextStart = pinchRef.current.anchorTime - midRatio * nextSpan;
+        const nextEnd = nextStart + nextSpan;
+        setViewWindow(clampViewport(nextStart, nextEnd));
+        setActivePreset(null);
+      } else if (e.touches.length === 1 && !pinchRef.current.active) {
+        const rect = svgEl.getBoundingClientRect();
+        const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
+        setHoverX(relX);
+      }
+    };
+
+    const handleTouchEnd = (e) => {
+      if (!e.touches || e.touches.length < 2) {
+        pinchRef.current.active = false;
+      }
+    };
+
+    const handleGesture = (e) => {
+      e.preventDefault();
+    };
+
     svgEl.addEventListener('wheel', handleWheel, { passive: false });
+    svgEl.addEventListener('touchstart', handleTouchStart, { passive: false });
+    svgEl.addEventListener('touchmove', handleTouchMove, { passive: false });
+    svgEl.addEventListener('touchend', handleTouchEnd);
+    svgEl.addEventListener('touchcancel', handleTouchEnd);
+    svgEl.addEventListener('gesturestart', handleGesture, { passive: false });
+    svgEl.addEventListener('gesturechange', handleGesture, { passive: false });
+
     return () => {
       svgEl.removeEventListener('wheel', handleWheel);
+      svgEl.removeEventListener('touchstart', handleTouchStart);
+      svgEl.removeEventListener('touchmove', handleTouchMove);
+      svgEl.removeEventListener('touchend', handleTouchEnd);
+      svgEl.removeEventListener('touchcancel', handleTouchEnd);
+      svgEl.removeEventListener('gesturestart', handleGesture);
+      svgEl.removeEventListener('gesturechange', handleGesture);
     };
   }, [width, plotW, padLeft, processed.minBound, processed.maxBound, clampViewport, isLoadingChart]);
 
@@ -992,6 +1085,7 @@ export const PremiumTrajectoryChart = ({
                 height: `${height}px`,
                 display: 'block',
                 overflow: 'hidden',
+                touchAction: 'pan-y',
                 cursor: isDragging ? 'grabbing' : 'grab'
               }}
               onMouseDown={(e) => {
@@ -1013,18 +1107,6 @@ export const PremiumTrajectoryChart = ({
               onMouseMove={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * width;
-                setHoverX(relX);
-              }}
-              onTouchStart={(e) => {
-                if (!e.touches || e.touches.length === 0) return;
-                const rect = e.currentTarget.getBoundingClientRect();
-                const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
-                setHoverX(relX);
-              }}
-              onTouchMove={(e) => {
-                if (!e.touches || e.touches.length === 0) return;
-                const rect = e.currentTarget.getBoundingClientRect();
-                const relX = ((e.touches[0].clientX - rect.left) / Math.max(1, rect.width)) * width;
                 setHoverX(relX);
               }}
             >
