@@ -54,6 +54,15 @@ export const Settings = () => {
 
   // 4. Trade History
   const [historyList, setHistoryList] = useState([]);
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= 768
+  );
+
+  useEffect(() => {
+    const onResize = () => setIsMobileViewport(window.innerWidth <= 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   const switchSubTab = (tabName) => {
     setActiveTab(tabName);
@@ -346,6 +355,65 @@ export const Settings = () => {
                     ? '등록된 거래소 API 키가 없습니다. (모의매매는 API 키 없이도 100% 실제 시세로 즉시 작동합니다)'
                     : 'No exchange API keys registered yet. (Paper mode works immediately without API keys)'}
                 </div>
+              </div>
+            ) : isMobileViewport ? (
+              <div className="mobile-card-list">
+                {registeredKeys.map((k) => {
+                  const exName = k.exchange || k.Exchange;
+                  const isActive = k.is_active ?? k.IsActive ?? true;
+                  const access = k.access_key || k.AccessKey || '';
+                  return (
+                    <div key={exName} className="mobile-data-card">
+                      <div className="mobile-card-header">
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="mono" style={{ fontWeight: 700, fontSize: '15px' }}>
+                              {exName}
+                            </span>
+                            <span className={`badge ${isActive ? 'badge-emerald' : 'badge-neutral'}`}>
+                              {isActive
+                                ? lang === 'ko'
+                                  ? '활성화됨'
+                                  : 'Active'
+                                : lang === 'ko'
+                                  ? '비활성화'
+                                  : 'Disabled'}
+                            </span>
+                          </div>
+                          <div
+                            className="mono"
+                            style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}
+                          >
+                            {access ? `${access.slice(0, 6)}••••••` : '••••••••'}
+                          </div>
+                        </div>
+
+                        <div style={{ display: 'inline-flex', gap: '6px' }}>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-ghost"
+                            onClick={() => handleToggleKey(exName, isActive)}
+                          >
+                            {isActive
+                              ? lang === 'ko'
+                                ? '일시 중지'
+                                : 'Disable'
+                              : lang === 'ko'
+                                ? '활성화'
+                                : 'Enable'}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-danger"
+                            onClick={() => handleDeleteKey(exName)}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <table className="clean-table">
@@ -644,6 +712,91 @@ export const Settings = () => {
             {historyList.length === 0 ? (
               <div className="empty-state">
                 <div>{t.settings.noHistory}</div>
+              </div>
+            ) : isMobileViewport ? (
+              <div className="mobile-card-list">
+                {historyList.map((h) => {
+                  const coin = String(h.baseSymbol).split('-')[0];
+                  const isWin = h.realizedPnlUsd >= 0;
+                  return (
+                    <div key={h.id} className="mobile-data-card">
+                      <div className="mobile-card-header">
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="mono" style={{ fontWeight: 700, fontSize: '15px' }}>
+                              {coin}
+                            </span>
+                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                              {h.baseExchange} → {h.foreignExchange}
+                            </span>
+                          </div>
+                          <div
+                            style={{
+                              fontSize: '12px',
+                              color: 'var(--text-secondary)',
+                              marginTop: '3px'
+                            }}
+                          >
+                            {formatStrategyLabel(h.strategy, lang)}
+                          </div>
+                        </div>
+
+                        <div
+                          className="mono"
+                          style={{
+                            fontWeight: 700,
+                            fontSize: '15px',
+                            color: isWin ? 'var(--emerald)' : 'var(--rose)'
+                          }}
+                        >
+                          {isWin ? '+' : ''}${h.realizedPnlUsd.toFixed(2)}
+                        </div>
+                      </div>
+
+                      <div className="mobile-card-grid">
+                        <div className="mobile-card-cell">
+                          <span className="mobile-card-label">
+                            {t.dashboard.colInvested} / {t.dashboard.colEntrySpread}
+                          </span>
+                          <span className="mobile-card-value mono" style={{ fontSize: '12.5px' }}>
+                            ${h.investedUsd.toFixed(2)} · {h.entrySpreadPct >= 0 ? '+' : ''}
+                            {h.entrySpreadPct.toFixed(2)}%
+                          </span>
+                        </div>
+
+                        <div className="mobile-card-cell">
+                          <span className="mobile-card-label">
+                            {t.settings.colOpenedAt} → {t.settings.colClosedAt}
+                          </span>
+                          <span
+                            className="mobile-card-value mono"
+                            style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}
+                          >
+                            {h.openedAt
+                              ? new Date(h.openedAt).toLocaleTimeString([], {
+                                  month: '2-digit',
+                                  day: '2-digit',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit'
+                                })
+                              : '-'}
+                            <br />→{' '}
+                            {h.closedAt
+                              ? new Date(h.closedAt).toLocaleTimeString([], {
+                                  month: '2-digit',
+                                  day: '2-digit',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit'
+                                })
+                              : '-'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <table className="clean-table">

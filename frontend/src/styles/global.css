@@ -586,6 +586,62 @@ button:disabled {
   background: var(--bg-hover);
 }
 
+.mobile-card-list {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.mobile-data-card {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.mobile-data-card:last-child {
+  border-bottom: none;
+}
+
+.mobile-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.mobile-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.mobile-card-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.mobile-card-label {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.mobile-card-value {
+  font-size: 13.5px;
+  color: var(--text-primary);
+  font-weight: 600;
+  word-break: break-word;
+}
+
 .empty-state {
   padding: 56px 24px;
   text-align: center;

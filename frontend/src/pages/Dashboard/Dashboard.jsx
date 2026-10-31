@@ -29,6 +29,15 @@ export const Dashboard = () => {
     exchanges: [],
   });
   const [activePositions, setActivePositions] = useState([]);
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= 768
+  );
+
+  useEffect(() => {
+    const onResize = () => setIsMobileViewport(window.innerWidth <= 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   const mapPositions = (rawList) => {
     if (!Array.isArray(rawList)) return [];
@@ -341,6 +350,93 @@ export const Dashboard = () => {
                 <span>{t.dashboard.goToMarketBtn}</span>
                 <ArrowRight size={15} />
               </button>
+            </div>
+          ) : isMobileViewport ? (
+            <div className="mobile-card-list">
+              {activePositions.map((pos) => {
+                const coin = String(pos.baseSymbol || 'BTC').split('-')[0];
+                const isPosPnl = pos.currentPnlUsd >= 0;
+                return (
+                  <div key={pos.id} className="mobile-data-card">
+                    <div className="mobile-card-header">
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span className="mono" style={{ fontWeight: 700, fontSize: '16px' }}>
+                            {coin}
+                          </span>
+                          <span
+                            className={`badge ${
+                              pos.status === 'TRANSFERRING'
+                                ? 'badge-blue'
+                                : pos.status === 'REPAYING'
+                                  ? 'badge-amber'
+                                  : 'badge-emerald'
+                            }`}
+                            style={{ fontSize: '11.5px', padding: '2px 8px' }}
+                          >
+                            {formatPositionStatus(pos.status, lang)}
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginTop: '3px',
+                          }}
+                        >
+                          {pos.baseExchange} → {pos.foreignExchange}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-danger"
+                        onClick={() => handleClosePosition(pos)}
+                      >
+                        {t.dashboard.closePositionBtn}
+                      </button>
+                    </div>
+
+                    <div className="mobile-card-grid">
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.dashboard.colStrategy}</span>
+                        <span className="mobile-card-value" style={{ fontSize: '12.5px' }}>
+                          {formatStrategyLabel(pos.strategy, lang)}
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.dashboard.colInvested}</span>
+                        <span className="mobile-card-value mono">
+                          {formatMoney(pos.investedUsd)}
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.dashboard.colEntrySpread}</span>
+                        <span className="mobile-card-value mono">
+                          {pos.entrySpreadPct >= 0 ? '+' : ''}
+                          {pos.entrySpreadPct.toFixed(2)}%
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.dashboard.colPnl}</span>
+                        <span
+                          className="mobile-card-value mono"
+                          style={{ color: isPosPnl ? 'var(--emerald)' : 'var(--rose)' }}
+                        >
+                          {formatMoney(pos.currentPnlUsd, { signed: true })}{' '}
+                          <span style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                            ({pos.currentPnlPct >= 0 ? '+' : ''}
+                            {pos.currentPnlPct.toFixed(2)}%)
+                          </span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <table className="clean-table">

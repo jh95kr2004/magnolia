@@ -51,6 +51,15 @@ export const Opportunities = () => {
   });
   const [applyingSim, setApplyingSim] = useState(false);
   const [enteringKey, setEnteringKey] = useState(null);
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= 768
+  );
+
+  useEffect(() => {
+    const onResize = () => setIsMobileViewport(window.innerWidth <= 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   useEffect(() => {
     apiClient
@@ -457,6 +466,165 @@ export const Opportunities = () => {
           {opportunities.length === 0 ? (
             <div className="empty-state">
               <div style={{ fontSize: '15px' }}>{t.market.noOpps}</div>
+            </div>
+          ) : isMobileViewport ? (
+            <div className="mobile-card-list">
+              {opportunities.map((opp) => {
+                const coin = String(opp.baseSymbol).split('-')[0];
+                const isPosSpread = opp.premiumPct >= 0;
+                const isExpanded = expandedCoin === coin;
+                const isWidening = opp.direction === 'WIDENING';
+                const etaText = formatHorizonEta(opp.targetOffsetMin, lang);
+                const dirBadgeText =
+                  lang === 'ko'
+                    ? isWidening
+                      ? `${etaText} 최고`
+                      : `${etaText} 최저`
+                    : isWidening
+                      ? `Peak ${etaText}`
+                      : `Low ${etaText}`;
+
+                return (
+                  <div
+                    key={opp.id}
+                    className="mobile-data-card"
+                    style={{
+                      background: isExpanded ? 'rgba(56, 189, 248, 0.04)' : undefined
+                    }}
+                  >
+                    <div
+                      className="mobile-card-header"
+                      onClick={() => setExpandedCoin(isExpanded ? null : coin)}
+                      style={{ cursor: 'pointer' }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span className="mono" style={{ fontWeight: 700, fontSize: '16px' }}>
+                            {coin}
+                          </span>
+                          {isExpanded ? (
+                            <ChevronUp size={15} style={{ color: 'var(--text-secondary)' }} />
+                          ) : (
+                            <ChevronDown size={15} style={{ color: 'var(--text-secondary)' }} />
+                          )}
+                          <span
+                            className={`badge mono ${
+                              opp.premiumPct >= 1.0
+                                ? 'badge-emerald'
+                                : opp.premiumPct <= -0.5
+                                  ? 'badge-blue'
+                                  : 'badge-neutral'
+                            }`}
+                            style={{ fontSize: '12px', padding: '2px 8px' }}
+                          >
+                            {isPosSpread ? '+' : ''}
+                            {opp.premiumPct.toFixed(2)}%
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginTop: '3px',
+                            wordBreak: 'break-word'
+                          }}
+                        >
+                          {opp.baseExchange} ({opp.baseSymbol}) → {opp.foreignExchange} (
+                          {opp.foreignSymbol})
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={enteringKey === opp.id}
+                        onClick={(e) => handleManualEnter(opp, e)}
+                        className="btn btn-sm btn-ghost"
+                        style={{ flexShrink: 0 }}
+                      >
+                        {t.market.enterBtn}
+                      </button>
+                    </div>
+
+                    <div
+                      className="mobile-card-grid"
+                      onClick={() => setExpandedCoin(isExpanded ? null : coin)}
+                      style={{ cursor: 'pointer' }}
+                    >
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">
+                          {t.market.colBasePrice} / {t.market.colForeignPrice}
+                        </span>
+                        <span className="mobile-card-value mono" style={{ fontSize: '12.5px' }}>
+                          $
+                          {opp.basePriceUsd.toLocaleString(undefined, {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                          })}{' '}
+                          /{' '}
+                          $
+                          {opp.foreignPriceUsd.toLocaleString(undefined, {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                          })}
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.market.colAiForecast}</span>
+                        <span
+                          className="mobile-card-value mono"
+                          style={{
+                            color: isWidening ? '#10b981' : '#f59e0b',
+                            fontSize: '12.5px'
+                          }}
+                        >
+                          {dirBadgeText} {opp.predictedPct >= 0 ? '+' : ''}
+                          {opp.predictedPct.toFixed(2)}%
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.market.colRecommended}</span>
+                        <span className="mobile-card-value" style={{ fontSize: '12.5px' }}>
+                          {formatStrategyLabel(opp.strategy, lang, opp.direction)}
+                        </span>
+                      </div>
+
+                      <div className="mobile-card-cell">
+                        <span className="mobile-card-label">{t.market.colNetMargin}</span>
+                        <span
+                          className="mobile-card-value mono"
+                          style={{
+                            color:
+                              opp.expectedMarginPct > 0.3
+                                ? 'var(--emerald)'
+                                : 'var(--text-secondary)'
+                          }}
+                        >
+                          {opp.expectedMarginPct >= 0 ? '+' : ''}
+                          {opp.expectedMarginPct.toFixed(2)}%
+                        </span>
+                      </div>
+                    </div>
+
+                    {isExpanded && (
+                      <div style={{ margin: '2px -16px -16px -16px' }}>
+                        <PremiumTrajectoryChart
+                          key={opp.id}
+                          baseExchange={opp.baseExchange}
+                          baseSymbol={opp.baseSymbol}
+                          foreignExchange={opp.foreignExchange}
+                          foreignSymbol={opp.foreignSymbol}
+                          viewMode={viewMode}
+                          livePremiumPct={opp.premiumPct}
+                          simStatus={simStatus}
+                          lang={lang}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <table className="clean-table">
