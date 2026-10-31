@@ -121,8 +121,13 @@ export const Dashboard = () => {
     dashboardSrc.addEventListener('positions', (e) => {
       try {
         const data = JSON.parse(e.data);
-        if (data && Array.isArray(data.positions)) {
-          setActivePositions(mapPositions(data.positions));
+        if (data && ('positions' in data || Array.isArray(data))) {
+          const list = Array.isArray(data)
+            ? data
+            : Array.isArray(data.positions)
+              ? data.positions
+              : [];
+          setActivePositions(mapPositions(list));
         }
       } catch {}
     });
@@ -130,13 +135,25 @@ export const Dashboard = () => {
     dashboardSrc.addEventListener('notification', (e) => {
       try {
         const data = JSON.parse(e.data);
-        if (
-          data &&
-          (data.action === 'PAPER_ACCOUNT_RESET' ||
-            data.action === 'POSITION_OPENED' ||
-            data.action === 'POSITION_CLOSED')
-        ) {
+        if (!data) return;
+        if (data.action === 'PAPER_ACCOUNT_RESET') {
+          setActivePositions([]);
           setHistoryRefreshKey((k) => k + 1);
+        } else if (data.action === 'POSITION_CLOSED') {
+          if (data.position_id) {
+            setActivePositions((prev) => prev.filter((p) => p.id !== data.position_id));
+          }
+          setHistoryRefreshKey((k) => k + 1);
+          apiClient
+            .get(`/positions/active?mode=${viewMode}`)
+            .then((res) => setActivePositions(mapPositions(res.data)))
+            .catch(() => {});
+        } else if (data.action === 'POSITION_OPENED') {
+          setHistoryRefreshKey((k) => k + 1);
+          apiClient
+            .get(`/positions/active?mode=${viewMode}`)
+            .then((res) => setActivePositions(mapPositions(res.data)))
+            .catch(() => {});
         }
       } catch {}
     });
@@ -156,14 +173,20 @@ export const Dashboard = () => {
       onConfirm: async () => {
         try {
           await apiClient.delete(`/positions/active/${pos.id}?mode=${viewMode}`);
+          setActivePositions((prev) => prev.filter((p) => p.id !== pos.id));
+          setHistoryRefreshKey((k) => k + 1);
           showToast(
             lang === 'ko'
               ? '포지션 청산 명령이 전송되었습니다.'
               : 'Position close command dispatched.',
             'success'
           );
-          const res = await apiClient.get(`/positions/active?mode=${viewMode}`);
-          setActivePositions(mapPositions(res.data));
+          setTimeout(() => {
+            apiClient
+              .get(`/positions/active?mode=${viewMode}`)
+              .then((res) => setActivePositions(mapPositions(res.data)))
+              .catch(() => {});
+          }, 400);
         } catch (err) {
           showToast(err.response?.data?.error || err.message, 'error');
         }

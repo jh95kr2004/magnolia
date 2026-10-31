@@ -228,7 +228,7 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		OpenedAt           time.Time `json:"OpenedAt"`
 	}
 
-	var enrichedList []enrichedPos
+	enrichedList := make([]enrichedPos, 0, len(positions))
 	for _, p := range positions {
 		livePnL := p.MaxUnrealizedROI * p.InvestmentUSD
 		if posPnLs != nil {

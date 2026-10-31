@@ -1673,7 +1673,7 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 						if targetStrategy != nil && targetPair != nil {
 							log.Printf("⚡ [Manual Force Close] (%s) User %d closing Position %s on %s/%s...",
 								e.ModeString(), e.userID, pos.PositionID, pos.BaseExchange, pos.ForeignExchange)
-							if err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy); err != nil {
+							if err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy); err != nil && !e.isPaper {
 								if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
 									_ = e.db.UpdatePositionStatus(pos.PositionID, "AWAITING_REPAY")
 								}
@@ -1686,6 +1686,10 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 								e.persistPaperState()
 								e.notifyPositionClosed(ctx, pos.PositionID)
 							}
+						} else if e.isPaper {
+							_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+							e.persistPaperState()
+							e.notifyPositionClosed(ctx, pos.PositionID)
 						}
 						break
 					}
