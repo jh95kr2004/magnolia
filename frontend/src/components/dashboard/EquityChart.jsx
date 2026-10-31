@@ -932,9 +932,15 @@ export const EquityChart = ({
         className="timeframe-tabs"
         role="tablist"
         aria-label="Chart Timeframe"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '4px',
+          flexWrap: 'nowrap',
+        }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px', flexWrap: 'nowrap' }}>
           {TIMEFRAMES.map((tf) => (
             <button
               key={tf}
@@ -953,13 +959,13 @@ export const EquityChart = ({
           ))}
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}>
           <button
             type="button"
             className="timeframe-tab mono"
             onClick={() => applyZoomFactor(0.7, 0.5)}
             title={lang === 'ko' ? '확대' : 'Zoom In'}
-            style={{ padding: '4px 9px', fontWeight: 700 }}
+            style={{ padding: '4px 8px', fontWeight: 700 }}
           >
             +
           </button>
@@ -968,20 +974,10 @@ export const EquityChart = ({
             className="timeframe-tab mono"
             onClick={() => applyZoomFactor(1.4, 0.5)}
             title={lang === 'ko' ? '축소' : 'Zoom Out'}
-            style={{ padding: '4px 9px', fontWeight: 700 }}
+            style={{ padding: '4px 8px', fontWeight: 700 }}
           >
             −
           </button>
-          {zoomWindow && (
-            <button
-              type="button"
-              className="timeframe-tab mono"
-              onClick={() => setZoomWindow(null)}
-              style={{ fontSize: '11px', color: 'var(--sky)' }}
-            >
-              {lang === 'ko' ? '초기화' : 'Reset'}
-            </button>
-          )}
         </div>
       </div>
     </div>
