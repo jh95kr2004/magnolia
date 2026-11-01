@@ -547,15 +547,12 @@ export const EquityChart = ({
     };
   }, [hoverRatio, winStartMs, winEndMs, visibleSeries]);
 
-  const firstPoint = visibleSeries[0] || chartSeries[0];
-  const lastPoint = visibleSeries[visibleSeries.length - 1] || chartSeries[chartSeries.length - 1];
+  const firstPoint = chartSeries[0];
+  const latestPoint = chartSeries[chartSeries.length - 1];
 
-  const displayEquityUsd =
-    hoverPoint !== null
-      ? Number(hoverPoint.total_equity_usd || 0)
-      : zoomWindow
-        ? Number(lastPoint?.total_equity_usd || 0)
-        : Number(currentTotalUsd > 0 ? currentTotalUsd : lastPoint?.total_equity_usd || 0);
+  const displayEquityUsd = Number(
+    currentTotalUsd > 0 ? currentTotalUsd : latestPoint?.total_equity_usd || 0
+  );
 
   const startEquityUsd = Number(firstPoint?.total_equity_usd || displayEquityUsd || 0);
   const deltaUsd = displayEquityUsd - startEquityUsd;
