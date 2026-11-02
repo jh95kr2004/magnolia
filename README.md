@@ -9,13 +9,14 @@ Magnolia는 국내외 암호화폐 거래소(Upbit, Coinbase 등) 간의 가격 
 ## 📑 목차 (Table of Contents)
 1. [🏗 시스템 아키텍처 및 컨테이너 구성](#-시스템-아키텍처-및-컨테이너-구성)
 2. [🛠 필수 인프라 & 환경 변수](#-필수-인프라--환경-변수)
-3. [🚀 전체 서버 빌드 및 띄우는 방법 (Quick Start)](#-전체-서버-빌드-및-띄우는-방법-quick-start)
-4. [🧭 파트별 수정 방향 · 빌드 · 테스트 매뉴얼](#-파트별-수정-방향--빌드--테스트-매뉴얼)
-   - [4.1 AI 서비스 (`ai_service/`) 수정 및 테스트](#41-ai-서비스-ai_service-수정-및-테스트)
-   - [4.2 백엔드 (`backend/`) 수정 및 테스트](#42-백엔드-backend-수정-및-테스트)
-   - [4.3 프론트엔드 (`frontend/`) 수정 및 테스트](#43-프론트엔드-frontend-수정-및-테스트)
-5. [🧪 통합 테스트 및 검증 가이드](#-통합-테스트-및-검증-가이드)
-6. [☁️ 프로덕션 & 클라우드 (K8s / AWS / GCP) 배포 가이드](#️-프로덕션--클라우드-k8s--aws--gcp-배포-가이드)
+3. [⚡ 통합 제어 스크립트 (`magnolia.sh`) 사용 매뉴얼](#-통합-제어-스크립트-magnoliash-사용-매뉴얼)
+4. [🚀 전체 서버 빌드 및 띄우는 방법 (Quick Start)](#-전체-서버-빌드-및-띄우는-방법-quick-start)
+5. [🧭 파트별 수정 방향 · 빌드 · 테스트 매뉴얼](#-파트별-수정-방향--빌드--테스트-매뉴얼)
+   - [5.1 AI 서비스 (`ai_service/`) 수정 및 테스트](#51-ai-서비스-ai_service-수정-및-테스트)
+   - [5.2 백엔드 (`backend/`) 수정 및 테스트](#52-백엔드-backend-수정-및-테스트)
+   - [5.3 프론트엔드 (`frontend/`) 수정 및 테스트](#53-프론트엔드-frontend-수정-및-테스트)
+6. [🧪 통합 테스트 및 검증 가이드](#-통합-테스트-및-검증-가이드)
+7. [☁️ 프로덕션 & 클라우드 (K8s / AWS / GCP) 배포 가이드](#️-프로덕션--클라우드-k8s--aws--gcp-배포-가이드)
 
 ---
 
@@ -55,37 +56,81 @@ Magnolia는 국내외 암호화폐 거래소(Upbit, Coinbase 등) 간의 가격 
 
 ---
 
+## ⚡ 통합 제어 스크립트 (`magnolia.sh`) 사용 매뉴얼
+
+프로젝트 최상단의 [`magnolia.sh`](file:///home/jh95kr2004/Workspace/magnolia/magnolia.sh)는 **전체 컨테이너 빌드·기동, Nginx 리버스 프록시(`nginx.conf`) 및 Let's Encrypt HTTPS(Certbot) 자동 구성, 헬스 체크, 그리고 파트별 격리 테스트 실행**을 하나로 묶은 통합 제어 스크립트입니다.
+
+### 1. 명령어 요약표
+
+| 명령어 | 설명 |
+| :--- | :--- |
+| `./magnolia.sh start [domain]` | Python AI 의존성 검증 → 8개 Docker 컨테이너 빌드 및 실행(`docker compose up -d --build`) → 도메인 기반 [`nginx.conf`](file:///home/jh95kr2004/Workspace/magnolia/nginx.conf) 생성·적용 및 SSL 자동 연동 (예: `./magnolia.sh start magnolia.hooneken.com`) |
+| `./magnolia.sh stop` | DB 볼륨(유저·포지션·모의매매 잔고)을 보존한 상태로 모든 서비스 안전 종료 |
+| `./magnolia.sh restart [domain]` | 전체 스택 종료 후 재빌드 및 재시작 |
+| `./magnolia.sh status` | 설정된 도메인, AI 서비스(`magnolia_ai`), Web/API Node(`:8081`) 응답 상태 및 8개 컨테이너 헬스 체크 일괄 출력 |
+| `./magnolia.sh logs [service]` | 전체 컨테이너 또는 특정 서비스(`ai`, `node`, `engine`, `feed`, `redis`, `postgres`) 실시간 로그 스트리밍 |
+| `./magnolia.sh ssl [domain]` | Certbot을 통해 해당 도메인의 Let's Encrypt HTTPS(443) 인증서 발급 및 Nginx 적용 |
+| `./magnolia.sh reset` | **[주의]** 모든 컨테이너를 내리고 DB 볼륨까지 완전 초기화 (Factory Reset) |
+| `./magnolia.sh test [target]` | 격리된 테스트 환경([`docker-compose.test.yml`](file:///home/jh95kr2004/Workspace/magnolia/docker-compose.test.yml))에서 자동화 테스트 실행 (`all` \| `ai` \| `backend` \| `frontend` \| `e2e`) |
+
+### 2. `./magnolia.sh test` 파트별 자동화 테스트
+호스트 PC에 Go나 Node.js가 직접 설치되어 있지 않아도 [`magnolia.sh`](file:///home/jh95kr2004/Workspace/magnolia/magnolia.sh)가 일회용 컨테이너(`golang:1.25-alpine`, `node:20-alpine`)와 격리된 테스트 네트워크(`magnolia_test`)를 자동으로 띄워 운영 DB에 영향을 주지 않고 테스트를 수행합니다.
+
+```bash
+# 1) AI + 백엔드 + 프론트엔드 + 풀스택 E2E 전체 테스트 일괄 실행
+./magnolia.sh test
+# (또는 ./magnolia.sh test all)
+
+# 2) AI 서비스 단위 테스트만 실행 (pytest)
+./magnolia.sh test ai
+
+# 3) Go 백엔드 단위 및 Postgres/Redis 통합 테스트만 실행
+./magnolia.sh test backend
+
+# 4) React 프론트엔드 컴포넌트 및 SSE 단위 테스트만 실행 (Vitest)
+./magnolia.sh test frontend
+
+# 5) 격리된 풀스택 + 헤드리스 Chromium 브라우저 E2E 테스트만 실행
+./magnolia.sh test e2e
+```
+
+---
+
 ## 🚀 전체 서버 빌드 및 띄우는 방법 (Quick Start)
 
 ### 1. 전체 서비스 한 번에 빌드 및 기동
-프로젝트 루트(`/home/jh95kr2004/Workspace/magnolia`)에서 아래 명령어를 실행하면 DB 인프라부터 AI, Feed, Engine, Node(프론트엔드 포함)까지 모두 빌드되어 백그라운드로 실행됩니다.
+프로젝트 루트(`/home/jh95kr2004/Workspace/magnolia`)에서 [`magnolia.sh`](file:///home/jh95kr2004/Workspace/magnolia/magnolia.sh) 또는 `docker compose`로 전체 스택을 한 번에 빌드하고 띄울 수 있습니다.
 
 ```bash
-# 전체 컨테이너 이미지 빌드 및 백그라운드 실행
+# 방법 A (권장): 통합 스크립트로 전체 컨테이너 빌드·기동 + Nginx 설정 + 상태 확인
+./magnolia.sh start magnolia.hooneken.com
+# (도메인 없이 로컬 구동 시: ./magnolia.sh start)
+
+# 방법 B: Docker Compose 직접 실행
 docker compose up -d --build
 ```
 
 ### 2. 실행 중인 컨테이너 상태 및 로그 확인
 ```bash
-# 전체 컨테이너 상태(Up / Healthy 여부) 확인
-docker compose ps
+# 통합 헬스 체크 및 컨테이너 상태 확인
+./magnolia.sh status
 
 # 특정 서비스 실시간 로그 확인 (예: node, engine, feed, ai)
-docker compose logs -f node
-docker compose logs -f engine
-docker compose logs -f ai
+./magnolia.sh logs node
+./magnolia.sh logs engine
+./magnolia.sh logs ai
 ```
 
 ### 3. 파트별 재빌드 / 재시작 요약 치트시트
-코드를 수정한 뒤 변경 사항을 서버에 즉시 반영할 때 사용하는 명령어입니다.
+코드를 수정한 뒤 전체 스택을 다 내리지 않고 **변경된 컨테이너만 빠르게 반영**할 때 사용하는 명령어입니다.
 
-| 수정한 영역 | 반영 명령어 | 비고 |
-| :--- | :--- | :--- |
-| **AI 서비스 (`ai_service/**`)** | `docker restart magnolia_ai` | `./ai_service` 디렉토리가 컨테이너 `/app`에 볼륨 마운트되어 있어 이미지 재빌드 없이 재시작만으로 즉시 반영 |
-| **프론트엔드 (`frontend/**`)** | `docker compose up -d --build node` | [`Dockerfile.node`](file:///home/jh95kr2004/Workspace/magnolia/backend/Dockerfile.node)가 `npm run build`를 수행하여 `magnolia_node` 안에 최신 SPA 번들을 내장 |
-| **백엔드 API / 차트 (`backend/internal/api/**`, `cmd/node/**`)** | `docker compose up -d --build node` | 프론트엔드와 통신하는 REST API 및 SSE 게이트웨이 재빌드 |
-| **백엔드 매매 엔진 / 전략 (`backend/internal/strategy/**`, `cmd/engine/**`)** | `docker compose up -d --build engine` | 코어 매매 엔진(`magnolia_master` 이미지) 재빌드 및 재기동 |
-| **백엔드 시세 피드 (`backend/cmd/feed/**`, `internal/exchange/**`)** | `docker compose up -d --build feed engine node` | 거래소 인터페이스 변경 시 연관 서비스 일괄 재빌드 |
+| 수정한 영역 | 빠른 반영 명령어 | 테스트 명령어 | 비고 |
+| :--- | :--- | :--- | :--- |
+| **AI 서비스 (`ai_service/**`)** | `docker restart magnolia_ai` | `./magnolia.sh test ai` | `./ai_service` 디렉토리가 컨테이너 `/app`에 볼륨 마운트되어 있어 이미지 재빌드 없이 재시작만으로 즉시 반영 |
+| **프론트엔드 (`frontend/**`)** | `docker compose up -d --build node` | `./magnolia.sh test frontend` | [`Dockerfile.node`](file:///home/jh95kr2004/Workspace/magnolia/backend/Dockerfile.node)가 `npm run build`를 수행하여 `magnolia_node` 안에 최신 SPA 번들을 내장 |
+| **백엔드 API / 차트 (`backend/internal/api/**`, `cmd/node/**`)** | `docker compose up -d --build node` | `./magnolia.sh test backend` | 프론트엔드와 통신하는 REST API 및 SSE 게이트웨이 재빌드 |
+| **백엔드 매매 엔진 / 전략 (`backend/internal/strategy/**`, `cmd/engine/**`)** | `docker compose up -d --build engine` | `./magnolia.sh test backend` | 코어 매매 엔진(`magnolia_master` 이미지) 재빌드 및 재기동 |
+| **백엔드 시세 피드 (`backend/cmd/feed/**`, `internal/exchange/**`)** | `docker compose up -d --build feed engine node` | `./magnolia.sh test backend` | 거래소 인터페이스 변경 시 연관 서비스 일괄 재빌드 |
 
 ---
 
@@ -93,7 +138,7 @@ docker compose logs -f ai
 
 ---
 
-### 4.1 AI 서비스 (`ai_service/`) 수정 및 테스트
+### 5.1 AI 서비스 (`ai_service/`) 수정 및 테스트
 
 #### 📂 주요 파일 구조 및 수정 포인트
 - [`ai_service/app.py`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/app.py):
@@ -107,8 +152,11 @@ docker compose logs -f ai
   - 강화학습 학습용 아비트라지 시뮬레이션 환경으로, 백엔드(`backend/internal/strategy`)의 수수료·펀딩비·슬리피지 로직과 동일하게 유지해야 합니다.
 
 #### 🧪 AI 서비스 수정 후 테스트 및 반영 방법
-1. **문법 및 로컬 스크립트 검증**:
+1. **단위 테스트 및 문법 검증**:
    ```bash
+   # AI 서비스 pytest 단위 테스트 실행
+   ./magnolia.sh test ai
+
    # 컨테이너 내부와 동일한 Python 환경으로 문법/모듈 로드 검증
    /home/jh95kr2004/miniconda3/envs/torch_env/bin/python -m py_compile ai_service/app.py ai_service/data/influx_client.py
    ```
@@ -126,9 +174,9 @@ docker compose logs -f ai
    ```
 3. **컨테이너 재시작 및 Redis 캐시 검증**:
    ```bash
-   # AI 컨테이너 재시작
+   # AI 컨테이너 재시작 및 로그 확인
    docker restart magnolia_ai
-   docker logs --tail 50 magnolia_ai
+   ./magnolia.sh logs ai
 
    # Redis에 다중 해상도 차트 캐시(24H, 7D, 1M, 1Y)가 정상 생성되었는지 확인
    docker exec magnolia_redis redis-cli keys "market:premium_chart*"
@@ -136,7 +184,7 @@ docker compose logs -f ai
 
 ---
 
-### 4.2 백엔드 (`backend/`) 수정 및 테스트
+### 5.2 백엔드 (`backend/`) 수정 및 테스트
 
 #### 📂 주요 파일 구조 및 수정 포인트
 - [`backend/internal/api/`](file:///home/jh95kr2004/Workspace/magnolia/backend/internal/api):
@@ -150,16 +198,11 @@ docker compose logs -f ai
   - Redis Pub/Sub 시세 수신 및 `GetPremiumChartByRange` 등 캐시 조회 레이어입니다.
 
 #### 🧪 백엔드 수정 후 테스트 및 빌드 방법
-1. **Go 컴파일 및 단위 테스트 실행**:
+1. **격리된 DB/Redis 통합 및 단위 테스트 실행**:
    ```bash
-   cd backend
-   # 전체 패키지 컴파일 검증
-   go build ./...
-
-   # 전략, 실행, 거래소, API 단위 테스트 실행
-   go test ./... -v
+   # magnolia.sh를 통해 테스트용 Postgres/Redis 컨테이너 구동 및 Go 전체 테스트 실행
+   ./magnolia.sh test backend
    ```
-   *(로컬 호스트에 Go가 설치되어 있지 않은 경우 Docker 빌더를 통해 검증할 수 있습니다: `docker compose build node engine`)*
 2. **수정 대상에 따른 컨테이너 빌드 및 재기동**:
    ```bash
    # 1) API 핸들러(internal/api) 또는 cmd/node 수정 시
@@ -174,7 +217,7 @@ docker compose logs -f ai
 
 ---
 
-### 4.3 프론트엔드 (`frontend/`) 수정 및 테스트
+### 5.3 프론트엔드 (`frontend/`) 수정 및 테스트
 
 #### 📂 주요 파일 구조 및 수정 포인트
 - [`frontend/src/pages/Dashboard.jsx`](file:///home/jh95kr2004/Workspace/magnolia/frontend/src/pages/Dashboard.jsx):
@@ -193,25 +236,15 @@ docker compose logs -f ai
   - 다크 테마 디자인 토큰, 테이블/카드 스타일, 모바일 반응형 미디어 쿼리(`@media (max-width: 768px)`, `@media (max-width: 640px)`)가 정의되어 있습니다.
 
 #### 🧪 프론트엔드 수정 후 테스트 및 서버 반영 방법
-1. **로컬 개발 서버 구동 (선택)**:
+1. **프론트엔드 단위 테스트 및 풀스택 E2E 테스트 (`magnolia.sh` 활용)**:
    ```bash
-   cd frontend
-   npm install
-   npm run dev
-   ```
-2. **프론트엔드 단위 테스트 및 E2E 테스트**:
-   ```bash
-   cd frontend
-   # Vitest 컴포넌트 단위 테스트
-   npm test
+   # Node 20 컨테이너 안에서 Vitest 컴포넌트 단위 테스트 실행
+   ./magnolia.sh test frontend
 
-   # 프로덕션 번들 빌드 검증 (문법 및 번들링 에러 확인)
-   npm run build
-
-   # Playwright 브라우저 E2E 테스트
-   npm run test:e2e
+   # 헤드리스 Chromium 브라우저를 통한 풀스택 E2E 테스트 실행
+   ./magnolia.sh test e2e
    ```
-3. **운영 서버(`magnolia_node`)에 프론트엔드 빌드 및 배포**:
+2. **운영 서버(`magnolia_node`)에 프론트엔드 빌드 및 배포**:
    프론트엔드 정적 파일은 `magnolia_node` 컨테이너 빌드 시 [`backend/Dockerfile.node`](file:///home/jh95kr2004/Workspace/magnolia/backend/Dockerfile.node)의 `frontend-builder` 스테이지에서 자동으로 `npm run build`를 거쳐 `/app/frontend/dist`에 탑재됩니다. 따라서 프론트엔드 코드를 수정한 뒤에는 아래 명령어 한 줄로 빌드와 배포가 완료됩니다.
    ```bash
    # 프로젝트 루트에서 실행
