@@ -230,6 +230,7 @@ class AnnouncementClassifier:
                 "상장폐지",
                 "상장 폐지",
                 "Delisting",
+                "Will Delist",
                 "Termination of Trading Support",
             )
         )
@@ -240,7 +241,7 @@ class AnnouncementClassifier:
         # --- Guardrail 2: INVESTMENT_WARNING vs RELEASE (거래유의 / 투자유의 종목 지정 vs 해제) ---
         elif any(
             kw in title_clean
-            for kw in ("유의 종목", "유의종목", "거래유의", "투자유의", "Investment Warning")
+            for kw in ("유의 종목", "유의종목", "거래유의", "투자유의", "Investment Warning", "Monitoring Tag")
         ):
             # Must NOT be a release ("해제") or continuation-only without designation
             is_release = any(
@@ -250,7 +251,7 @@ class AnnouncementClassifier:
             if is_release:
                 event_type = "NONE"
                 confidence = 0.98
-            elif any(d_kw in title_clean for d_kw in ("지정", "연장", "Designation", "Warning")):
+            elif any(d_kw in title_clean for d_kw in ("지정", "연장", "Designation", "Warning", "Monitoring Tag")):
                 event_type = "INVESTMENT_WARNING"
                 confidence = 0.98
 
@@ -266,11 +267,13 @@ class AnnouncementClassifier:
                 "원화마켓 신규",
                 "신규 상장",
                 "New Listing",
+                "Will List",
             )
         ):
-            # Check if notice specifies ONLY BTC/USDT market without KRW
+            # Check if notice specifies ONLY BTC/USDT market without KRW (for Korean exchanges)
             has_btc_or_usdt_only = (
-                ("BTC 마켓" in title_clean or "USDT 마켓" in title_clean or "(BTC, USDT" in title_clean or "(BTC 마켓" in title_clean)
+                exchange.upper() in ("UPBIT", "BITHUMB", "COINONE")
+                and ("BTC 마켓" in title_clean or "USDT 마켓" in title_clean or "(BTC, USDT" in title_clean or "(BTC 마켓" in title_clean)
                 and "KRW" not in title_clean
                 and "원화" not in title_clean
             )
@@ -295,6 +298,8 @@ class AnnouncementClassifier:
                 "토큰 스왑",
                 "리브랜딩",
                 "Suspension of Deposit",
+                "Wallet Maintenance",
+                "Network Upgrade",
             )
         ):
             is_resumed = any(
@@ -398,7 +403,10 @@ def classify_announcement(
     body: str = "",
     exchange: str = "UPBIT",
     announced_at: Optional[datetime] = None,
+    now_ts: Optional[float] = None,
 ) -> Dict[str, Any]:
+    if announced_at is None and now_ts is not None:
+        announced_at = datetime.fromtimestamp(float(now_ts), tz=timezone.utc)
     return _default_classifier.classify(
         title=title, body=body, exchange=exchange, announced_at=announced_at
     )
