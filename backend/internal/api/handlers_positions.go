@@ -133,6 +133,8 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 		Symbol          string  `json:"symbol"`
 		ExpectedRoi     float64 `json:"expected_roi"`
 		InvestmentUsd   float64 `json:"investment_usd"`
+		ActionType      int     `json:"action_type"`
+		EventType       string  `json:"event_type"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -171,6 +173,8 @@ func (s *Server) handleForceEnter(w http.ResponseWriter, r *http.Request) {
 		"strategy":         strat,
 		"expected_roi":     req.ExpectedRoi,
 		"investment_usd":   req.InvestmentUsd,
+		"action_type":      req.ActionType,
+		"event_type":       req.EventType,
 	})
 
 	if s.Redis != nil {

@@ -3,7 +3,7 @@ import { RotateCcw, ChevronDown, ChevronUp } from 'lucide-react';
 import { apiClient } from '../../services/api';
 import { buildSseUrl, useAuth } from '../../contexts/AuthContext';
 import { useI18n } from '../../contexts/LanguageContext';
-import { formatStrategyLabel } from '../../i18n/translations';
+import { formatStrategyLabel, formatEventBadge } from '../../i18n/translations';
 import { useToast } from '../../contexts/ToastContext';
 import { ColumnTooltipHeader } from '../../components/common/ColumnTooltipHeader';
 import { PremiumTrajectoryChart } from '../../components/opportunities/PremiumTrajectoryChart';
@@ -51,6 +51,7 @@ export const Opportunities = () => {
   });
   const [applyingSim, setApplyingSim] = useState(false);
   const [enteringKey, setEnteringKey] = useState(null);
+  const [chartRefreshKey, setChartRefreshKey] = useState(0);
   const [isMobileViewport, setIsMobileViewport] = useState(
     () => typeof window !== 'undefined' && window.innerWidth <= 768
   );
@@ -131,6 +132,12 @@ export const Opportunities = () => {
               basePriceUsd: Number(item.base_price_usd || 0),
               foreignPriceUsd: Number(item.foreign_price_usd || 0),
               premiumPct: livePremPct,
+              realCoinPremiumPct: Number(
+                aiInfo?.real_coin_premium_pct ?? item.real_coin_premium_pct ?? livePremPct - 0.85
+              ),
+              vaspTier: aiInfo?.vasp_tier || item.vasp_tier || 'TIER3_RISK_ASSESSED',
+              needsWalletProxy: Boolean(aiInfo?.needs_wallet_proxy ?? item.needs_wallet_proxy ?? true),
+              eventType: aiInfo?.event_type || item.event_type || 'NONE',
               predictedPct: predPct,
               meanPct,
               targetOffsetMin,
@@ -251,6 +258,7 @@ export const Opportunities = () => {
         targetOffsetPct: Number(targetPct),
         rampMinutes: Number(rampMin)
       });
+      setChartRefreshKey((k) => k + 1);
       showToast(
         lang === 'ko'
           ? `${exchange} 시세 오프셋(${Number(targetPct) >= 0 ? '+' : ''}${targetPct}% / ${rampMin}분)이 적용되었습니다.`
@@ -262,6 +270,80 @@ export const Opportunities = () => {
     } finally {
       setApplyingSim(false);
     }
+  };
+
+  const triggerSimEvent = async ({
+    eventType,
+    scheduledOffsetMin = 0,
+    targetOffsetPct = 0,
+    rampMinutes = 1,
+    autoStageAssassination = true
+  }) => {
+    const targetCoin = expandedCoin || 'BTC';
+    setApplyingSim(true);
+    try {
+      const res = await apiClient.post('/settings/sim_event', {
+        exchange: 'UPBIT',
+        symbol: targetCoin,
+        event_type: eventType,
+        scheduled_offset_min: scheduledOffsetMin,
+        target_offset_pct: targetOffsetPct,
+        ramp_minutes: rampMinutes,
+        auto_stage_assassination: autoStageAssassination
+      });
+      setChartRefreshKey((k) => k + 1);
+      const evt = res.data?.event;
+      showToast(
+        lang === 'ko'
+          ? evt?.summary_ko || `${targetCoin} 이벤트 시뮬레이션이 발동되었습니다.`
+          : evt?.summary_en || `${targetCoin} event simulation triggered.`,
+        eventType === 'DELISTING' ? 'error' : 'success'
+      );
+    } catch (err) {
+      showToast(err.response?.data?.error || err.message, 'error');
+    } finally {
+      setApplyingSim(false);
+    }
+  };
+
+  const handleManualStageAssassination = (opp, e) => {
+    if (e) e.stopPropagation();
+    const coin = String(opp.baseSymbol).split('-')[0];
+    requestConfirm({
+      title: lang === 'ko' ? `${coin} 선제 입금 암살 대기 (Stage Assassination)` : `Stage ${coin} Assassination`,
+      message:
+        lang === 'ko'
+          ? `해외 거래소(${opp.foreignExchange})에서 ${coin} 현물 매수 + 선물 1배 숏(델타 중립) 진입 후 국내 거래소(${opp.baseExchange})로 선제 입금하여 가두리/펌핑 익절 타이밍을 대기하시겠습니까?`
+          : `Enter delta-neutral Spot Buy + 1x Futures Short on ${opp.foreignExchange} and pre-deposit ${coin} to ${opp.baseExchange} to snipe the next Kimp surge?`,
+      confirmText: lang === 'ko' ? '🎯 암살 대기 진입' : '🎯 Stage Assassination',
+      cancelText: t.stopModal.cancel,
+      onConfirm: async () => {
+        setEnteringKey(opp.id);
+        try {
+          await apiClient.post('/positions/force_enter', {
+            mode: viewMode,
+            base_exchange: opp.baseExchange,
+            foreign_exchange: opp.foreignExchange,
+            base_symbol: opp.baseSymbol,
+            foreign_symbol: opp.foreignSymbol,
+            strategy: 'FOREIGN_TRANSFER',
+            action_type: 3,
+            event_type: opp.eventType !== 'NONE' ? opp.eventType : 'MANUAL_ASSASSINATION',
+            investment_usd: 2500
+          });
+          showToast(
+            lang === 'ko'
+              ? `${coin} 암살 대기(STAGED_ASSASSINATION) 진입 요청이 전송되었습니다.`
+              : `Assassination staging command sent for ${coin}.`,
+            'success'
+          );
+        } catch (err) {
+          showToast(err.response?.data?.error || err.message, 'error');
+        } finally {
+          setEnteringKey(null);
+        }
+      }
+    });
   };
 
   const handleManualEnter = (opp, e) => {
@@ -386,6 +468,127 @@ export const Opportunities = () => {
               <RotateCcw size={13} />
               <span>{t.market.simPresetReset}</span>
             </button>
+          </div>
+
+          {/* 1-Click Event & Assassination Scenario Simulator */}
+          <div style={{ marginTop: '10px' }}>
+            <div
+              style={{
+                fontSize: '12px',
+                fontWeight: 700,
+                color: 'var(--text-secondary)',
+                marginBottom: '6px'
+              }}
+            >
+              {lang === 'ko'
+                ? `🎯 이벤트 & 암살(Assassination) 시나리오 원클릭 시뮬레이터 (대상: ${expandedCoin || 'BTC'})`
+                : `🎯 1-Click Event & Assassination Scenario Simulator (Target: ${expandedCoin || 'BTC'})`}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'NEW_KRW_LISTING',
+                    scheduledOffsetMin: 60,
+                    targetOffsetPct: 0.0,
+                    rampMinutes: 0,
+                    autoStageAssassination: true
+                  })
+                }
+              >
+                {lang === 'ko' ? '🚀 원화 신규 상장 (60분 뒤 개시·2단계 장전)' : '🚀 New KRW Listing (+60m)'}
+              </button>
+
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'INVESTMENT_WARNING',
+                    scheduledOffsetMin: 0,
+                    targetOffsetPct: 6.5,
+                    rampMinutes: 2,
+                    autoStageAssassination: true
+                  })
+                }
+              >
+                {lang === 'ko' ? '⚠️ 유의 지정 가두리 암살 (+6.5% 펌핑)' : '⚠️ Warning Gaduri Snipe (+6.5%)'}
+              </button>
+
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'WALLET_SUSPENSION',
+                    scheduledOffsetMin: 90,
+                    targetOffsetPct: 3.8,
+                    rampMinutes: 3,
+                    autoStageAssassination: true
+                  })
+                }
+              >
+                {lang === 'ko' ? '🔒 입출금 중단 예고 (+90분 뒤·선제 입금)' : '🔒 Wallet Suspension (+90m)'}
+              </button>
+
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'IN_TRANSIT_KIMP_DROP',
+                    scheduledOffsetMin: 0,
+                    targetOffsetPct: -0.5,
+                    rampMinutes: 0,
+                    autoStageAssassination: true
+                  })
+                }
+              >
+                {lang === 'ko'
+                  ? '🛡️ 전송 중 김프 급락 방어 (STAGED 전환)'
+                  : '🛡️ In-Transit Kimp Drop Defense'}
+              </button>
+
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'DELISTING',
+                    scheduledOffsetMin: 0,
+                    targetOffsetPct: -8.0,
+                    rampMinutes: 1,
+                    autoStageAssassination: false
+                  })
+                }
+              >
+                {lang === 'ko' ? '🚨 상장폐지 긴급 방어 (진입 차단·청산)' : '🚨 Delisting Emergency Veto'}
+              </button>
+
+              <button
+                type="button"
+                disabled={applyingSim}
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  triggerSimEvent({
+                    eventType: 'CLEAR',
+                    scheduledOffsetMin: 0,
+                    targetOffsetPct: 0,
+                    rampMinutes: 0,
+                    autoStageAssassination: false
+                  })
+                }
+              >
+                {lang === 'ko' ? '🧹 이벤트 마커 초기화' : '🧹 Clear Event Markers'}
+              </button>
+            </div>
           </div>
 
           <div className="divider" />
@@ -618,6 +821,7 @@ export const Opportunities = () => {
                           viewMode={viewMode}
                           livePremiumPct={opp.premiumPct}
                           simStatus={simStatus}
+                          refreshKey={chartRefreshKey}
                           lang={lang}
                         />
                       </div>
@@ -726,6 +930,18 @@ export const Opportunities = () => {
                           >
                             {opp.baseExchange} ({opp.baseSymbol}) → {opp.foreignExchange} (
                             {opp.foreignSymbol})
+                            {opp.needsWalletProxy && (
+                              <span
+                                className="mono"
+                                style={{
+                                  marginLeft: '6px',
+                                  fontSize: '11px',
+                                  color: '#f59e0b'
+                                }}
+                              >
+                                [2-Hop Wallet]
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td className="mono">
@@ -756,6 +972,19 @@ export const Opportunities = () => {
                             {isPosSpread ? '+' : ''}
                             {opp.premiumPct.toFixed(2)}%
                           </span>
+                          {typeof opp.realCoinPremiumPct === 'number' && (
+                            <div
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                marginTop: '3px'
+                              }}
+                            >
+                              {lang === 'ko' ? '실질(USDT):' : 'Real(USDT):'}{' '}
+                              {opp.realCoinPremiumPct >= 0 ? '+' : ''}
+                              {opp.realCoinPremiumPct.toFixed(2)}%
+                            </div>
+                          )}
                         </td>
                         <td>
                           <div
@@ -800,14 +1029,29 @@ export const Opportunities = () => {
                           {opp.expectedMarginPct.toFixed(2)}%
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <button
-                            type="button"
-                            disabled={enteringKey === opp.id}
-                            onClick={(e) => handleManualEnter(opp, e)}
-                            className="btn btn-sm btn-ghost"
-                          >
-                            {t.market.enterBtn}
-                          </button>
+                          <div style={{ display: 'inline-flex', gap: '6px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                            <button
+                              type="button"
+                              disabled={enteringKey === opp.id}
+                              onClick={(e) => handleManualEnter(opp, e)}
+                              className="btn btn-sm btn-ghost"
+                            >
+                              {t.market.enterBtn}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={enteringKey === opp.id}
+                              onClick={(e) => handleManualStageAssassination(opp, e)}
+                              className="btn btn-sm btn-ghost"
+                              title={
+                                lang === 'ko'
+                                  ? '해외 현물 롱 + 선물 1배 숏 후 국내 선제 입금 대기 (암살 모드)'
+                                  : 'Stage delta-neutral pre-deposit assassination'
+                              }
+                            >
+                              {lang === 'ko' ? '🎯 암살 대기' : '🎯 Stage'}
+                            </button>
+                          </div>
                         </td>
                       </tr>
 
@@ -823,6 +1067,7 @@ export const Opportunities = () => {
                               viewMode={viewMode}
                               livePremiumPct={opp.premiumPct}
                               simStatus={simStatus}
+                              refreshKey={chartRefreshKey}
                               lang={lang}
                             />
                           </td>

@@ -192,6 +192,15 @@ func (p *PubSubClient) GetCoinAnnouncementEvents(ctx context.Context, coin strin
 	return events
 }
 
+// ClearCoinAnnouncementEvents deletes stored announcement events for a coin ticker (or all if symbol == "").
+func (p *PubSubClient) ClearCoinAnnouncementEvents(ctx context.Context, coin string) error {
+	cleanCoin := strings.ToUpper(strings.Split(strings.TrimSpace(coin), "-")[0])
+	if cleanCoin != "" {
+		_ = p.client.Del(ctx, "market:events:coin:"+cleanCoin).Err()
+	}
+	return p.client.Del(ctx, "market:events:recent").Err()
+}
+
 // SubscribeAnnouncementEvents subscribes to live LLM-classified exchange announcement events.
 func (p *PubSubClient) SubscribeAnnouncementEvents(ctx context.Context, outCh chan<- exchange.AnnouncementEvent) {
 	pubsub := p.client.Subscribe(ctx, "event:announcement")

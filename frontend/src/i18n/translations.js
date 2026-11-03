@@ -299,13 +299,67 @@ export const formatStrategyLabel = (rawType, lang = 'ko', direction = '') => {
 export const formatPositionStatus = (rawStatus, lang = 'ko') => {
   const st = String(rawStatus || 'OPEN').toUpperCase();
   if (lang === 'en') {
-    if (st === 'TRANSFERRING') return 'Transferring On-Chain';
+    if (st === 'STAGED_ASSASSINATION') return '🎯 Staged Assassination (Deposited)';
+    if (st === 'PRE_STAGED_LISTING') return '🚀 Pre-Staged Listing (Wallet Ready)';
+    if (st === 'TRANSFERRING' || st === 'IN_TRANSIT') return 'Transferring On-Chain';
     if (st === 'REPAYING' || st === 'AWAITING_REPAY') return 'Awaiting Loan Repay';
     if (st === 'CLOSED') return 'Closed';
     return 'Hedged (Open)';
   }
-  if (st === 'TRANSFERRING') return '온체인 코인 전송 중';
+  if (st === 'STAGED_ASSASSINATION') return '🎯 암살 대기 중 (국내 입금 완료)';
+  if (st === 'PRE_STAGED_LISTING') return '🚀 상장 대기 장전 중 (개인지갑)';
+  if (st === 'TRANSFERRING' || st === 'IN_TRANSIT') return '온체인 코인 전송 중';
   if (st === 'REPAYING' || st === 'AWAITING_REPAY') return '대여 상환 대기';
   if (st === 'CLOSED') return '청산 완료';
   return '델타 중립 헤징 중';
+};
+
+export const formatEventBadge = (eventType, lang = 'ko') => {
+  const ev = String(eventType || '').toUpperCase();
+  if (ev === 'NEW_KRW_LISTING') {
+    return {
+      icon: '🚀',
+      label: lang === 'ko' ? '원화 상장 공지' : 'KRW Listing',
+      futureLabel: lang === 'ko' ? '원화 상장 개시 예정' : 'Listing Open Scheduled',
+      color: '#10b981',
+      bg: 'rgba(16, 185, 129, 0.16)'
+    };
+  }
+  if (ev === 'INVESTMENT_WARNING') {
+    return {
+      icon: '⚠️',
+      label: lang === 'ko' ? '유의 종목 지정 (가두리)' : 'Investment Warning (Gaduri)',
+      futureLabel: lang === 'ko' ? '유의 가두리 진행' : 'Gaduri Active',
+      color: '#f59e0b',
+      bg: 'rgba(245, 158, 11, 0.16)'
+    };
+  }
+  if (ev === 'WALLET_SUSPENSION') {
+    return {
+      icon: '🔒',
+      label: lang === 'ko' ? '입출금 중단 예고' : 'Wallet Suspension Notice',
+      futureLabel: lang === 'ko' ? '입출금 중단(가두리) 시작 예정' : 'Wallet Suspension Starts',
+      color: '#38bdf8',
+      bg: 'rgba(56, 189, 248, 0.16)'
+    };
+  }
+  if (ev === 'DELISTING') {
+    return {
+      icon: '🚨',
+      label: lang === 'ko' ? '상장폐지 결정 (진입 차단)' : 'Delisting (Entry Veto)',
+      futureLabel: lang === 'ko' ? '거래지원 종료 예정' : 'Delisting Scheduled',
+      color: '#f43f5e',
+      bg: 'rgba(244, 63, 94, 0.18)'
+    };
+  }
+  if (ev === 'VOLUME_SURGE') {
+    return {
+      icon: '⚡',
+      label: lang === 'ko' ? '거래대금 급증 감지' : 'Volume Surge',
+      futureLabel: lang === 'ko' ? '단기 펌핑 주의' : 'Pump Alert',
+      color: '#c084fc',
+      bg: 'rgba(192, 132, 252, 0.16)'
+    };
+  }
+  return null;
 };

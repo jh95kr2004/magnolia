@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { apiClient } from '../../services/api';
+import { formatEventBadge } from '../../i18n/translations';
 
 const PRESET_OPTIONS = [
   { id: '1H', label: '1H', start: -60, end: 120 },
@@ -45,6 +46,7 @@ export const PremiumTrajectoryChart = ({
   viewMode = 'PAPER',
   livePremiumPct,
   simStatus,
+  refreshKey = 0,
   lang = 'ko'
 }) => {
   const [hoverX, setHoverX] = useState(null);
@@ -157,8 +159,11 @@ export const PremiumTrajectoryChart = ({
   // Fetch the active resolution (24H / 7D / 1M / 1Y) and poll for live updates
   useEffect(() => {
     let active = true;
+    if (refreshKey > 0) {
+      chartDataCache.delete(cacheKey);
+    }
     const cached = chartDataCache.get(cacheKey);
-    if (cached) {
+    if (cached && refreshKey === 0) {
       setChartData(cached);
     }
     const fetchChart = async () => {
@@ -209,7 +214,8 @@ export const PremiumTrajectoryChart = ({
     simStatus?.started_at,
     simStatus?.target_offset_pct,
     simStatus?.ramp_minutes,
-    simStatus?.is_ramping
+    simStatus?.is_ramping,
+    refreshKey
   ]);
 
   // Background prefetch of multi-resolution levels (24H, 7D, 1M, 1Y) for zero-latency LOD zoom switching
@@ -267,8 +273,10 @@ export const PremiumTrajectoryChart = ({
     const summary = activeChartData?.summary || {};
     const stepMin = Math.max(1, Number(activeChartData?.step_min || 1));
 
-    const curPct =
-      typeof livePremiumPct === 'number' && !Number.isNaN(livePremiumPct)
+    const isPreListing = Boolean(activeChartData?.is_pre_listing);
+    const curPct = isPreListing
+      ? 0.0
+      : typeof livePremiumPct === 'number' && !Number.isNaN(livePremiumPct)
         ? livePremiumPct
         : Number(summary.current_pct ?? 0.25);
 
@@ -1234,6 +1242,74 @@ export const PremiumTrajectoryChart = ({
         </div>
       </div>
 
+      {/* Active Catalyst Event Strip & Pre-Listing Notice */}
+      {(Boolean(activeChartData?.is_pre_listing) ||
+        (Array.isArray(activeChartData?.events) && activeChartData.events.length > 0)) && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '8px',
+            marginBottom: '8px',
+            padding: '6px 10px',
+            borderRadius: '6px',
+            background: 'rgba(15, 23, 42, 0.72)',
+            border: '1px solid rgba(56, 189, 248, 0.25)',
+            fontSize: isMobile ? '11px' : '12px'
+          }}
+        >
+          {Boolean(activeChartData?.is_pre_listing) && (
+            <span
+              className="mono"
+              style={{
+                color: '#10b981',
+                fontWeight: 700,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}
+            >
+              <span>🚀</span>
+              <span>
+                {lang === 'ko'
+                  ? `신규 원화 상장 대기 중 (+${activeChartData?.pre_listing_scheduled_offset_min || 60}분 뒤 개시) · 상장 전 0.00% 암시적 패리티(해외 롱+선물 1x 숏 개인지갑 장전 구간)`
+                  : `Pre-Listing Mode (+${activeChartData?.pre_listing_scheduled_offset_min || 60}m to open) · 0.00% Implied Parity (Personal Wallet Pre-Staged Zone)`}
+              </span>
+            </span>
+          )}
+          {Array.isArray(activeChartData?.events) &&
+            activeChartData.events.slice(0, 3).map((evt, idx) => {
+              const badge = formatEventBadge(evt.event_type, lang);
+              if (!badge) return null;
+              const schedMin = Number(evt.scheduled_offset_min || 0);
+              return (
+                <span
+                  key={evt.id || idx}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                    background: badge.bg,
+                    color: badge.color,
+                    fontWeight: 600
+                  }}
+                >
+                  <span>{badge.icon}</span>
+                  <span>{lang === 'ko' ? evt.summary_ko || badge.label : evt.summary_en || badge.label}</span>
+                  {schedMin > 0 && (
+                    <span className="mono" style={{ opacity: 0.9 }}>
+                      ({formatOffsetLabel(schedMin, lang)}: {badge.futureLabel})
+                    </span>
+                  )}
+                </span>
+              );
+            })}
+        </div>
+      )}
+
       {/* SVG Trajectory Canvas */}
       <div
         ref={containerRef}
@@ -1353,6 +1429,40 @@ export const PremiumTrajectoryChart = ({
                   rx="4"
                 />
               )}
+
+              {/* Pre-Listing Waiting Zone Shading [NOW -> Listing Open] */}
+              {Boolean(activeChartData?.is_pre_listing) &&
+                Number(activeChartData?.pre_listing_scheduled_offset_min) > 0 &&
+                (() => {
+                  const x0 = Math.max(padLeft, toX(0));
+                  const x1 = Math.min(
+                    width - padRight,
+                    toX(Number(activeChartData.pre_listing_scheduled_offset_min))
+                  );
+                  if (x1 <= x0) return null;
+                  return (
+                    <g>
+                      <rect
+                        x={x0}
+                        y={padTop}
+                        width={x1 - x0}
+                        height={plotH}
+                        fill="rgba(16, 185, 129, 0.09)"
+                      />
+                      <text
+                        x={(x0 + x1) / 2}
+                        y={padTop + plotH - 8}
+                        textAnchor="middle"
+                        fill="rgba(16, 185, 129, 0.85)"
+                        fontSize={isMobile ? '9' : '10'}
+                        fontWeight="700"
+                        fontFamily="monospace"
+                      >
+                        {lang === 'ko' ? '상장 대기 (개인지갑 장전 구간)' : 'Pre-Listing Staged Zone'}
+                      </text>
+                    </g>
+                  );
+                })()}
 
               {/* Horizontal Grid Lines & Y-Axis Labels */}
               {yTicks.map((val, idx) => {
@@ -1556,6 +1666,94 @@ export const PremiumTrajectoryChart = ({
                       </text>
                     </g>
                   )}
+
+                {/* 6. LLM-Detected Past Announcement Pins & Future Scheduled Catalyst Markers */}
+                {Array.isArray(activeChartData?.events) &&
+                  activeChartData.events.slice(0, 4).map((evt, idx) => {
+                    const badge = formatEventBadge(evt.event_type, lang);
+                    if (!badge) return null;
+                    const pastOffMin = Number(evt.offset_min ?? 0);
+                    const schedOffMin = Number(evt.scheduled_offset_min ?? 0);
+                    const xPast = toX(pastOffMin);
+                    const xFuture = schedOffMin > 0 ? toX(schedOffMin) : null;
+
+                    return (
+                      <g key={evt.id || `evt-${idx}`}>
+                        {/* Occurred Announcement Vertical Pin (Solid Line) */}
+                        {xPast >= padLeft && xPast <= width - padRight && (
+                          <g>
+                            <line
+                              x1={xPast}
+                              y1={padTop}
+                              x2={xPast}
+                              y2={padTop + plotH}
+                              stroke={badge.color}
+                              strokeWidth="1.6"
+                              strokeOpacity="0.8"
+                            />
+                            <text
+                              x={Math.min(
+                                width - padRight - 55,
+                                Math.max(padLeft + 55, xPast)
+                              )}
+                              y={padTop + 13 + idx * 14}
+                              textAnchor="middle"
+                              fill={badge.color}
+                              fontSize={isMobile ? '9' : '10'}
+                              fontWeight="700"
+                              fontFamily="monospace"
+                            >
+                              {badge.icon} {badge.label} ({formatOffsetLabel(pastOffMin, lang)})
+                            </text>
+                          </g>
+                        )}
+
+                        {/* Future Scheduled Catalyst Vertical Pin (Dashed Line + Pulse Marker) */}
+                        {xFuture !== null &&
+                          xFuture >= padLeft &&
+                          xFuture <= width - padRight && (
+                            <g>
+                              <line
+                                x1={xFuture}
+                                y1={padTop}
+                                x2={xFuture}
+                                y2={padTop + plotH}
+                                stroke={badge.color}
+                                strokeWidth="2"
+                                strokeDasharray="5 3"
+                              />
+                              <circle
+                                cx={xFuture}
+                                cy={padTop + 26}
+                                r="5"
+                                fill={badge.color}
+                                fillOpacity="0.35"
+                              />
+                              <circle
+                                cx={xFuture}
+                                cy={padTop + 26}
+                                r="3"
+                                fill={badge.color}
+                              />
+                              <text
+                                x={Math.min(
+                                  width - padRight - 70,
+                                  Math.max(padLeft + 70, xFuture)
+                                )}
+                                y={padTop + 22}
+                                textAnchor="middle"
+                                fill={badge.color}
+                                fontSize={isMobile ? '9.5' : '10.5'}
+                                fontWeight="700"
+                                fontFamily="monospace"
+                              >
+                                {badge.icon} {formatOffsetLabel(schedOffMin, lang)}: {badge.futureLabel}
+                              </text>
+                            </g>
+                          )}
+                      </g>
+                    );
+                  })}
               </g>
 
               {/* NOW Top Badge (rendered above clipPath when NOW is visible) */}

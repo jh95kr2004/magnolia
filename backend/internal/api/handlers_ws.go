@@ -89,6 +89,10 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		"total_equity_usd":       capitalLimit,
 		"available_balance":      capitalLimit,
 		"fx_rate_krw":            fxRate,
+		"tether_rates_krw": map[string]float64{
+			"UPBIT":   strategy.GetExchangeTetherRate("UPBIT", "KRW"),
+			"BITHUMB": strategy.GetExchangeTetherRate("BITHUMB", "KRW"),
+		},
 		"foreign_share":          0.50,
 		"rebalance_trigger_skew": triggerSkew,
 		"rebalance_target_skew":  targetSkew,
@@ -205,27 +209,30 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 
 	positions, _ := s.DB.GetActivePositionsByUserAndMode(userID, isPaper)
 	type enrichedPos struct {
-		ID                 uint      `json:"ID"`
-		PositionID         string    `json:"PositionID"`
-		IsPaper            bool      `json:"IsPaper"`
-		Status             string    `json:"Status"`
-		Type               string    `json:"Type"`
-		HedgeMarket        string    `json:"HedgeMarket"`
-		BaseExchange       string    `json:"BaseExchange"`
-		ForeignExchange    string    `json:"ForeignExchange"`
-		BaseSymbol         string    `json:"BaseSymbol"`
-		ForeignSymbol      string    `json:"ForeignSymbol"`
-		BaseAmount         float64   `json:"BaseAmount"`
-		ForeignAmount      float64   `json:"ForeignAmount"`
-		InvestmentUSD      float64   `json:"InvestmentUSD"`
-		EntryBasePrice     float64   `json:"EntryBasePrice"`
-		EntryForeignPrice  float64   `json:"EntryForeignPrice"`
-		EntryPremium       float64   `json:"EntryPremium"`
-		ExpectedFuturePrem float64   `json:"ExpectedFuturePrem"`
-		MaxUnrealizedROI   float64   `json:"MaxUnrealizedROI"`
-		CurrentPnLUSD      float64   `json:"CurrentPnLUSD"`
-		CurrentPnLPct      float64   `json:"CurrentPnLPct"`
-		OpenedAt           time.Time `json:"OpenedAt"`
+		ID                         uint                   `json:"ID"`
+		PositionID                 string                 `json:"PositionID"`
+		IsPaper                    bool                   `json:"IsPaper"`
+		Status                     string                 `json:"Status"`
+		Type                       string                 `json:"Type"`
+		HedgeMarket                string                 `json:"HedgeMarket"`
+		BaseExchange               string                 `json:"BaseExchange"`
+		ForeignExchange            string                 `json:"ForeignExchange"`
+		BaseSymbol                 string                 `json:"BaseSymbol"`
+		ForeignSymbol              string                 `json:"ForeignSymbol"`
+		BaseAmount                 float64                `json:"BaseAmount"`
+		ForeignAmount              float64                `json:"ForeignAmount"`
+		InvestmentUSD              float64                `json:"InvestmentUSD"`
+		EntryBasePrice             float64                `json:"EntryBasePrice"`
+		EntryForeignPrice          float64                `json:"EntryForeignPrice"`
+		EntryPremium               float64                `json:"EntryPremium"`
+		ExpectedFuturePrem         float64                `json:"ExpectedFuturePrem"`
+		MaxUnrealizedROI           float64                `json:"MaxUnrealizedROI"`
+		CurrentPnLUSD              float64                `json:"CurrentPnLUSD"`
+		CurrentPnLPct              float64                `json:"CurrentPnLPct"`
+		HedgeMode                  string                 `json:"HedgeMode,omitempty"`
+		AssassinationRationaleJSON string                 `json:"AssassinationRationaleJSON,omitempty"`
+		AssassinationRationale     map[string]interface{} `json:"AssassinationRationale,omitempty"`
+		OpenedAt                   time.Time              `json:"OpenedAt"`
 	}
 
 	enrichedList := make([]enrichedPos, 0, len(positions))
@@ -242,28 +249,41 @@ func (s *Server) pushDashboardSnapshot(ctx context.Context, w http.ResponseWrite
 		if p.InvestmentUSD > 0 {
 			livePct = (livePnL / p.InvestmentUSD) * 100.0
 		}
+		var rationaleMap map[string]interface{}
+		if p.AssassinationRationaleJSON != "" {
+			if err := json.Unmarshal([]byte(p.AssassinationRationaleJSON), &rationaleMap); err == nil && rationaleMap != nil {
+				remMin := 720.0 - time.Since(p.OpenedAt).Minutes()
+				if remMin < 0 {
+					remMin = 0
+				}
+				rationaleMap["timeout_remaining_min"] = math.Round(remMin*10) / 10
+			}
+		}
 		enrichedList = append(enrichedList, enrichedPos{
-			ID:                 p.ID,
-			PositionID:         p.PositionID,
-			IsPaper:            p.IsPaper,
-			Status:             p.Status,
-			Type:               p.Type,
-			HedgeMarket:        p.HedgeMarket,
-			BaseExchange:       p.BaseExchange,
-			ForeignExchange:    p.ForeignExchange,
-			BaseSymbol:         p.BaseSymbol,
-			ForeignSymbol:      p.ForeignSymbol,
-			BaseAmount:         p.BaseAmount,
-			ForeignAmount:      p.ForeignAmount,
-			InvestmentUSD:      p.InvestmentUSD,
-			EntryBasePrice:     p.EntryBasePrice,
-			EntryForeignPrice:  p.EntryForeignPrice,
-			EntryPremium:       p.EntryPremium,
-			ExpectedFuturePrem: p.ExpectedFuturePrem,
-			MaxUnrealizedROI:   p.MaxUnrealizedROI,
-			CurrentPnLUSD:      livePnL,
-			CurrentPnLPct:      livePct,
-			OpenedAt:           p.OpenedAt,
+			ID:                         p.ID,
+			PositionID:                 p.PositionID,
+			IsPaper:                    p.IsPaper,
+			Status:                     p.Status,
+			Type:                       p.Type,
+			HedgeMarket:                p.HedgeMarket,
+			BaseExchange:               p.BaseExchange,
+			ForeignExchange:            p.ForeignExchange,
+			BaseSymbol:                 p.BaseSymbol,
+			ForeignSymbol:              p.ForeignSymbol,
+			BaseAmount:                 p.BaseAmount,
+			ForeignAmount:              p.ForeignAmount,
+			InvestmentUSD:              p.InvestmentUSD,
+			EntryBasePrice:             p.EntryBasePrice,
+			EntryForeignPrice:          p.EntryForeignPrice,
+			EntryPremium:               p.EntryPremium,
+			ExpectedFuturePrem:         p.ExpectedFuturePrem,
+			MaxUnrealizedROI:           p.MaxUnrealizedROI,
+			CurrentPnLUSD:              livePnL,
+			CurrentPnLPct:              livePct,
+			HedgeMode:                  p.HedgeMode,
+			AssassinationRationaleJSON: p.AssassinationRationaleJSON,
+			AssassinationRationale:     rationaleMap,
+			OpenedAt:                   p.OpenedAt,
 		})
 	}
 
@@ -704,6 +724,97 @@ func (s *Server) handleOpportunityChart(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 			}
+		}
+	}
+
+	// Attach recent LLM-classified announcement / catalyst events for timeline markers
+	coin := strings.Split(baseSym, "-")[0]
+	nowTime := time.Now().UTC()
+	var chartEvents []map[string]interface{}
+	preListingSchedMin := 0
+	if s.Redis != nil && coin != "" {
+		rawEvts := s.Redis.GetCoinAnnouncementEvents(r.Context(), coin)
+		for _, evt := range rawEvts {
+			offMin := int(math.Round(evt.AnnouncedAt.Sub(nowTime).Minutes()))
+			schedOffMin := 0
+			if evt.ScheduledAt != nil {
+				schedOffMin = int(math.Round(evt.ScheduledAt.Sub(nowTime).Minutes()))
+				if evt.EventType == "NEW_KRW_LISTING" && schedOffMin > 0 && preListingSchedMin == 0 {
+					preListingSchedMin = schedOffMin
+				}
+			}
+			chartEvents = append(chartEvents, map[string]interface{}{
+				"id":                   evt.ID,
+				"exchange":             evt.Exchange,
+				"event_type":           evt.EventType,
+				"title":                evt.Title,
+				"summary_ko":           evt.SummaryKO,
+				"summary_en":           evt.SummaryEN,
+				"announced_at":         evt.AnnouncedAt.Format(time.RFC3339),
+				"offset_min":           offMin,
+				"scheduled_offset_min": schedOffMin,
+				"is_catalyst":          evt.IsCatalyst,
+			})
+		}
+	}
+	payload["events"] = chartEvents
+
+	// If a NEW_KRW_LISTING event is scheduled in the future, render pre-listing implied 0.0% parity
+	// in the past & waiting zone [0, preListingSchedMin], then surge at listing open
+	if preListingSchedMin > 0 {
+		payload["is_pre_listing"] = true
+		payload["pre_listing_scheduled_offset_min"] = preListingSchedMin
+		if histSlice, ok := payload["history"].([]interface{}); ok {
+			for _, item := range histSlice {
+				if pt, ok := item.(map[string]interface{}); ok {
+					pt["actual_pct"] = 0.0
+					pt["ai_past_pred_pct"] = 0.0
+					pt["is_pre_listing"] = true
+				}
+			}
+		} else if histMapSlice, ok := payload["history"].([]map[string]interface{}); ok {
+			for _, pt := range histMapSlice {
+				pt["actual_pct"] = 0.0
+				pt["ai_past_pred_pct"] = 0.0
+				pt["is_pre_listing"] = true
+			}
+		}
+		nowUTC := time.Now().UTC()
+		fcList := make([]map[string]interface{}, 0, 97)
+		peakPct := 6.80
+		peakOff := preListingSchedMin + 15
+		for off := 0; off <= 480; off += 5 {
+			ts := nowUTC.Add(time.Duration(off) * time.Minute)
+			pred := 0.0
+			if off >= preListingSchedMin {
+				if off <= peakOff {
+					ratio := float64(off-preListingSchedMin) / math.Max(1.0, float64(peakOff-preListingSchedMin))
+					pred = peakPct * ratio
+				} else {
+					decay := math.Exp(-0.008 * float64(off-peakOff))
+					pred = 1.20 + (peakPct-1.20)*decay
+				}
+			}
+			fcList = append(fcList, map[string]interface{}{
+				"timestamp":      ts.Format(time.RFC3339),
+				"offset_min":     off,
+				"predicted_pct":  math.Round(pred*10000) / 10000,
+				"is_pre_listing": off < preListingSchedMin,
+			})
+		}
+		payload["forecast"] = fcList
+		payload["summary"] = map[string]interface{}{
+			"current_pct":           0.0,
+			"target_pct":            peakPct,
+			"target_offset_min":     peakOff,
+			"mean_8h_pct":           3.45,
+			"max_8h_pct":            peakPct,
+			"max_offset_min":        peakOff,
+			"min_8h_pct":            0.0,
+			"min_offset_min":        0,
+			"first_wave_pct":        peakPct,
+			"first_wave_offset_min": peakOff,
+			"direction":             "WIDENING",
 		}
 	}
 

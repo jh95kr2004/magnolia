@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { translations, formatStrategyLabel, formatPositionStatus } from '../i18n/translations';
+import {
+  translations,
+  formatStrategyLabel,
+  formatPositionStatus,
+  formatEventBadge
+} from '../i18n/translations';
 
 describe('i18n translations and domain formatters', () => {
   it('contains matching top-level sections for ko and en', () => {
@@ -15,10 +20,19 @@ describe('i18n translations and domain formatters', () => {
     expect(formatStrategyLabel('Margin-Spot (A)', 'ko')).toContain('마진 대여 숏');
   });
 
-  it('formats position status codes accurately in KO and EN', () => {
+  it('formats position status codes including STAGED_ASSASSINATION and PRE_STAGED_LISTING', () => {
     expect(formatPositionStatus('OPEN', 'ko')).toBe('델타 중립 헤징 중');
     expect(formatPositionStatus('TRANSFERRING', 'ko')).toBe('온체인 코인 전송 중');
+    expect(formatPositionStatus('STAGED_ASSASSINATION', 'ko')).toContain('암살 대기 중');
+    expect(formatPositionStatus('PRE_STAGED_LISTING', 'ko')).toContain('상장 대기 장전 중');
     expect(formatPositionStatus('AWAITING_REPAY', 'ko')).toBe('대여 상환 대기');
     expect(formatPositionStatus('CLOSED', 'en')).toBe('Closed');
+  });
+
+  it('formats LLM catalyst event badges in KO and EN', () => {
+    expect(formatEventBadge('NEW_KRW_LISTING', 'ko')?.label).toContain('원화 상장 공지');
+    expect(formatEventBadge('INVESTMENT_WARNING', 'ko')?.label).toContain('유의 종목 지정');
+    expect(formatEventBadge('WALLET_SUSPENSION', 'ko')?.label).toContain('입출금 중단 예고');
+    expect(formatEventBadge('DELISTING', 'en')?.label).toContain('Delisting');
   });
 });

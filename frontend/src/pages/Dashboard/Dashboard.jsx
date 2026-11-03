@@ -41,23 +41,35 @@ export const Dashboard = () => {
 
   const mapPositions = (rawList) => {
     if (!Array.isArray(rawList)) return [];
-    return rawList.map((p) => ({
-      id: p.PositionID || p.ID,
-      strategy: p.Type,
-      baseExchange: p.BaseExchange,
-      foreignExchange: p.ForeignExchange,
-      baseSymbol: p.BaseSymbol || 'BTC-KRW',
-      foreignSymbol: p.ForeignSymbol || 'BTC-USD',
-      investedUsd: Number(p.InvestmentUSD || 0),
-      entrySpreadPct: Number((p.EntrySpread ?? p.EntryPremium) || 0) * 100,
-      currentPnlUsd:
-        typeof p.CurrentPnLUSD === 'number'
-          ? p.CurrentPnLUSD
-          : Number(p.RealizedProfitUSD || 0),
-      currentPnlPct: typeof p.CurrentPnLPct === 'number' ? p.CurrentPnLPct : 0,
-      status: p.Status || 'OPEN',
-      openedAt: p.OpenedAt,
-    }));
+    return rawList.map((p) => {
+      let rationale = p.AssassinationRationale || null;
+      if (!rationale && p.AssassinationRationaleJSON) {
+        try {
+          rationale = JSON.parse(p.AssassinationRationaleJSON);
+        } catch {
+          rationale = null;
+        }
+      }
+      return {
+        id: p.PositionID || p.ID,
+        strategy: p.Type,
+        hedgeMode: p.HedgeMode || '',
+        baseExchange: p.BaseExchange,
+        foreignExchange: p.ForeignExchange,
+        baseSymbol: p.BaseSymbol || 'BTC-KRW',
+        foreignSymbol: p.ForeignSymbol || 'BTC-USD',
+        investedUsd: Number(p.InvestmentUSD || 0),
+        entrySpreadPct: Number((p.EntrySpread ?? p.EntryPremium) || 0) * 100,
+        currentPnlUsd:
+          typeof p.CurrentPnLUSD === 'number'
+            ? p.CurrentPnLUSD
+            : Number(p.RealizedProfitUSD || 0),
+        currentPnlPct: typeof p.CurrentPnLPct === 'number' ? p.CurrentPnLPct : 0,
+        status: p.Status || 'OPEN',
+        assassinationRationale: rationale,
+        openedAt: p.OpenedAt,
+      };
+    });
   };
 
   useEffect(() => {
@@ -434,6 +446,34 @@ export const Dashboard = () => {
                         </span>
                       </div>
                     </div>
+
+                    {pos.assassinationRationale && (
+                      <div
+                        style={{
+                          marginTop: '10px',
+                          padding: '8px 10px',
+                          borderRadius: '6px',
+                          background: 'rgba(16, 185, 129, 0.08)',
+                          border: '1px solid rgba(16, 185, 129, 0.28)',
+                          fontSize: '12px',
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, color: '#10b981', marginBottom: '3px' }}>
+                          🎯{' '}
+                          {lang === 'ko'
+                            ? pos.assassinationRationale.reason_ko
+                            : pos.assassinationRationale.reason_en || pos.assassinationRationale.reason_ko}
+                        </div>
+                        <div className="mono" style={{ color: 'var(--text-secondary)', fontSize: '11.5px' }}>
+                          {lang === 'ko' ? '목표 김프' : 'Target'}: +
+                          {Number(pos.assassinationRationale.target_exit_kimp_pct || 3.5).toFixed(2)}% ·{' '}
+                          {lang === 'ko' ? '선물 베이시스' : 'Basis'}:{' '}
+                          {Number(pos.assassinationRationale.entry_basis_pct || 0).toFixed(2)}% ·{' '}
+                          {lang === 'ko' ? '잔여 대기' : 'Remaining'}:{' '}
+                          {Math.round(Number(pos.assassinationRationale.timeout_remaining_min || 720))}m
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -505,7 +545,52 @@ export const Dashboard = () => {
                           }}
                         >
                           {pos.baseExchange} → {pos.foreignExchange}
+                          {pos.hedgeMode && (
+                            <span
+                              className="mono"
+                              style={{ marginLeft: '6px', fontSize: '11px', opacity: 0.8 }}
+                            >
+                              [{pos.hedgeMode}]
+                            </span>
+                          )}
                         </div>
+                        {pos.assassinationRationale && (
+                          <div
+                            style={{
+                              marginTop: '6px',
+                              padding: '6px 10px',
+                              borderRadius: '6px',
+                              background: 'rgba(16, 185, 129, 0.09)',
+                              border: '1px solid rgba(16, 185, 129, 0.28)',
+                              fontSize: '12px',
+                              maxWidth: '420px',
+                            }}
+                          >
+                            <div style={{ fontWeight: 700, color: '#10b981' }}>
+                              🎯{' '}
+                              {lang === 'ko'
+                                ? pos.assassinationRationale.reason_ko
+                                : pos.assassinationRationale.reason_en ||
+                                  pos.assassinationRationale.reason_ko}
+                            </div>
+                            <div
+                              className="mono"
+                              style={{
+                                color: 'var(--text-secondary)',
+                                fontSize: '11px',
+                                marginTop: '2px',
+                              }}
+                            >
+                              {lang === 'ko' ? '목표 익절 김프' : 'Target Kimp'}: +
+                              {Number(pos.assassinationRationale.target_exit_kimp_pct || 3.5).toFixed(2)}% ·{' '}
+                              {lang === 'ko' ? '진입 베이시스' : 'Basis'}:{' '}
+                              {Number(pos.assassinationRationale.entry_basis_pct || 0).toFixed(2)}% ·{' '}
+                              {lang === 'ko' ? '남은 대기시간' : 'Remaining'}:{' '}
+                              {Math.round(Number(pos.assassinationRationale.timeout_remaining_min || 720))}
+                              {lang === 'ko' ? '분' : 'm'}
+                            </div>
+                          </div>
+                        )}
                       </td>
                       <td style={{ fontWeight: 500 }}>
                         {formatStrategyLabel(pos.strategy, lang)}

@@ -714,3 +714,219 @@ func (s *Server) handleSupportedExchanges(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// handleSimEvent injects or clears simulated exchange announcement & assassination events in Paper Mode.
+func (s *Server) handleSimEvent(w http.ResponseWriter, r *http.Request) {
+	userID := getUserIDFromContext(r)
+
+	if r.Method == http.MethodGet {
+		sym := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+		if sym == "" {
+			sym = "BTC"
+		}
+		sym = strings.Split(sym, "-")[0]
+		events := []exchange.AnnouncementEvent{}
+		if s.Redis != nil {
+			events = s.Redis.GetCoinAnnouncementEvents(r.Context(), sym)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"symbol": sym,
+			"events": events,
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Exchange               string  `json:"exchange"`
+		Symbol                 string  `json:"symbol"`
+		EventType              string  `json:"event_type"`
+		ScheduledOffsetMin     int     `json:"scheduled_offset_min"`
+		TargetOffsetPct        float64 `json:"target_offset_pct"`
+		RampMinutes            float64 `json:"ramp_minutes"`
+		AutoStageAssassination bool    `json:"auto_stage_assassination"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ex := strings.ToUpper(strings.TrimSpace(req.Exchange))
+	if ex == "" {
+		ex = "UPBIT"
+	}
+	coin := strings.ToUpper(strings.TrimSpace(req.Symbol))
+	if coin == "" {
+		coin = "BTC"
+	}
+	coin = strings.Split(coin, "-")[0]
+	evType := strings.ToUpper(strings.TrimSpace(req.EventType))
+
+	nowUnix := time.Now().Unix()
+
+	if evType == "CLEAR" || evType == "RESET" {
+		if s.Redis != nil {
+			_ = s.Redis.ClearCoinAnnouncementEvents(r.Context(), coin)
+		}
+		if s.DB != nil {
+			if settings, _ := s.DB.GetUserSettings(userID); settings != nil {
+				settings.SimStartOffsetPct = 0
+				settings.SimTargetOffsetPct = 0
+				settings.SimRampMinutes = 0
+				settings.SimStartedAt = 0
+				_ = s.DB.SaveUserSettings(settings)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "Simulated events and offset reset",
+			"symbol":  coin,
+		})
+		return
+	}
+
+	nowTime := time.Now().UTC()
+	var schedPtr *time.Time
+	if req.ScheduledOffsetMin > 0 {
+		t := nowTime.Add(time.Duration(req.ScheduledOffsetMin) * time.Minute)
+		schedPtr = &t
+	} else if evType == "NEW_KRW_LISTING" {
+		t := nowTime.Add(60 * time.Minute)
+		schedPtr = &t
+	} else if evType == "WALLET_SUSPENSION" {
+		t := nowTime.Add(90 * time.Minute)
+		schedPtr = &t
+	}
+
+	var title, summaryKO, summaryEN string
+	switch evType {
+	case "NEW_KRW_LISTING":
+		title = fmt.Sprintf("[모의 공지] 원화(KRW) 마켓 디지털 자산 추가 (%s)", coin)
+		summaryKO = fmt.Sprintf("🚀 원화 마켓 신규 상장 예고 (%s) — 상장 개시 직후 가두리 펌핑 기대", coin)
+		summaryEN = fmt.Sprintf("🚀 New KRW Market Listing Scheduled (%s) — Listing Surge Expected", coin)
+	case "INVESTMENT_WARNING":
+		title = fmt.Sprintf("[모의 공지] 거래유의 종목 지정 안내 (%s)", coin)
+		summaryKO = fmt.Sprintf("⚠️ 거래유의 종목 지정 및 입금 정지 (%s) — 가두리 프리미엄 급등 기대", coin)
+		summaryEN = fmt.Sprintf("⚠️ Investment Warning & Deposit Suspended (%s) — Gaduri Surge Expected", coin)
+	case "WALLET_SUSPENSION":
+		title = fmt.Sprintf("[모의 공지] 네트워크 업그레이드에 따른 입출금 일시 중단 안내 (%s)", coin)
+		summaryKO = fmt.Sprintf("🔒 입출금 일시 중단 예고 (%s) — 중단 전 선제 입금(암살 대기) 유효", coin)
+		summaryEN = fmt.Sprintf("🔒 Wallet Suspension Scheduled (%s) — Pre-stage Assassination Active", coin)
+	case "DELISTING":
+		title = fmt.Sprintf("[모의 공지] 거래지원 종료(상장폐지) 안내 (%s)", coin)
+		summaryKO = fmt.Sprintf("🚨 상장폐지 결정 (%s) — 신규 진입 즉시 차단 및 보유 포지션 긴급 청산", coin)
+		summaryEN = fmt.Sprintf("🚨 Delisting Announced (%s) — Entry Veto & Emergency Unwind", coin)
+	case "IN_TRANSIT_KIMP_DROP":
+		title = fmt.Sprintf("[모의 시나리오] 전송 도중 김프 급락 방어 (%s)", coin)
+		summaryKO = fmt.Sprintf("🛡️ 전송 도중 김프 급락 (%s) — 손절 매도 대신 STAGED_ASSASSINATION 자동 전환", coin)
+		summaryEN = fmt.Sprintf("🛡️ In-Transit Kimp Drop (%s) — Auto-switched to STAGED_ASSASSINATION", coin)
+	default:
+		evType = "INVESTMENT_WARNING"
+		title = fmt.Sprintf("[모의 공지] 이벤트 시뮬레이션 (%s)", coin)
+		summaryKO = title
+		summaryEN = title
+	}
+
+	annEvent := exchange.AnnouncementEvent{
+		ID:          fmt.Sprintf("sim-%s-%d", strings.ToLower(coin), nowUnix),
+		Exchange:    ex,
+		EventType:   evType,
+		Symbols:     []string{coin},
+		Title:       title,
+		SummaryKO:   summaryKO,
+		SummaryEN:   summaryEN,
+		AnnouncedAt: nowTime,
+		ScheduledAt: schedPtr,
+		IsCatalyst:  evType != "NONE" && evType != "DELISTING",
+	}
+
+	if s.Redis != nil && evType != "IN_TRANSIT_KIMP_DROP" {
+		_ = s.Redis.PublishAnnouncementEvent(r.Context(), annEvent)
+	}
+
+	// Apply accompanying Paper Mode price offset ramp if requested
+	if s.DB != nil {
+		settings, _ := s.DB.GetUserSettings(userID)
+		if settings == nil {
+			settings = &postgres.UserSettings{
+				UserID:           userID,
+				ActiveViewMode:   "PAPER",
+				PaperBotStatus:   "RUNNING",
+				LiveBotStatus:    "STOPPED",
+				PaperUpbitKRW:    50000000.0,
+				PaperCoinbaseUSD: 35000.0,
+				SimExchange:      ex,
+			}
+		}
+		currSim := computeSimStatusFromSettings(settings)
+		currOffset, _ := currSim["current_offset_pct"].(float64)
+		settings.SimExchange = ex
+		settings.SimStartOffsetPct = currOffset
+		settings.SimTargetOffsetPct = req.TargetOffsetPct
+		settings.SimRampMinutes = req.RampMinutes
+		settings.SimStartedAt = nowUnix
+		_ = s.DB.SaveUserSettings(settings)
+
+		if s.Redis != nil {
+			simCmd, _ := json.Marshal(map[string]interface{}{
+				"action":                "SET_SIM_OFFSET",
+				"mode":                  "PAPER",
+				"exchange":              ex,
+				"sim_exchange":          ex,
+				"target_offset_pct":     req.TargetOffsetPct,
+				"sim_target_offset_pct": req.TargetOffsetPct,
+				"ramp_minutes":          req.RampMinutes,
+				"sim_ramp_minutes":      req.RampMinutes,
+			})
+			_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), simCmd)
+		}
+	}
+
+	// Dispatch corresponding Paper Engine position action so the user sees immediate execution
+	if s.Redis != nil {
+		if evType == "DELISTING" {
+			if activePos, err := s.DB.GetActivePositionsByUserAndMode(userID, true); err == nil {
+				for _, p := range activePos {
+					if strings.HasPrefix(strings.ToUpper(p.BaseSymbol), coin+"-") {
+						closeCmd, _ := json.Marshal(map[string]interface{}{
+							"action":      "FORCE_CLOSE",
+							"position_id": p.PositionID,
+							"mode":        "PAPER",
+						})
+						_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), closeCmd)
+					}
+				}
+			}
+		} else if req.AutoStageAssassination {
+			actionType := 3 // STAGE_ASSASSINATION
+			if evType == "IN_TRANSIT_KIMP_DROP" {
+				actionType = 1 // Start normal transfer first, then let Kimp drop trigger auto-switch
+			}
+			enterCmd, _ := json.Marshal(map[string]interface{}{
+				"action":           "FORCE_ENTER",
+				"mode":             "PAPER",
+				"base_exchange":    "UPBIT",
+				"foreign_exchange": "COINBASE",
+				"base_symbol":      coin + "-KRW",
+				"foreign_symbol":   coin + "-USD",
+				"strategy":         "FOREIGN_TRANSFER",
+				"action_type":      actionType,
+				"event_type":       evType,
+				"expected_roi":     0.045,
+				"investment_usd":   2500.0,
+			})
+			_ = s.Redis.PublishUserCommand(r.Context(), fmt.Sprint(userID), enterCmd)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Simulated announcement event dispatched",
+		"event":   annEvent,
+	})
+}
