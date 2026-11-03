@@ -77,7 +77,137 @@ func (p *PubSubClient) SubscribeTickers(ctx context.Context, symbols []exchange.
 // PublishFXRate broadcasts a normalized FX rate for a given quote/base pair to the cluster.
 func (p *PubSubClient) PublishFXRate(ctx context.Context, base, quote string, rate float64) error {
 	channel := "fx:" + base + "-" + quote
+	_ = p.client.Set(ctx, channel+":latest", rate, 24*time.Hour).Err()
 	return p.client.Publish(ctx, channel, rate).Err()
+}
+
+// GetCachedFXRate returns the latest cached FX rate from Redis if available.
+func (p *PubSubClient) GetCachedFXRate(ctx context.Context, base, quote string) (float64, error) {
+	channel := "fx:" + base + "-" + quote + ":latest"
+	return p.client.Get(ctx, channel).Float64()
+}
+
+// PublishExchangeTetherRate broadcasts and caches the real-time USDT-KRW rate for a specific domestic exchange (e.g., "UPBIT", "BITHUMB").
+func (p *PubSubClient) PublishExchangeTetherRate(ctx context.Context, exchangeName string, rate float64) error {
+	ex := strings.ToUpper(strings.TrimSpace(exchangeName))
+	if ex == "" {
+		ex = "UPBIT"
+	}
+	key := "fx:" + ex + ":USDT-KRW"
+	_ = p.client.Set(ctx, key+":latest", rate, 24*time.Hour).Err()
+	_ = p.client.HSet(ctx, "market:tether_rates:krw", ex, rate).Err()
+	payload, _ := json.Marshal(map[string]interface{}{
+		"exchange": ex,
+		"rate":     rate,
+	})
+	return p.client.Publish(ctx, "fx:tether_krw", payload).Err()
+}
+
+// GetAllExchangeTetherRates returns a map of domestic exchange -> USDT-KRW rate.
+func (p *PubSubClient) GetAllExchangeTetherRates(ctx context.Context) map[string]float64 {
+	res := make(map[string]float64)
+	raw, err := p.client.HGetAll(ctx, "market:tether_rates:krw").Result()
+	if err != nil {
+		return res
+	}
+	for k, v := range raw {
+		var f float64
+		if err := json.Unmarshal([]byte(v), &f); err == nil && f > 0 {
+			res[strings.ToUpper(k)] = f
+		}
+	}
+	return res
+}
+
+// SubscribeExchangeTetherRates listens for per-exchange USDT-KRW rate updates.
+func (p *PubSubClient) SubscribeExchangeTetherRates(ctx context.Context, onUpdate func(exchangeName string, rate float64)) {
+	if existing := p.GetAllExchangeTetherRates(ctx); len(existing) > 0 {
+		for ex, r := range existing {
+			onUpdate(ex, r)
+		}
+	}
+	pubsub := p.client.Subscribe(ctx, "fx:tether_krw")
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			var parsed struct {
+				Exchange string  `json:"exchange"`
+				Rate     float64 `json:"rate"`
+			}
+			if err := json.Unmarshal([]byte(msg.Payload), &parsed); err == nil && parsed.Rate > 0 {
+				onUpdate(strings.ToUpper(parsed.Exchange), parsed.Rate)
+			}
+		}
+	}
+}
+
+// PublishAnnouncementEvent stores and broadcasts an LLM-classified exchange announcement / catalyst event.
+func (p *PubSubClient) PublishAnnouncementEvent(ctx context.Context, evt exchange.AnnouncementEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return err
+	}
+	for _, sym := range evt.Symbols {
+		coin := strings.ToUpper(strings.Split(strings.TrimSpace(sym), "-")[0])
+		if coin == "" {
+			continue
+		}
+		coinKey := "market:events:coin:" + coin
+		_ = p.client.LPush(ctx, coinKey, payload).Err()
+		_ = p.client.LTrim(ctx, coinKey, 0, 19).Err()
+		_ = p.client.Expire(ctx, coinKey, 48*time.Hour).Err()
+	}
+	_ = p.client.LPush(ctx, "market:events:recent", payload).Err()
+	_ = p.client.LTrim(ctx, "market:events:recent", 0, 49).Err()
+	_ = p.client.Expire(ctx, "market:events:recent", 48*time.Hour).Err()
+	return p.client.Publish(ctx, "event:announcement", payload).Err()
+}
+
+// GetCoinAnnouncementEvents returns recent LLM-classified announcement events for a specific coin ticker (e.g. "BTC", "SOL").
+func (p *PubSubClient) GetCoinAnnouncementEvents(ctx context.Context, coin string) []exchange.AnnouncementEvent {
+	cleanCoin := strings.ToUpper(strings.Split(strings.TrimSpace(coin), "-")[0])
+	if cleanCoin == "" {
+		return nil
+	}
+	rawList, err := p.client.LRange(ctx, "market:events:coin:"+cleanCoin, 0, 19).Result()
+	if err != nil || len(rawList) == 0 {
+		return nil
+	}
+	var events []exchange.AnnouncementEvent
+	seen := make(map[string]bool)
+	for _, item := range rawList {
+		var evt exchange.AnnouncementEvent
+		if err := json.Unmarshal([]byte(item), &evt); err == nil {
+			dedupKey := evt.ID + ":" + evt.EventType
+			if !seen[dedupKey] {
+				seen[dedupKey] = true
+				events = append(events, evt)
+			}
+		}
+	}
+	return events
+}
+
+// SubscribeAnnouncementEvents subscribes to live LLM-classified exchange announcement events.
+func (p *PubSubClient) SubscribeAnnouncementEvents(ctx context.Context, outCh chan<- exchange.AnnouncementEvent) {
+	pubsub := p.client.Subscribe(ctx, "event:announcement")
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			var evt exchange.AnnouncementEvent
+			if err := json.Unmarshal([]byte(msg.Payload), &evt); err == nil {
+				outCh <- evt
+			}
+		}
+	}
 }
 
 // SubscribeFXRate listens for updates on a specific currency pair (e.g., "USD", "KRW") 

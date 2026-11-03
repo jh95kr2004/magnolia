@@ -197,6 +197,11 @@ func main() {
 			}
 		}
 
+		// Always monitor USDT-KRW on Korean domestic exchanges to track per-exchange Tether Kimp
+		if client.GetName() == "UPBIT" || client.GetName() == "BITHUMB" {
+			symbolMap[exchange.Symbol("USDT-KRW")] = true
+		}
+
 		var symbolsToMonitor []exchange.Symbol
 		for sym := range symbolMap {
 			symbolsToMonitor = append(symbolsToMonitor, sym)
@@ -317,6 +322,12 @@ func main() {
 						merged.AskFutureUSD = merged.RawFutureAsk / krwRate
 					}
 				}
+
+				// Broadcast per-exchange Tether (USDT-KRW) rate whenever updated
+				if string(merged.Symbol) == "USDT-KRW" && merged.RawBid > 500 {
+					strategy.SetExchangeTetherRate(merged.Exchange, "KRW", merged.RawBid)
+					_ = redisClient.PublishExchangeTetherRate(ctx, merged.Exchange, merged.RawBid)
+				}
 			}
 
 			// Save back to sync.Map
@@ -354,11 +365,13 @@ func main() {
 				fxClient := fx.NewFixerClient(fxAPIKey, isFreeTier)
 				if rate := fetchFX(ctx, fxClient, redisClient, influxClient); rate > 0 {
 					setKRWRate(rate)
+					strategy.SetFXRate("KRW", rate)
 					return
 				}
 			}
 			if rate := fetchPublicUSDKRW(ctx, redisClient, influxClient); rate > 0 {
 				setKRWRate(rate)
+				strategy.SetFXRate("KRW", rate)
 			}
 		}
 
@@ -372,6 +385,9 @@ func main() {
 			}
 		}
 	}()
+
+	// 6b. Upbit Public Announcement Poller + AI LLM Catalyst Classifier Daemon
+	go startUpbitAnnouncementMonitor(ctx, redisClient)
 
 	// 7. High-Speed Background Ranker Daemon
 	go func() {
@@ -505,6 +521,116 @@ func startRESTPseudoWebsocketFallback(ctx context.Context, c exchange.Client, sy
 				
 				priceCh <- update
 			}
+		}
+	}
+}
+
+// startUpbitAnnouncementMonitor polls Upbit's public announcement API every 15s,
+// passes only newly detected notices (id > lastSeenID) to the AI LLM classifier (/analyze_announcement),
+// and broadcasts catalyst events (NEW_KRW_LISTING, INVESTMENT_WARNING, DELISTING, WALLET_SUSPENSION) to Redis.
+func startUpbitAnnouncementMonitor(ctx context.Context, rClient *redis.PubSubClient) {
+	if rClient == nil {
+		return
+	}
+	aiBaseURL := os.Getenv("AI_SERVICE_URL")
+	if aiBaseURL == "" {
+		aiBaseURL = "http://ai_service:8000"
+	}
+	aiBaseURL = strings.TrimRight(aiBaseURL, "/")
+
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+	var lastSeenID int64 = 0
+
+	pollOnce := func(isInit bool) {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=10&category=all", nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MagnoliaFeed/1.0)")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return
+		}
+
+		var payload struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Notices []struct {
+					ID        int64  `json:"id"`
+					Title     string `json:"title"`
+					Category  string `json:"category"`
+					ListedAt  string `json:"listed_at"`
+					CreatedAt string `json:"created_at"`
+				} `json:"notices"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return
+		}
+
+		notices := payload.Data.Notices
+		if len(notices) == 0 {
+			return
+		}
+
+		if isInit {
+			for _, n := range notices {
+				if n.ID > lastSeenID {
+					lastSeenID = n.ID
+				}
+			}
+			return
+		}
+
+		for i := len(notices) - 1; i >= 0; i-- {
+			n := notices[i]
+			if n.ID <= lastSeenID {
+				continue
+			}
+			lastSeenID = n.ID
+
+			reqBody, _ := json.Marshal(map[string]interface{}{
+				"notice_id":    fmt.Sprintf("upbit-%d", n.ID),
+				"exchange":     "UPBIT",
+				"title":        n.Title,
+				"category":     n.Category,
+				"published_at": n.ListedAt,
+			})
+			aiReq, err := http.NewRequestWithContext(ctx, "POST", aiBaseURL+"/analyze_announcement", strings.NewReader(string(reqBody)))
+			if err != nil {
+				continue
+			}
+			aiReq.Header.Set("Content-Type", "application/json")
+			aiResp, err := httpClient.Do(aiReq)
+			if err != nil {
+				continue
+			}
+			var evt exchange.AnnouncementEvent
+			decodeErr := json.NewDecoder(aiResp.Body).Decode(&evt)
+			aiResp.Body.Close()
+			if decodeErr == nil && evt.EventType != "" && evt.EventType != "NONE" && len(evt.Symbols) > 0 {
+				if evt.AnnouncedAt.IsZero() {
+					evt.AnnouncedAt = time.Now().UTC()
+				}
+				log.Printf("[LLM-Announcement] Detected %s on %v: %s", evt.EventType, evt.Symbols, evt.Title)
+				_ = rClient.PublishAnnouncementEvent(ctx, evt)
+			}
+		}
+	}
+
+	pollOnce(true)
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollOnce(false)
 		}
 	}
 }

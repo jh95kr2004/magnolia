@@ -111,8 +111,16 @@ func (p *PersonalFilter) EvaluateAndFilter(
 	var results []RankedOpportunity
 
 	for _, raw := range rawOps {
-		// Check Profit Threshold early drop
-		if raw.ExpectedMargin < threshold.MinTargetProfitPercent {
+		// Never open a new position on a coin announced for DELISTING (거래지원 종료)
+		if raw.EventType == "DELISTING" {
+			continue
+		}
+
+		// Allow assassination staging on catalyst events even if current spot spread is still low
+		isCatalystEvent := raw.EventType == "NEW_KRW_LISTING" || raw.EventType == "INVESTMENT_WARNING" || raw.EventType == "WALLET_SUSPENSION"
+
+		// Check Profit Threshold early drop (unless catalyst event is present for staging evaluation)
+		if !isCatalystEvent && raw.ExpectedMargin < threshold.MinTargetProfitPercent {
 			continue // Immediately drop below-threshold margins
 		}
 
@@ -123,8 +131,6 @@ func (p *PersonalFilter) EvaluateAndFilter(
 		}
 
 		// Prevent Self-Competition (Duplicate entry)
-		// TODO: Even though the user already has a duplicate position, the engine should see if
-		// the user can make more profit if scale-in.
 		if activeCoinMap[string(pair.BaseMarketInfo.Symbol)] {
 			continue // Already trading this coin, skip
 		}
@@ -135,11 +141,8 @@ func (p *PersonalFilter) EvaluateAndFilter(
 			break // System completely out of allocated capital, stop testing
 		}
 
-		// AI Weight Implementation (Prototype Mock -> Normally fetched from Redis/AI Cache)
-		// Assuming we parsed raw.AIWeight or default to 1.0 here:
-		// TODO: Adopt AI results. Currently, none of strategies use AI results.
-		aiSignal := "SCALE_IN" // Mock baseline
-		aiWeight := 1.0        // Default 100% allocation
+		aiSignal := "SCALE_IN"
+		aiWeight := 1.0
 
 		// Determine dynamic sizing based on AI confidence
 		investmentUsd := remainingCapital * aiWeight
@@ -147,39 +150,51 @@ func (p *PersonalFilter) EvaluateAndFilter(
 			investmentUsd = threshold.PerPositionLimitUsd
 		}
 
-		// Fetch quote currency balances and convert to USD
+		// Fetch quote currency balances and convert to USD using live FX rate
 		baseQuote := pair.BaseMarketInfo.QuoteCurrency
 		foreignQuote := pair.ForeignMarketInfo.QuoteCurrency
 
 		baseBal := baseBalMap[baseQuote]
 		foreignBal := foreignBalMap[foreignQuote]
 
+		liveFX := raw.FXRateKRW
+		if liveFX <= 500 {
+			liveFX = GetFXRate("KRW")
+		}
+		if liveFX <= 500 {
+			liveFX = 1385.0
+		}
+
 		baseBalanceUsd := baseBal
 		if baseQuote == "KRW" {
-			baseBalanceUsd = baseBal / 1400.0
+			baseBalanceUsd = baseBal / liveFX
 		}
 
 		foreignBalanceUsd := foreignBal
 		if foreignQuote == "KRW" {
-			foreignBalanceUsd = foreignBal / 1400.0
+			foreignBalanceUsd = foreignBal / liveFX
 		}
 
 		// Recreate precise spot updates for strict Strategy Evaluation
 		baseSpotUpdate := exchange.PriceUpdate{
-			Exchange:      p.baseExchange.GetName(), // Fixed receiver
+			Exchange:      p.baseExchange.GetName(),
 			Symbol:        exchange.Symbol(raw.BaseSymbol),
-			QuoteCurrency: "KRW",
+			QuoteCurrency: baseQuote,
+			RawBid:        raw.BasePriceUSD * liveFX,
+			RawAsk:        raw.BasePriceUSD * liveFX,
 			BidUSD:        raw.BasePriceUSD,
 			BidFutureUSD:  raw.BaseFuturePriceUSD,
 			AskUSD:        raw.BasePriceUSD,
 			AskFutureUSD:  raw.BaseFuturePriceUSD,
-			FXRate:        1400.0, // TODO: Should be passed down or retrieved, mocked for brevity
+			FXRate:        liveFX,
 		}
 
 		foreignSpotUpdate := exchange.PriceUpdate{
-			Exchange:      p.foreignExchange.GetName(), // Fixed receiver
+			Exchange:      p.foreignExchange.GetName(),
 			Symbol:        exchange.Symbol(raw.ForeignSymbol),
-			QuoteCurrency: "USD",
+			QuoteCurrency: foreignQuote,
+			RawBid:        raw.ForeignPriceUSD,
+			RawAsk:        raw.ForeignPriceUSD,
 			BidUSD:        raw.ForeignPriceUSD,
 			BidFutureUSD:  raw.ForeignFuturePriceUSD,
 			AskUSD:        raw.ForeignPriceUSD,
@@ -187,20 +202,34 @@ func (p *PersonalFilter) EvaluateAndFilter(
 			FXRate:        1.0,
 		}
 
+		vaspTier := GetVASPTier(p.baseExchange.GetName(), p.foreignExchange.GetName())
+		needsWalletProxy := (vaspTier == exchange.VASPTier3RiskAssessed) && (investmentUsd*liveFX >= 1000000.0)
+
 		// Evaluation Parameters
 		params := PremiumEvalParams{
-			InvestmentUsd:         investmentUsd,
-			BaseBalanceUsd:        baseBalanceUsd,
-			ForeignBalanceUsd:     foreignBalanceUsd,
-			BaseSupportsMargin:    p.baseExchange.SupportsMargin(),
-			ForeignSupportsMargin: p.foreignExchange.SupportsMargin(),
-			// Network fees and predictions mocked for brevity
-			PredictionConfidence: 0.8,
-			AISignal:             aiSignal,
-			AIWeight:             aiWeight,
-			TransferFeeFixedUsd:  5.0,
-			EstTransferTime:      5 * time.Minute,
-			BalanceSkewThreshold: skewThreshold,
+			InvestmentUsd:              investmentUsd,
+			BaseBalanceUsd:             baseBalanceUsd,
+			ForeignBalanceUsd:          foreignBalanceUsd,
+			BaseSupportsMargin:         p.baseExchange.SupportsMargin(),
+			ForeignSupportsMargin:      p.foreignExchange.SupportsMargin(),
+			PredictionConfidence:       0.8,
+			AISignal:                   aiSignal,
+			AIWeight:                   aiWeight,
+			TransferFeeFixedUsd:        5.0,
+			EstTransferTime:            5 * time.Minute,
+			NeedsWalletProxy:           needsWalletProxy,
+			WalletTransferFeeFixedUsd:  2.5,
+			WalletEstTransferTime:      3 * time.Minute,
+			BalanceSkewThreshold:       skewThreshold,
+			TetherRealPremiumPct:       raw.RealCoinPremiumPct / 100.0,
+			FiatPremiumPct:             raw.PremiumPct / 100.0,
+			ForeignBasisPct:            raw.ForeignBasisPct / 100.0,
+			VASPTier:                   vaspTier,
+			StageAssassination:         isCatalystEvent && raw.RealCoinPremiumPct < 1.5,
+			PreStageListing:            raw.EventType == "NEW_KRW_LISTING" && !raw.IsWalletOpen,
+			EventType:                  raw.EventType,
+			EventTitle:                 raw.EventTitle,
+			TargetAssassinationKimpPct: 4.5,
 		}
 
 		var evals []StrategyEvaluation

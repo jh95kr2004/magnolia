@@ -198,7 +198,8 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 	var parsed []struct {
 		Market      string `json:"market"`
 		MarketEvent struct {
-			Warning bool `json:"warning"`
+			Warning bool            `json:"warning"`
+			Caution map[string]bool `json:"caution"`
 		} `json:"market_event"`
 		MarketState string `json:"market_state"` // active, etc.
 	}
@@ -228,11 +229,18 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 			}
 		}
 
-		// Warning marks potentially illiquid/risky assets, or trading might be restricted.
-		// NOTE: Upbit /v1/market/all does not return 'market_state', so it defaults to "". We assume active if no severe warning.
-		isTradingEnabled := !p.MarketEvent.Warning
+		var cautionTypes []string
+		for k, v := range p.MarketEvent.Caution {
+			if v {
+				cautionTypes = append(cautionTypes, strings.ToUpper(k))
+			}
+		}
+
+		// Note: Investment warning (유의 종목) coins remain actively tradable on Upbit until delisting,
+		// and often experience gaduri premium surges. Keep trading enabled unless market_state is explicitly inactive.
+		isTradingEnabled := true
 		if p.MarketState != "" {
-			isTradingEnabled = isTradingEnabled && (p.MarketState == "active")
+			isTradingEnabled = (p.MarketState == "active")
 		}
 
 		// Filtering directly at the client level: we only care about KRW fiat markets on Upbit for cross-exchange arbitrage
@@ -256,6 +264,9 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 			IsTradingEnabled:  isTradingEnabled,
 			IsDepositEnabled:  canDeposit,
 			IsWithdrawEnabled: canWithdraw,
+			IsWarning:         p.MarketEvent.Warning,
+			IsCaution:         len(cautionTypes) > 0,
+			CautionTypes:      cautionTypes,
 		})
 	}
 
@@ -932,4 +943,181 @@ func (u *UpbitClient) GetWithdrawalWhitelist(ctx context.Context, currency Curre
 	}
 
 	return whitelists, nil
+}
+
+// VerifyTravelRuleDeposit implements TravelRuleVerifier using Upbit's official Travel Rule OpenAPI:
+// 1. Checks `GET /v1/deposits` for incoming deposits matching currency/txID.
+// 2. If `state == "TRAVEL_RULE_SUSPECTED"`, queries `GET /v1/travel_rule/vasps` to resolve the sending VASP UUID.
+// 3. Triggers `POST /v1/travel_rule/deposit/uuid` (or `/v1/travel_rule/deposit/txid`) for zero-touch account-owner verification.
+func (u *UpbitClient) VerifyTravelRuleDeposit(ctx context.Context, currency Currency, txID string, fromExchange string) (*TravelRuleDepositStatus, error) {
+	if u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy" {
+		return &TravelRuleDepositStatus{
+			TxID:         txID,
+			DepositState: "ACCEPTED",
+			Verified:     true,
+			Message:      "Public/Paper mode deposit auto-verified",
+		}, nil
+	}
+
+	baseURL := upbitRESTURL
+	if customURL := os.Getenv("UPBIT_REST_URL_OVERRIDE"); customURL != "" {
+		baseURL = strings.TrimRight(customURL, "/")
+	}
+
+	// 1. Query recent deposits for currency
+	params := url.Values{}
+	if currency != "" {
+		params.Set("currency", toUpbitCurrency(currency))
+	}
+	if txID != "" {
+		params.Set("txid", txID)
+	}
+	queryStr := params.Encode()
+	token, err := u.signPayload(queryStr)
+	if err != nil {
+		return nil, err
+	}
+
+	reqUrl := baseURL + "/deposits"
+	if queryStr != "" {
+		reqUrl += "?" + queryStr
+	}
+	req, _ := http.NewRequestWithContext(ctx, "GET", reqUrl, nil)
+	req.Header.Add("Authorization", "Bearer "+token)
+
+	resp, err := u.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var deposits []struct {
+		UUID     string `json:"uuid"`
+		TxID     string `json:"txid"`
+		Currency string `json:"currency"`
+		State    string `json:"state"`
+	}
+	if resp.StatusCode == 200 {
+		_ = json.NewDecoder(resp.Body).Decode(&deposits)
+	}
+
+	depositUUID := ""
+	depositState := ""
+	for _, d := range deposits {
+		if txID == "" || strings.EqualFold(d.TxID, txID) {
+			depositUUID = d.UUID
+			depositState = strings.ToUpper(d.State)
+			break
+		}
+	}
+
+	if depositState == "ACCEPTED" || depositState == "DONE" {
+		return &TravelRuleDepositStatus{
+			DepositUUID:  depositUUID,
+			TxID:         txID,
+			DepositState: depositState,
+			Verified:     true,
+			Message:      "Deposit already accepted by Upbit",
+		}, nil
+	}
+
+	// 2. Lookup VASP UUID via GET /v1/travel_rule/vasps
+	vaspToken, err := u.signPayload("")
+	if err != nil {
+		return nil, err
+	}
+	vaspReq, _ := http.NewRequestWithContext(ctx, "GET", baseURL+"/travel_rule/vasps", nil)
+	vaspReq.Header.Add("Authorization", "Bearer "+vaspToken)
+	vaspResp, err := u.httpClient.Do(vaspReq)
+	if err != nil {
+		return nil, err
+	}
+	defer vaspResp.Body.Close()
+
+	var vasps []struct {
+		VaspName   string `json:"vasp_name"`
+		VaspUUID   string `json:"vasp_uuid"`
+		Depositable bool  `json:"depositable"`
+	}
+	if vaspResp.StatusCode == 200 {
+		_ = json.NewDecoder(vaspResp.Body).Decode(&vasps)
+	}
+
+	targetEx := strings.ToUpper(strings.TrimSpace(fromExchange))
+	vaspUUID := ""
+	for _, v := range vasps {
+		vName := strings.ToUpper(v.VaspName)
+		if strings.Contains(vName, targetEx) || (targetEx == "BINANCE" && strings.Contains(vName, "바이낸스")) ||
+			(targetEx == "BYBIT" && strings.Contains(vName, "바이비트")) ||
+			(targetEx == "OKX" && strings.Contains(vName, "오케이엑스")) ||
+			(targetEx == "BITHUMB" && strings.Contains(vName, "빗썸")) ||
+			(targetEx == "COINBASE" && strings.Contains(vName, "코인베이스")) {
+			vaspUUID = v.VaspUUID
+			break
+		}
+	}
+	if vaspUUID == "" && len(vasps) > 0 {
+		vaspUUID = vasps[0].VaspUUID
+	}
+	if vaspUUID == "" {
+		return &TravelRuleDepositStatus{
+			DepositUUID:  depositUUID,
+			TxID:         txID,
+			DepositState: depositState,
+			Verified:     false,
+			Message:      fmt.Sprintf("VASP UUID not found for exchange %s", fromExchange),
+		}, nil
+	}
+
+	// 3. Trigger POST /v1/travel_rule/deposit/uuid (or /txid fallback)
+	var verifyEndpoint string
+	var verifyParams url.Values = url.Values{}
+	verifyParams.Set("vasp_uuid", vaspUUID)
+	if depositUUID != "" {
+		verifyEndpoint = baseURL + "/travel_rule/deposit/uuid"
+		verifyParams.Set("deposit_uuid", depositUUID)
+	} else {
+		verifyEndpoint = baseURL + "/travel_rule/deposit/txid"
+		verifyParams.Set("txid", txID)
+		verifyParams.Set("currency", toUpbitCurrency(currency))
+	}
+
+	verifyQuery := verifyParams.Encode()
+	verifyToken, err := u.signPayload(verifyQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyMap := make(map[string]string)
+	for k, v := range verifyParams {
+		if len(v) > 0 {
+			bodyMap[k] = v[0]
+		}
+	}
+	jsonBytes, _ := json.Marshal(bodyMap)
+
+	postReq, _ := http.NewRequestWithContext(ctx, "POST", verifyEndpoint, strings.NewReader(string(jsonBytes)))
+	postReq.Header.Add("Authorization", "Bearer "+verifyToken)
+	postReq.Header.Add("Content-Type", "application/json")
+
+	postResp, err := u.httpClient.Do(postReq)
+	if err != nil {
+		return nil, err
+	}
+	defer postResp.Body.Close()
+
+	var verifyRes struct {
+		DepositUUID  string `json:"deposit_uuid"`
+		DepositState string `json:"deposit_state"`
+		Verified     bool   `json:"verified"`
+	}
+	_ = json.NewDecoder(postResp.Body).Decode(&verifyRes)
+
+	return &TravelRuleDepositStatus{
+		DepositUUID:  verifyRes.DepositUUID,
+		TxID:         txID,
+		DepositState: verifyRes.DepositState,
+		Verified:     verifyRes.Verified,
+		Message:      fmt.Sprintf("Upbit Travel Rule API status=%d verified=%v state=%s", postResp.StatusCode, verifyRes.Verified, verifyRes.DepositState),
+	}, nil
 }

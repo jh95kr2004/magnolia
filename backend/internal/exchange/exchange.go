@@ -119,11 +119,52 @@ type MarketInfo struct {
 	Symbol                   Symbol
 	BaseCurrency             Currency
 	QuoteCurrency            Currency
-	MarketType               string // "SPOT" or "FUTURE"
-	IsTradingEnabled         bool   // Can we execute buy/sell orders?
-	IsDepositEnabled         bool   // Can we transfer assets into the exchange?
-	IsWithdrawEnabled        bool   // Can we transfer assets out?
+	MarketType               string   // "SPOT" or "FUTURE"
+	IsTradingEnabled         bool     // Can we execute buy/sell orders?
+	IsDepositEnabled         bool     // Can we transfer assets into the exchange?
+	IsWithdrawEnabled        bool     // Can we transfer assets out?
+	IsWarning                bool     // Upbit/Bithumb investment warning (유의 종목)
+	IsCaution                bool     // Upbit market caution (가격 급등락, 입금량 급등, 거래량 급등 등)
+	CautionTypes             []string // Specific caution categories (e.g., "DEPOSIT_AMOUNT_SOARING", "TRADING_VOLUME_SOARING")
 	MaintenanceScheduledTime *time.Time
+}
+
+// VASPTier classifies an exchange's Travel Rule interoperability level with Korean exchanges (Upbit/Bithumb).
+type VASPTier string
+
+const (
+	VASPTier1Solution     VASPTier = "TIER1_SOLUTION"      // 100% auto-credited via VerifyVASP/CODE solution
+	VASPTier2OwnerLinked  VASPTier = "TIER2_OWNER_LINKED"  // Account owner API verification supported (/v1/travel_rule/deposit/uuid)
+	VASPTier3RiskAssessed VASPTier = "TIER3_RISK_ASSESSED" // Manual review if >=1M KRW direct deposit (e.g., Coinbase, Kraken); requires 2-hop walletProxy or non-transfer strategy
+)
+
+// AnnouncementEvent represents a parsed exchange announcement or market catalyst signal.
+type AnnouncementEvent struct {
+	ID          string     `json:"id"`
+	Exchange    string     `json:"exchange"`
+	EventType   string     `json:"event_type"` // NEW_KRW_LISTING, INVESTMENT_WARNING, DELISTING, WALLET_SUSPENSION, VOLUME_SURGE, NONE
+	Symbols     []string   `json:"symbols"`
+	Title       string     `json:"title"`
+	SummaryKO   string     `json:"summary_ko"`
+	SummaryEN   string     `json:"summary_en"`
+	AnnouncedAt time.Time  `json:"announced_at"`
+	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
+	IsCatalyst  bool       `json:"is_catalyst"`
+}
+
+// TravelRuleDepositStatus represents the verification result of a deposit subject to Travel Rule.
+type TravelRuleDepositStatus struct {
+	DepositUUID  string `json:"deposit_uuid"`
+	TxID         string `json:"txid"`
+	DepositState string `json:"deposit_state"` // ACCEPTED, PROCESSING, TRAVEL_RULE_SUSPECTED, REFUNDING
+	Verified     bool   `json:"verified"`
+	Message      string `json:"message"`
+}
+
+// TravelRuleVerifier is an optional interface implemented by domestic exchanges (e.g., Upbit)
+// that expose a programmatic Travel Rule verification OpenAPI (`POST /v1/travel_rule/deposit/uuid`).
+type TravelRuleVerifier interface {
+	VerifyTravelRuleDeposit(ctx context.Context, currency Currency, txID string, fromExchange string) (*TravelRuleDepositStatus, error)
 }
 
 // APIKeyPermissions represents the granted scopes of the currently used API key
