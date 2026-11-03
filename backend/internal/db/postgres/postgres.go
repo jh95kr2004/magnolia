@@ -348,11 +348,22 @@ func (db *DB) ReducePositionAmount(positionID string, reducedUsd, subtractedBase
 		}).Error
 }
 
+var activePositionStatuses = []string{
+	"OPEN",
+	"IN_TRANSIT",
+	"TRANSFERRING",
+	"REPAYING",
+	"AWAITING_REPAY",
+	"STAGED_ASSASSINATION",
+	"PRE_STAGED_LISTING",
+	"AWAITING_TRAVEL_RULE",
+}
+
 // GetActivePositions fetches all active positions to resume tracking during server restart / failover.
 // Filters tightly by nodeID to prevent kubernetes master replicas from duplicate-monitoring.
 func (db *DB) GetActivePositions(nodeID string) ([]ActivePosition, error) {
 	var positions []ActivePosition
-	err := db.conn.Where("status IN ? AND monitor_node_id = ?", []string{"OPEN", "IN_TRANSIT", "TRANSFERRING", "REPAYING", "AWAITING_REPAY"}, nodeID).Find(&positions).Error
+	err := db.conn.Where("status IN ? AND monitor_node_id = ?", activePositionStatuses, nodeID).Find(&positions).Error
 	return positions, err
 }
 
@@ -360,14 +371,14 @@ func (db *DB) GetActivePositions(nodeID string) ([]ActivePosition, error) {
 // Used by PersonalFilter to prevent duplicate entries on the same coin/exchange pairs.
 func (db *DB) GetActivePositionsByUser(userID uint) ([]ActivePosition, error) {
 	var positions []ActivePosition
-	err := db.conn.Where("user_id = ? AND status IN ?", userID, []string{"OPEN", "IN_TRANSIT", "TRANSFERRING", "REPAYING", "AWAITING_REPAY"}).Find(&positions).Error
+	err := db.conn.Where("user_id = ? AND status IN ?", userID, activePositionStatuses).Find(&positions).Error
 	return positions, err
 }
 
 // GetActivePositionsByUserAndMode fetches active positions filtered by Paper vs Live mode.
 func (db *DB) GetActivePositionsByUserAndMode(userID uint, isPaper bool) ([]ActivePosition, error) {
 	var positions []ActivePosition
-	err := db.conn.Where("user_id = ? AND is_paper = ? AND status IN ?", userID, isPaper, []string{"OPEN", "IN_TRANSIT", "TRANSFERRING", "REPAYING", "AWAITING_REPAY"}).Find(&positions).Error
+	err := db.conn.Where("user_id = ? AND is_paper = ? AND status IN ?", userID, isPaper, activePositionStatuses).Find(&positions).Error
 	return positions, err
 }
 

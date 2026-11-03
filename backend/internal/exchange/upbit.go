@@ -1107,17 +1107,19 @@ func (u *UpbitClient) VerifyTravelRuleDeposit(ctx context.Context, currency Curr
 	defer postResp.Body.Close()
 
 	var verifyRes struct {
-		DepositUUID  string `json:"deposit_uuid"`
-		DepositState string `json:"deposit_state"`
-		Verified     bool   `json:"verified"`
+		DepositUUID        string `json:"deposit_uuid"`
+		DepositState       string `json:"deposit_state"`
+		Verified           bool   `json:"verified"`
+		VerificationResult string `json:"verification_result"`
 	}
 	_ = json.NewDecoder(postResp.Body).Decode(&verifyRes)
+	isVerified := verifyRes.Verified || strings.EqualFold(verifyRes.VerificationResult, "VERIFIED")
 
 	return &TravelRuleDepositStatus{
 		DepositUUID:  verifyRes.DepositUUID,
 		TxID:         txID,
 		DepositState: verifyRes.DepositState,
-		Verified:     verifyRes.Verified,
-		Message:      fmt.Sprintf("Upbit Travel Rule API status=%d verified=%v state=%s", postResp.StatusCode, verifyRes.Verified, verifyRes.DepositState),
+		Verified:     isVerified,
+		Message:      fmt.Sprintf("Upbit Travel Rule API status=%d verified=%v state=%s", postResp.StatusCode, isVerified, verifyRes.DepositState),
 	}, nil
 }

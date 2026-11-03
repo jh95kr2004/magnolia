@@ -140,12 +140,14 @@ type ActivePosition struct {
 	ExpectedFuturePrem float64
 	MaxUnrealizedROI   float64   // Track peaks for Trailing Stop logic
 	RealizedProfitUSD  float64   // Settled realized profit in USD on close
-	BuyOrderID         string
-	SellOrderID        string
-	HedgeMarket        string     // e.g. "SPOT" or "FUTURE", used natively by Strategy C
-	OpenedAt           time.Time
-	ClosedAt           *time.Time
-	UpdatedAt          time.Time
+	BuyOrderID                 string
+	SellOrderID                string
+	HedgeMarket                string     // e.g. "SPOT" or "FUTURE", used natively by Strategy C
+	HedgeMode                  string     // "BASE_BORROW", "FOREIGN_BORROW", or "FOREIGN_FUTURES_HEDGE"
+	AssassinationRationaleJSON string     `gorm:"type:text"` // Serialized AssassinationRationale for UI/UX display
+	OpenedAt                   time.Time
+	ClosedAt                   *time.Time
+	UpdatedAt                  time.Time
 }
 
 // LeaderLease handles cluster-wide locks to prevent multi-pod InfluxDB deduplication.

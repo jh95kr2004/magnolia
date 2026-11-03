@@ -216,8 +216,13 @@ type PremiumEvalParams struct {
 	AIWeight                   float64       // Phase 3: Suggested investment sizing scalar (0.0 to 1.0)
 	TargetExposure             float64       // AI's designated structural direction (-1.0 to 1.0)
 	BalanceSkewThreshold       float64            // Custom threshold to deter transfer looping (e.g. 0.15)
+	BaseExchange               string             // Base exchange name (e.g. "UPBIT")
+	ForeignExchange            string             // Foreign exchange name (e.g. "COINBASE")
 	BaseSupportsMargin         bool               // Whether the base exchange supports margin borrowing/shorting
 	ForeignSupportsMargin      bool               // Whether the foreign exchange supports margin borrowing/shorting
+	ForeignSupportsFutures     bool               // Whether the foreign exchange supports futures hedging
+	FXRateKRW                  float64            // Fiat USD-KRW exchange rate
+	TetherRateKRW              float64            // Exchange-specific USDT-KRW rate
 	TetherRealPremiumPct       float64            // Real Tether-adjusted Kimp ratio (e.g., 0.035 for +3.5%), used by Strategy C
 	FiatPremiumPct             float64            // Nominal Fiat FX Kimp ratio (e.g., 0.042 for +4.2%), used by Strategy A/B/D/E
 	ForeignBasisPct            float64            // Foreign Spot-Futures basis ratio ((SpotAsk - FutureBid) / SpotAsk)
@@ -245,7 +250,9 @@ func (p *PremiumEvalParams) GetExpectedPremium() float64 {
 type StrategyEvaluation struct {
 	Type                   StrategyType
 	EntryPremium           float64
+	FiatPremiumPct         float64
 	TetherRealPremium      float64
+	TetherRealPremiumPct   float64
 	ForeignBasisCost       float64
 	TransferDelayDecay     float64
 	BasisReturn            float64
@@ -264,6 +271,10 @@ type StrategyEvaluation struct {
 	HedgeMode              string                  // "BASE_BORROW", "FOREIGN_BORROW", or "FOREIGN_FUTURES_HEDGE"
 	StageAssassination     bool                    // True if evaluated for staged assassination mode
 	PreStageListing        bool                    // True if evaluated for Stage-1 pre-listing personal wallet staging
+	EventType              string                  // Event type if catalyst-driven
+	EventTitle             string                  // Event announcement title
+	VASPTier               exchange.VASPTier       // Korean Travel Rule VASP classification
+	NeedsWalletProxy       bool                    // True if 2-hop personal wallet relay is required
 	AssassinationRationale *AssassinationRationale // Structured rationale for UI display
 	BalanceSkewThreshold   float64                 // Configured skew threshold (e.g. 0.15)
 	ErrorReason            string                  // Reason for rejection, if any

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -641,6 +642,31 @@ func (p *PaperClient) Deposit(currency string, amount float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.balances[strings.ToUpper(currency)] += amount
+}
+
+// CreditPaperDepositByAddress credits a PaperClient's virtual balance when a 2-hop walletProxy transfer
+// targets a PAPER-DEPOSIT-{userID}-{exchange}-{currency}-{network} address.
+func CreditPaperDepositByAddress(address, currency string, amount float64) bool {
+	if !strings.HasPrefix(address, "PAPER-DEPOSIT-") || amount <= 0 {
+		return false
+	}
+	parts := strings.Split(address, "-")
+	if len(parts) < 4 {
+		return false
+	}
+	uid, err := strconv.ParseUint(parts[2], 10, 64)
+	if err != nil {
+		return false
+	}
+	destExchange := parts[3]
+	paperRegistryMu.RLock()
+	destClient, ok := paperRegistry[paperRegistryKey(uint(uid), destExchange)]
+	paperRegistryMu.RUnlock()
+	if ok && destClient != nil {
+		destClient.Deposit(currency, amount)
+		return true
+	}
+	return false
 }
 
 // === Transfer API Mocks ===

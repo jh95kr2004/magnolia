@@ -495,7 +495,9 @@ func (e *Engine) ExecuteStrategy(
 	pos.UserID = e.userID
 	pos.IsPaper = e.isPaper
 	pos.MonitorNodeID = e.nodeID
-	pos.Status = "OPEN"
+	if pos.Status == "" {
+		pos.Status = "OPEN"
+	}
 	pos.BaseExchange = pair.BaseClient.GetName()
 	pos.ForeignExchange = pair.ForeignClient.GetName()
 	pos.BaseSymbol = string(pair.BaseMarketInfo.Symbol)
@@ -514,35 +516,49 @@ func (e *Engine) ExecuteStrategy(
 	// 3. Dispatch WebSocket event and send external notification
 	e.notifyPositionOpened(ctx, pos)
 
-	// 4. Auto-repay for Strategy C (Transfer Loop) in SPOT mode
-	if pos.Type == string(StrategyForeignTransfer) && pos.HedgeMarket == "SPOT" {
-		log.Printf("⚡ [Auto-Repay] Strategy C SPOT transfer completed. Automatically triggering repayment...")
-		// Mark it as TRANSFERRING so the state machine reflects the transition
-		_ = e.db.UpdatePositionStatus(pos.PositionID, "TRANSFERRING")
-		e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
-			`{"action":"POSITION_TRANSFERRING", "position_id":"%s"}`, pos.PositionID,
-		)))
-		e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
-			"📦 **Coin Transfer Completed (Auto-Repay Started)**\n- **ID**: `%s`\n- **Exchanges**: `%s` -> `%s`",
-			pos.PositionID, pos.ForeignExchange, pos.BaseExchange,
-		))
+	// 4. Post-Entry Settlement for Strategy C (Transfer Loop)
+	if pos.Type == string(StrategyForeignTransfer) {
+		switch pos.Status {
+		case "STAGED_ASSASSINATION", "PRE_STAGED_LISTING", "AWAITING_TRAVEL_RULE":
+			// Remain in staged state; RunPositionMonitor will track deposit opening / target surge / timeout
+			log.Printf("🎯 [Staged Position] %s entered state %s (HedgeMode=%s)", pos.PositionID, pos.Status, pos.HedgeMode)
+		case "OPEN":
+			if pos.HedgeMode == "FOREIGN_FUTURES_HEDGE" || pos.HedgeMode == "FOREIGN_BORROW" {
+				// ExecuteEntry already sold the arrived coin on Base and covered the Foreign short leg atomically
+				pos.Status = "CLOSED"
+				_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+				e.persistPaperState()
+				e.notifyPositionClosed(ctx, pos.PositionID)
+			} else if pos.HedgeMarket == "SPOT" {
+				log.Printf("⚡ [Auto-Repay] Strategy C SPOT transfer completed. Automatically triggering repayment...")
+				_ = e.db.UpdatePositionStatus(pos.PositionID, "TRANSFERRING")
+				e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+					`{"action":"POSITION_TRANSFERRING", "position_id":"%s"}`, pos.PositionID,
+				)))
+				e.sendNotification(ctx, notification.AlertPositionOpened, fmt.Sprintf(
+					"📦 **Coin Transfer Completed (Auto-Repay Started)**\n- **ID**: `%s`\n- **Exchanges**: `%s` -> `%s`",
+					pos.PositionID, pos.ForeignExchange, pos.BaseExchange,
+				))
 
-		// Execute Exit (which for SPOT does the Repay and closes the debt)
-		err := strat.ExecuteExit(ctx, e.executor, pair, *pos, 1.0, e.walletProxy)
-		if err == nil {
-			pos.Status = "CLOSED"
-			_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
-			e.notifyPositionClosed(ctx, pos.PositionID)
-		} else {
-			if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
-				pos.Status = "AWAITING_REPAY"
-				_ = e.db.UpdatePositionStatus(pos.PositionID, "AWAITING_REPAY")
+				// Execute Exit (which for BASE_BORROW SPOT does the Repay and closes the debt)
+				err := strat.ExecuteExit(ctx, e.executor, pair, *pos, 1.0, e.walletProxy)
+				if err == nil {
+					pos.Status = "CLOSED"
+					_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+					e.persistPaperState()
+					e.notifyPositionClosed(ctx, pos.PositionID)
+				} else {
+					if strings.Contains(err.Error(), "ERR_SESSION_EXPIRED") {
+						pos.Status = "AWAITING_REPAY"
+						_ = e.db.UpdatePositionStatus(pos.PositionID, "AWAITING_REPAY")
+					}
+					log.Printf("❌ [Auto-Repay Error] Failed to execute auto-repayment for %s: %v", pos.PositionID, err)
+					e.sendNotification(ctx, notification.AlertLiquidation, fmt.Sprintf(
+						"🚨 **[CRITICAL] Auto-Repay Error: Failed to repay debt for Position %s**\n- **Error**: %v\n- 웹 대여 세션이 만료된 경우 즉시 noVNC에서 재로그인하면 자동 상환됩니다.",
+						pos.PositionID, err,
+					))
+				}
 			}
-			log.Printf("❌ [Auto-Repay Error] Failed to execute auto-repayment for %s: %v", pos.PositionID, err)
-			e.sendNotification(ctx, notification.AlertLiquidation, fmt.Sprintf(
-				"🚨 **[CRITICAL] Auto-Repay Error: Failed to repay debt for Position %s**\n- **Error**: %v\n- 웹 대여 세션이 만료된 경우 즉시 noVNC에서 재로그인하면 자동 상환됩니다.",
-				pos.PositionID, err,
-			))
 		}
 	}
 
@@ -570,6 +586,13 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 		case quote := <-priceCh:
 			if quote.FXRate > 0 && quote.QuoteCurrency != "" {
 				SetFXRate(string(quote.QuoteCurrency), quote.FXRate)
+			}
+			if strings.EqualFold(string(quote.Symbol), "USDT-KRW") && quote.RawAsk > 0 {
+				mid := quote.RawAsk
+				if quote.RawBid > 0 {
+					mid = (quote.RawBid + quote.RawAsk) / 2.0
+				}
+				SetExchangeTetherRate(quote.Exchange, "KRW", mid)
 			}
 
 			e.mu.Lock()
@@ -635,11 +658,101 @@ func (e *Engine) evaluateAllOpenPositions(
 	}
 
 	for _, pos := range positions {
+		targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
+
+		// 1. Handle PRE_STAGED_LISTING (Stage-1 coin in personal wallet awaiting Base deposit opening)
+		if pos.Status == "PRE_STAGED_LISTING" {
+			if targetPair != nil && (targetPair.IsValidForTransfer || targetPair.BaseMarketInfo.IsDepositEnabled) {
+				if ft, ok := e.findStrategy(StrategyForeignTransfer).(*ForeignTransferStrategy); ok {
+					posCopy := pos
+					if err := ft.CompletePreStagedListingToBase(ctx, e.executor, *targetPair, &posCopy, e.walletProxy); err == nil {
+						_ = e.db.UpdatePositionStatus(pos.PositionID, posCopy.Status)
+						e.persistPaperState()
+						e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+							`{"action":"POSITION_STAGED_ASSASSINATION","position_id":"%s","message":"Stage-2 listing deposit arrived on %s. Awaiting trading surge!"}`,
+							pos.PositionID, pos.BaseExchange,
+						)))
+					}
+				}
+			}
+			continue
+		}
+
 		baseQuote, hasBase := quotes[pos.BaseSymbol]
 		foreignQuote, hasForeign := quotes[pos.ForeignSymbol]
 
 		// Skip evaluation until we have fresh data for both legs
 		if !hasBase || !hasForeign {
+			continue
+		}
+
+		// 2. Handle STAGED_ASSASSINATION (Coin pre-deposited on Base + hedged on Foreign, waiting for Kimp surge or timeout)
+		if pos.Status == "STAGED_ASSASSINATION" {
+			fxKRW := GetFXRate("KRW")
+			tetherKRW := GetExchangeTetherRate(pos.BaseExchange, "KRW")
+			baseBidKRW := baseQuote.RawBid
+			if baseBidKRW <= 0 && baseQuote.BidUSD > 0 {
+				baseBidKRW = baseQuote.BidUSD * fxKRW
+			}
+			foreignAskUSD := foreignQuote.AskUSD
+			if foreignAskUSD <= 0 {
+				foreignAskUSD = foreignQuote.RawAsk
+			}
+
+			var nominalKimp, realKimp float64
+			if foreignAskUSD > 0 && fxKRW > 0 && baseBidKRW > 0 {
+				nominalKimp = (baseBidKRW / (foreignAskUSD * fxKRW)) - 1.0
+			}
+			if foreignAskUSD > 0 && tetherKRW > 0 && baseBidKRW > 0 {
+				realKimp = (baseBidKRW / (foreignAskUSD * tetherKRW)) - 1.0
+			}
+
+			targetExitDec := 0.045 // Default +4.5% Kimp target
+			maxHoldDur := 12 * time.Hour
+			if pos.AssassinationRationaleJSON != "" {
+				var rat AssassinationRationale
+				if json.Unmarshal([]byte(pos.AssassinationRationaleJSON), &rat) == nil && rat.TargetExitKimpPct > 0 {
+					targetExitDec = rat.TargetExitKimpPct / 100.0
+				}
+			}
+
+			// Check for emergency DELISTING event
+			isDelisting := false
+			coinSym := strings.Split(pos.BaseSymbol, "-")[0]
+			if e.redisClient != nil && coinSym != "" {
+				for _, ev := range e.redisClient.GetCoinAnnouncementEvents(ctx, coinSym) {
+					if ev.EventType == "DELISTING" {
+						isDelisting = true
+						break
+					}
+				}
+			}
+
+			// Compute unrealized PnL while staged
+			if e.liveUnrealizedPnLs == nil {
+				e.liveUnrealizedPnLs = make(map[string]float64)
+			}
+			stagedUnrealizedUSD := (realKimp - 0.0025) * pos.InvestmentUSD
+			e.liveUnrealizedPnLs[pos.BaseExchange+"|"+pos.BaseSymbol] = stagedUnrealizedUSD
+			e.liveUnrealizedPnLs[pos.ForeignExchange+"|"+pos.ForeignSymbol] = stagedUnrealizedUSD
+
+			shouldExitAssassination := realKimp >= targetExitDec ||
+				nominalKimp >= targetExitDec ||
+				time.Since(pos.OpenedAt) >= maxHoldDur ||
+				isDelisting
+
+			if shouldExitAssassination && targetPair != nil {
+				targetStrategy := e.findStrategy(StrategyType(pos.Type))
+				if targetStrategy != nil {
+					log.Printf("🎯 [ASSASSINATION EXIT] %s | RealKimp=%.2f%% NominalKimp=%.2f%% Target=%.2f%% Delisting=%v",
+						pos.PositionID, realKimp*100, nominalKimp*100, targetExitDec*100, isDelisting)
+					if err := targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy); err == nil {
+						_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+						e.persistPaperState()
+						e.notifyPositionClosed(ctx, pos.PositionID)
+					}
+				}
+			}
 			continue
 		}
 
@@ -1222,17 +1335,49 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
 								isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
 								reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
-								transferNetROI := entrySpread - 0.0022
 								isReverseDirection := opp.ActionScore > 5.0
+
+								// Check active announcement events for this coin
+								coinSym := strings.Split(entryBaseSym, "-")[0]
+								var activeEvType, activeEvTitle string
+								if e.redisClient != nil && coinSym != "" {
+									if evs := e.redisClient.GetCoinAnnouncementEvents(ctx, coinSym); len(evs) > 0 {
+										activeEvType = evs[0].EventType
+										activeEvTitle = evs[0].Title
+									}
+								}
+								if activeEvType == "DELISTING" {
+									// Strictly block new entry on delisting announcement
+									continue
+								}
+
+								// Compute Real Tether Kimp & quantitative Strategy C NetROI (including VASP Tier 3 2-hop fee if applicable)
+								fxKRW := GetFXRate("KRW")
+								tetherKRW := GetExchangeTetherRate(targetPair.BaseClient.GetName(), string(targetPair.BaseMarketInfo.QuoteCurrency))
+								realEntrySpread := entrySpread
+								if fxKRW > 0 && tetherKRW > 0 {
+									realEntrySpread = ((1.0 + entrySpread) * fxKRW / tetherKRW) - 1.0
+								}
+								vaspTier := GetVASPTier(targetPair.BaseClient.GetName(), targetPair.ForeignClient.GetName())
+								needs2Hop := vaspTier == exchange.VASPTier3RiskAssessed && e.walletProxy != nil
+								feeEstimate := 0.0022
+								if needs2Hop {
+									feeEstimate = 0.0032
+								}
+								transferNetROI := realEntrySpread - feeEstimate
+
+								stageAssassination := opp.ActionType == 3 ||
+									((activeEvType == "INVESTMENT_WARNING" || activeEvType == "WALLET_SUSPENSION" || activeEvType == "NEW_KRW_LISTING") &&
+										realEntrySpread < 0.030 && opp.MaxPremiumPct >= 0.040)
+								preStageListing := activeEvType == "NEW_KRW_LISTING" && !targetPair.IsValidForTransfer && e.walletProxy != nil
 
 								if isBaseFuture && isForeignFuture {
 									selectedStrategy = StrategyFutureFuture
 								} else if isBaseFuture {
 									selectedStrategy = StrategyFutureSpot
 								} else {
-									// Only use Strategy C (Transfer Loop) for canonical positive-premium transfers;
-									// reverse capital transfers (UPBIT -> COINBASE) are strictly governed by evaluateRebalancing.
-									if !isReverseDirection && targetPair.IsValidForTransfer && transferNetROI >= reversionNetROI && entrySpread > 0.0025 {
+									// Quantitative NetROI comparison: Strategy C wins if its NetROI (even after 2-hop fees) beats Strategy A/B, or if assassination staging is triggered
+									if !isReverseDirection && (preStageListing || (targetPair.IsValidForTransfer && (stageAssassination || (transferNetROI >= reversionNetROI && realEntrySpread > 0.0025)))) {
 										selectedStrategy = StrategyForeignTransfer
 									} else if isForeignFuture {
 										selectedStrategy = StrategyMarginFuture
@@ -1245,7 +1390,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								if selectedStrategy == StrategyForeignTransfer {
 									expectedBestNetROI = transferNetROI
 								}
-								if expectedBestNetROI <= 0.0005 && entrySpread <= 0.0025 {
+								if !stageAssassination && !preStageListing && expectedBestNetROI <= 0.0005 && entrySpread <= 0.0025 {
 									// Guard against opening a position with negative or sub-fee expected return
 									continue
 								}
@@ -1255,12 +1400,19 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									eval := targetStrategy.GetLastEvaluation()
 									eval.Type = selectedStrategy
 									eval.EntryPremium = entrySpread
+									eval.TetherRealPremiumPct = realEntrySpread
 									eval.BasisReturn = entrySpread - entryPredictedSpread
 									eval.InvestmentUSD = targetDollarVolume
 									eval.HedgeMarket = "SPOT"
 									if isForeignFuture {
 										eval.HedgeMarket = "FUTURE"
 									}
+									eval.StageAssassination = stageAssassination
+									eval.PreStageListing = preStageListing
+									eval.EventType = activeEvType
+									eval.EventTitle = activeEvTitle
+									eval.VASPTier = vaspTier
+									eval.NeedsWalletProxy = needs2Hop
 									targetStrategy.SetEvaluation(eval)
 									_, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair)
 									if err != nil {
@@ -1519,7 +1671,7 @@ type ExchangeBalanceSnapshot struct {
 
 // UserCommand represents a manual action sent from the frontend via the Node API server over Redis.
 type UserCommand struct {
-	Action             string  `json:"action"`     // "FORCE_ENTER" | "FORCE_CLOSE" | "SET_BOT_STATUS" | "SET_SIM_OFFSET" | "RESET_PAPER_ACCOUNT"
+	Action             string  `json:"action"`               // "FORCE_ENTER" | "FORCE_CLOSE" | "SET_BOT_STATUS" | "SET_SIM_OFFSET" | "RESET_PAPER_ACCOUNT" | "SIM_EVENT"
 	Mode               string  `json:"mode,omitempty"`       // "PAPER" | "LIVE"
 	SubAction          string  `json:"sub_action,omitempty"` // "RUN" | "DRAIN" | "STOP_AND_CLOSE"
 	PositionID         string  `json:"position_id,omitempty"`
@@ -1530,6 +1682,11 @@ type UserCommand struct {
 	Strategy           string  `json:"strategy,omitempty"`
 	ExpectedRoi        float64 `json:"expected_roi,omitempty"`
 	InvestmentUsd      float64 `json:"investment_usd,omitempty"`
+	StageAssassination bool    `json:"stage_assassination,omitempty"`
+	PreStageListing    bool    `json:"pre_stage_listing,omitempty"`
+	EventType          string  `json:"event_type,omitempty"`
+	EventTitle         string  `json:"event_title,omitempty"`
+	ScheduledOffsetMin int     `json:"scheduled_offset_min,omitempty"`
 	SimExchange        string  `json:"sim_exchange,omitempty"`
 	SimTargetOffsetPct float64 `json:"sim_target_offset_pct,omitempty"`
 	SimRampMinutes     float64 `json:"sim_ramp_minutes,omitempty"`
@@ -1728,12 +1885,17 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 					eval := targetStrategy.GetLastEvaluation()
 					eval.Type = selectedType
 					eval.EntryPremium = cmd.ExpectedRoi
+					eval.TetherRealPremiumPct = cmd.ExpectedRoi
 					eval.BasisReturn = cmd.ExpectedRoi
 					eval.InvestmentUSD = investUSD
 					eval.HedgeMarket = "SPOT"
 					if targetPair.ForeignMarketInfo.MarketType == "FUTURE" {
 						eval.HedgeMarket = "FUTURE"
 					}
+					eval.StageAssassination = cmd.StageAssassination
+					eval.PreStageListing = cmd.PreStageListing
+					eval.EventType = cmd.EventType
+					eval.EventTitle = cmd.EventTitle
 					targetStrategy.SetEvaluation(eval)
 					if _, err := e.ExecuteStrategy(ctx, targetStrategy, *targetPair); err != nil {
 						log.Printf("❌ [Manual Force Enter Error] (%s) %v", e.ModeString(), err)
@@ -1741,6 +1903,96 @@ func (e *Engine) ListenUserCommands(ctx context.Context) {
 							`{"action":"COMMAND_ERROR","message":"Manual entry failed: %s"}`, err.Error(),
 						)))
 					}
+				}
+
+			case "SIM_EVENT":
+				if e.isPaper {
+					baseEx := cmd.BaseExchange
+					if baseEx == "" {
+						baseEx = "UPBIT"
+					}
+					foreignEx := cmd.ForeignExchange
+					if foreignEx == "" {
+						foreignEx = "COINBASE"
+					}
+					baseSym := cmd.BaseSymbol
+					if baseSym == "" {
+						baseSym = "BTC-KRW"
+					}
+					coinSym := strings.Split(baseSym, "-")[0]
+					evType := cmd.EventType
+					if evType == "" {
+						evType = "INVESTMENT_WARNING"
+					}
+					evTitle := cmd.EventTitle
+					if evTitle == "" {
+						evTitle = fmt.Sprintf("[모의 이벤트] %s (%s) 공지 발생", evType, coinSym)
+					}
+					nowTime := time.Now().UTC()
+					schedOffsetMin := cmd.ScheduledOffsetMin
+					if schedOffsetMin <= 0 {
+						schedOffsetMin = 95
+					}
+					schedTime := nowTime.Add(time.Duration(schedOffsetMin) * time.Minute)
+					ev := exchange.AnnouncementEvent{
+						ID:          fmt.Sprintf("SIM-%d", nowTime.UnixNano()),
+						Exchange:    baseEx,
+						EventType:   evType,
+						Symbols:     []string{coinSym},
+						Title:       evTitle,
+						SummaryKO:   evTitle,
+						SummaryEN:   fmt.Sprintf("[Simulated Event] %s on %s", evType, coinSym),
+						AnnouncedAt: nowTime,
+						ScheduledAt: &schedTime,
+						IsCatalyst:  evType != "DELISTING" && evType != "NONE",
+					}
+					if e.redisClient != nil {
+						e.redisClient.PublishAnnouncementEvent(ctx, ev)
+					}
+
+					// If DELISTING, close any open positions on this coin immediately
+					if evType == "DELISTING" {
+						positions, _ := e.db.GetActivePositionsByUserAndMode(e.userID, true)
+						for _, pos := range positions {
+							if strings.HasPrefix(pos.BaseSymbol, coinSym) && pos.Status != "CLOSED" {
+								targetStrategy := e.findStrategy(StrategyType(pos.Type))
+								targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
+								if targetStrategy != nil && targetPair != nil {
+									_ = targetStrategy.ExecuteExit(ctx, e.executor, *targetPair, pos, 1.0, e.walletProxy)
+								}
+								_ = e.db.UpdatePositionStatus(pos.PositionID, "CLOSED")
+								e.persistPaperState()
+								e.notifyPositionClosed(ctx, pos.PositionID)
+							}
+						}
+					} else if cmd.StageAssassination || cmd.PreStageListing {
+						targetPair := e.findPair(baseEx, foreignEx, baseSym)
+						targetStrategy := e.findStrategy(StrategyForeignTransfer)
+						if targetPair != nil && targetStrategy != nil {
+							investUSD := cmd.InvestmentUsd
+							if investUSD <= 0 {
+								investUSD = math.Min(1000.0, e.config.CapitalLimitUsd*0.20)
+							}
+							eval := targetStrategy.GetLastEvaluation()
+							eval.Type = StrategyForeignTransfer
+							eval.EntryPremium = 0.005
+							eval.TetherRealPremiumPct = 0.004
+							eval.BasisReturn = 0.005
+							eval.InvestmentUSD = investUSD
+							eval.HedgeMarket = "SPOT"
+							eval.StageAssassination = cmd.StageAssassination
+							eval.PreStageListing = cmd.PreStageListing
+							eval.EventType = evType
+							eval.EventTitle = evTitle
+							targetStrategy.SetEvaluation(eval)
+							_, _ = e.ExecuteStrategy(ctx, targetStrategy, *targetPair)
+						}
+					}
+
+					e.redisClient.PublishUserEvents(ctx, fmt.Sprint(e.userID), []byte(fmt.Sprintf(
+						`{"action":"SIM_EVENT_TRIGGERED","mode":"PAPER","event_type":"%s","symbol":"%s","message":"Simulated event [%s] injected for %s."}`,
+						evType, coinSym, evType, coinSym,
+					)))
 				}
 			}
 			e.publishAccountState(ctx)
@@ -1757,6 +2009,7 @@ type AIAccountState struct {
 	AvailableBalance     float64                   `json:"available_balance"`
 	TotalEquityUSD       float64                   `json:"total_equity_usd"`
 	FXRateKRW            float64                   `json:"fx_rate_krw"`
+	TetherRatesKRW       map[string]float64        `json:"tether_rates_krw"`
 	ExchangeBalances     []ExchangeBalanceSnapshot `json:"exchange_balances"`
 	ForeignShare         float64                   `json:"foreign_share"`
 	RebalanceTriggerSkew float64                   `json:"rebalance_trigger_skew"`
@@ -1820,8 +2073,10 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		posState := 1
 		if pos.Status == "TRANSFERRING" {
 			posState = 2
-		} else if pos.Status == "REPAYING" || pos.Status == "AWAITING_REPAY" {
+		} else if pos.Status == "REPAYING" || pos.Status == "AWAITING_REPAY" || pos.Status == "AWAITING_TRAVEL_RULE" {
 			posState = 3
+		} else if pos.Status == "STAGED_ASSASSINATION" || pos.Status == "PRE_STAGED_LISTING" {
+			posState = 4
 		}
 		pairStates[key] = posState
 		pairStates[reverseKey] = posState
@@ -1946,6 +2201,7 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		AvailableBalance:     totalLiquidUSD,
 		TotalEquityUSD:       totalEquityUSD,
 		FXRateKRW:            fxKRW,
+		TetherRatesKRW:       GetAllExchangeTetherRatesSnapshot(),
 		ExchangeBalances:     exSnapshots,
 		ForeignShare:         foreignShare,
 		RebalanceTriggerSkew: e.config.RebalanceTriggerSkew,
@@ -2014,10 +2270,20 @@ func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
 	baseFX := e.getExchangeCurrencyFX(pos.BaseExchange, pos.BaseSymbol)
 	foreignFX := e.getExchangeCurrencyFX(pos.ForeignExchange, pos.ForeignSymbol)
 
-	// 1. Strategy C (FOREIGN_TRANSFER): Borrow & Sell on Base, Buy on Foreign, Transfer & 1:1 Repay
+	// 1. Strategy C (FOREIGN_TRANSFER): Borrow & Sell on Base, Buy on Foreign, Transfer & 1:1 Repay (or Staged Assassination exit)
 	if pos.Type == string(StrategyForeignTransfer) {
-		if pos.EntryBasePrice > 0 && pos.EntryForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
-			baseSellUSD := (pos.BaseAmount * pos.EntryBasePrice) / baseFX
+		sellBasePrice := pos.EntryBasePrice
+		if sellBasePrice <= 0 && e.latestQuotes != nil {
+			if bq, ok := e.latestQuotes[pos.BaseSymbol]; ok {
+				if bq.RawBid > 0 {
+					sellBasePrice = bq.RawBid
+				} else if bq.BidUSD > 0 {
+					sellBasePrice = bq.BidUSD * baseFX
+				}
+			}
+		}
+		if sellBasePrice > 0 && pos.EntryForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
+			baseSellUSD := (pos.BaseAmount * sellBasePrice) / baseFX
 			foreignBuyUSD := (pos.ForeignAmount * pos.EntryForeignPrice) / foreignFX
 			baseFeeUSD := baseSellUSD * 0.0005
 			foreignFeeUSD := foreignBuyUSD * 0.0020

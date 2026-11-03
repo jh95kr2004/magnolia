@@ -7,13 +7,21 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/magnolia/backend/internal/exchange"
 	"github.com/magnolia/backend/internal/wallet"
+)
+
+var (
+	// ErrTravelRuleManualRequired is returned when an incoming deposit is held by Travel Rule
+	// and automatic API verification could not resolve it without human intervention.
+	ErrTravelRuleManualRequired = errors.New("deposit requires manual Travel Rule verification")
 )
 
 type TransferStepType string
@@ -22,6 +30,7 @@ const (
 	StepTypeOrder          TransferStepType = "ORDER"
 	StepTypeWithdraw       TransferStepType = "WITHDRAW"
 	StepTypeWalletTransfer TransferStepType = "WALLET_TRANSFER"
+	StepTypeAwaitDeposit   TransferStepType = "AWAIT_DEPOSIT"
 	StepTypeBorrow         TransferStepType = "BORROW"
 	StepTypeRepay          TransferStepType = "REPAY"
 )
@@ -42,9 +51,13 @@ type TransferAction struct {
 	WalletClient wallet.Client
 	WalletReq    *wallet.TransferRequest
 
-	// For StepTypeBorrow / StepTypeRepay
-	Currency exchange.Currency
-	Amount   float64
+	// For StepTypeBorrow / StepTypeRepay / StepTypeAwaitDeposit
+	Currency       exchange.Currency
+	Amount         float64
+	ExpectedAmount float64
+	FromExchange   string
+	TxID           string
+	DepositTimeout time.Duration
 }
 
 // Executor coordinates complex multi-exchange trade execution and handles rollbacks.
@@ -254,16 +267,99 @@ func (e *Executor) ExecutePipeline(ctx context.Context, actions []*TransferActio
 					break
 				}
 				log.Printf("❌ [Executor] Step %d Wallet Transfer failed (Attempt %d): %v", i+1, attempt, proxyErr)
-				time.Sleep(5 * time.Second)
+				time.Sleep(100 * time.Millisecond)
 			}
 			if proxyErr != nil {
 				log.Printf("CRITICAL [Executor] Proxy Relay stuck in Personal Wallet! Funds safe but unhedged. Manual intervention req.")
 				return fmt.Errorf("step %d wallet proxy permanent failure: %w", i+1, proxyErr)
 			}
-			
-			log.Printf("⏳ [Executor] Simulating Wallet TX Network clearing time...")
-			time.Sleep(10 * time.Second)
-			
+
+			// If destination is a PaperClient address, credit the virtual deposit immediately
+			if action.WalletReq != nil {
+				exchange.CreditPaperDepositByAddress(action.WalletReq.ToAddress, action.WalletReq.Currency, action.WalletReq.Amount)
+			}
+
+			pollWait := e.WithdrawPollInterval
+			if pollWait <= 0 {
+				pollWait = 100 * time.Millisecond
+			}
+			time.Sleep(pollWait)
+
+		case StepTypeAwaitDeposit:
+			targetAmt := action.ExpectedAmount
+			if targetAmt <= 0 {
+				targetAmt = action.Amount
+			}
+			minArrived := targetAmt * 0.985
+			pollInterval := e.WithdrawPollInterval
+			if pollInterval <= 0 {
+				pollInterval = 5 * time.Second
+			}
+			timeout := action.DepositTimeout
+			if timeout <= 0 {
+				timeout = 10 * time.Minute
+			}
+
+			deadline := time.Now().Add(timeout)
+			arrived := false
+			travelRuleVerifiedAttempted := false
+
+			checkArrived := func() (bool, error) {
+				balances, err := action.ExchangeClient.GetBalances(ctx)
+				if err == nil {
+					for _, b := range balances {
+						if strings.EqualFold(string(b.Currency), string(action.Currency)) && b.Available >= minArrived {
+							return true, nil
+						}
+					}
+				}
+				// Attempt automatic Travel Rule OpenAPI verification if supported by destination exchange (e.g., Upbit)
+				if verifier, ok := action.ExchangeClient.(exchange.TravelRuleVerifier); ok && !travelRuleVerifiedAttempted {
+					travelRuleVerifiedAttempted = true
+					status, vErr := verifier.VerifyTravelRuleDeposit(ctx, action.Currency, action.TxID, action.FromExchange)
+					if vErr == nil && status != nil {
+						log.Printf("[Executor] Travel Rule Auto-Verification result on %s: verified=%v state=%s (%s)",
+							action.ExchangeClient.GetName(), status.Verified, status.DepositState, status.Message)
+						if !status.Verified && strings.EqualFold(status.DepositState, "TRAVEL_RULE_SUSPECTED") {
+							return false, fmt.Errorf("%w: %s", ErrTravelRuleManualRequired, status.Message)
+						}
+					}
+				}
+				return false, nil
+			}
+
+			if ok, trErr := checkArrived(); trErr != nil {
+				return trErr
+			} else if ok {
+				arrived = true
+			}
+
+			if !arrived {
+				ticker := time.NewTicker(pollInterval)
+				defer ticker.Stop()
+			AwaitLoop:
+				for time.Now().Before(deadline) {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-ticker.C:
+						ok, trErr := checkArrived()
+						if trErr != nil {
+							return trErr
+						}
+						if ok {
+							arrived = true
+							break AwaitLoop
+						}
+					}
+				}
+			}
+
+			if !arrived {
+				return fmt.Errorf("%w: deposit of %.6f %s did not arrive on %s within timeout", ErrTravelRuleManualRequired, targetAmt, action.Currency, action.ExchangeClient.GetName())
+			}
+			log.Printf("✅ [Executor] Step %d Deposit of %s confirmed in %s available balance.", i+1, action.Currency, action.ExchangeClient.GetName())
+
 		case StepTypeBorrow:
 			err := action.ExchangeClient.Borrow(ctx, action.Currency, action.Amount)
 			if err != nil {
@@ -403,4 +499,45 @@ func (e *Executor) CheckPreflightBalance(ctx context.Context, client exchange.Cl
 		}
 		return fmt.Errorf("base currency %s balance not found on %s", baseCur, client.GetName())
 	}
+}
+
+// CheckPreflightWalletGas verifies that the personal wallet (walletProxy) holds sufficient native gas token
+// (e.g., ETH for ERC20/Arbitrum/Base, TRX for TRC20, SOL for Solana) BEFORE initiating a 2-hop transfer,
+// preventing transferred assets from getting stuck inside the personal wallet.
+func (e *Executor) CheckPreflightWalletGas(
+	ctx context.Context,
+	walletClient wallet.Client,
+	network exchange.Network,
+	gasToken exchange.Currency,
+	minRequiredGas float64,
+) error {
+	return CheckPreflightWalletGas(ctx, walletClient, network, gasToken, minRequiredGas)
+}
+
+func CheckPreflightWalletGas(
+	ctx context.Context,
+	walletClient wallet.Client,
+	network exchange.Network,
+	gasToken exchange.Currency,
+	minRequiredGas float64,
+) error {
+	if walletClient == nil || minRequiredGas <= 0 {
+		return nil
+	}
+	bals, err := walletClient.GetBalance(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query personal wallet %s native gas (%s on %s): %w", walletClient.GetName(), gasToken, network, err)
+	}
+	var availGas float64
+	for _, b := range bals {
+		if strings.EqualFold(string(b.Currency), string(gasToken)) {
+			availGas = b.Available
+			break
+		}
+	}
+	if availGas < minRequiredGas {
+		return fmt.Errorf("insufficient native gas in personal wallet %s for %s relay: requires >= %.6f %s but have %.6f %s (2-hop entry blocked to prevent stuck funds)",
+			walletClient.GetName(), network, minRequiredGas, gasToken, availGas, gasToken)
+	}
+	return nil
 }
