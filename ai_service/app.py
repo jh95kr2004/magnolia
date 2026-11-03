@@ -8,11 +8,13 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
 from model.predictor import predict_reversion, extract_trajectory_metrics
 from model.rl_agent import PortfolioRLAgent
 from data.influx_client import MarketDataFetcher
+from data.announcement_classifier import classify_announcement
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AI_Daemon")
@@ -37,6 +39,7 @@ class FXCache:
     def __init__(self, r):
         self.r = r
         self.fx_rates = {"KRW": 1400.0}
+        self.tether_rates = {"UPBIT:KRW": 1400.0, "BITHUMB:KRW": 1400.0}
         self.lock = threading.Lock()
         
     def start_subscriber(self):
@@ -48,9 +51,15 @@ class FXCache:
                     try:
                         channel = msg["channel"]
                         rate = float(msg["data"])
-                        quote = channel.split("-")[-1]
                         with self.lock:
-                            self.fx_rates[quote] = rate
+                            if ":USDT-KRW" in channel:
+                                parts = channel.split(":")
+                                if len(parts) >= 2:
+                                    ex_name = parts[1].upper()
+                                    self.tether_rates[f"{ex_name}:KRW"] = rate
+                            else:
+                                quote = channel.split("-")[-1]
+                                self.fx_rates[quote] = rate
                     except Exception as e:
                         logger.warning(f"Failed to parse FX rate: {e}")
         t = threading.Thread(target=_listen, daemon=True)
@@ -59,6 +68,158 @@ class FXCache:
     def get_rate(self, quote: str):
         with self.lock:
             return self.fx_rates.get(quote.upper(), 1.0)
+
+    def get_tether_rate(self, exchange: str, quote: str = "KRW"):
+        with self.lock:
+            key = f"{exchange.upper()}:{quote.upper()}"
+            if key in self.tether_rates and self.tether_rates[key] > 0:
+                return self.tether_rates[key]
+            return self.fx_rates.get(quote.upper(), 1400.0)
+
+
+class AnnouncementCache:
+    """
+    Caches exchange announcements (Listing, Investment Warning, Delisting, Wallet Suspension)
+    received via Redis `event:announcement` or HTTP `/analyze_announcement`.
+    """
+
+    def __init__(self, r):
+        self.r = r
+        self.events_by_symbol = collections.defaultdict(list)
+        self.lock = threading.Lock()
+
+    def add_event(self, ev: dict):
+        if not ev or ev.get("event_type", "NONE") == "NONE":
+            return
+        sym = str(ev.get("symbol", "")).upper().split("-")[0]
+        if not sym:
+            syms = ev.get("symbols") or []
+            sym = str(syms[0]).upper().split("-")[0] if syms else ""
+        if not sym:
+            return
+        now_ts = time.time()
+        record = {
+            "exchange": ev.get("exchange", "UPBIT"),
+            "symbol": sym,
+            "event_type": ev.get("event_type", "NONE"),
+            "confidence": float(ev.get("confidence", 0.9)),
+            "title": ev.get("title", ""),
+            "summary_ko": ev.get("summary_ko", ev.get("title", "")),
+            "summary_en": ev.get("summary_en", ev.get("title", "")),
+            "announced_at": int(ev.get("announced_at") or ev.get("timestamp") or now_ts),
+            "scheduled_at": int(ev.get("scheduled_at") or 0),
+        }
+        with self.lock:
+            existing = [
+                e
+                for e in self.events_by_symbol[sym]
+                if not (
+                    e.get("event_type") == record["event_type"]
+                    and abs(int(e.get("announced_at", 0)) - record["announced_at"]) < 120
+                )
+            ]
+            existing.append(record)
+            self.events_by_symbol[sym] = existing[-10:]
+
+    def start_subscriber(self):
+        def _listen():
+            pubsub = self.r.pubsub()
+            pubsub.subscribe("event:announcement")
+            for msg in pubsub.listen():
+                if msg["type"] == "message":
+                    try:
+                        data = json.loads(msg["data"])
+                        self.add_event(data)
+                    except Exception as e:
+                        logger.warning(f"Failed to parse announcement event: {e}")
+
+        t = threading.Thread(target=_listen, daemon=True)
+        t.start()
+
+    def get_events_for_symbol(self, base_symbol: str, now_ts: float = None) -> list:
+        if now_ts is None:
+            now_ts = time.time()
+        coin = str(base_symbol or "").upper().split("-")[0]
+        if not coin:
+            return []
+        with self.lock:
+            raw_list = list(self.events_by_symbol.get(coin, []))
+        # Also check Redis `market:events:{coin}` if in-memory list is empty
+        if not raw_list and self.r is not None:
+            try:
+                redis_items = self.r.lrange(f"market:events:{coin}", 0, 9)
+                for raw_item in redis_items or []:
+                    ev_obj = json.loads(raw_item)
+                    raw_list.append(ev_obj)
+            except Exception:
+                pass
+        enriched = []
+        for ev in raw_list:
+            ann_ts = float(ev.get("announced_at") or ev.get("timestamp") or now_ts)
+            sched_ts = float(ev.get("scheduled_at") or 0)
+            offset_min = int(round((ann_ts - now_ts) / 60.0))
+            sched_offset_min = (
+                int(round((sched_ts - now_ts) / 60.0)) if sched_ts > now_ts else 0
+            )
+            item = dict(ev)
+            item["offset_min"] = offset_min
+            item["scheduled_offset_min"] = sched_offset_min
+            enriched.append(item)
+        return enriched
+
+
+def start_announcement_http_server(ann_cache: AnnouncementCache = None, port: int = 8000):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            if self.path.startswith("/analyze_announcement"):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+                try:
+                    req = json.loads(body)
+                except Exception:
+                    req = {}
+                title = req.get("title", "")
+                exchange = req.get("exchange", "UPBIT")
+                now_ts = float(req.get("now_ts") or time.time())
+                result = classify_announcement(title=title, exchange=exchange, now_ts=now_ts)
+                if ann_cache is not None and result.get("event_type", "NONE") != "NONE":
+                    for sym in result.get("symbols", []):
+                        ev_copy = dict(result)
+                        ev_copy["symbol"] = sym
+                        ann_cache.add_event(ev_copy)
+                payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve():
+        try:
+            srv = HTTPServer(("0.0.0.0", port), Handler)
+            logger.info(f"Started Announcement LLM Classifier HTTP endpoint on 0.0.0.0:{port}")
+            srv.serve_forever()
+        except Exception as e:
+            logger.warning(f"Announcement HTTP server could not bind port {port}: {e}")
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
 
 
 class UserAccountCache:
@@ -253,14 +414,31 @@ def build_chart_payload(
     current_spread: float,
     now_ts: float = None,
     past_trajs: dict = None,
+    events: list = None,
 ) -> dict:
     """
     Constructs the unified historical (actual + past AI forecast) and future 8-hour
     forecast trajectory payload for Redis storage and Frontend chart rendering.
+    Also attaches exchange announcement events (`events`) and synthesizes a Pre-Listing
+    trajectory (`0.0%` implied parity waiting zone -> listing Kimp surge) when a coin has
+    an upcoming `NEW_KRW_LISTING` event.
     """
     if now_ts is None:
         now_ts = time.time()
     now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    events = list(events or [])
+
+    # Check if there is an upcoming NEW_KRW_LISTING event in pre-listing state
+    pre_listing_event = next(
+        (
+            e
+            for e in events
+            if e.get("event_type") == "NEW_KRW_LISTING"
+            and int(e.get("scheduled_offset_min") or 0) > 0
+        ),
+        None,
+    )
+    is_pre_listing = pre_listing_event is not None
 
     n_hist = len(history_deque)
     t_1h = past_trajs.get("1h", []) if past_trajs else []
@@ -273,12 +451,12 @@ def build_chart_payload(
         ts_iso = item.get("timestamp_iso")
         if not ts_iso:
             ts_iso = datetime.fromtimestamp(mb * 60, tz=timezone.utc).isoformat()
-        act_spread = float(item.get("exchange_premium_spread", 0.0))
-        fallback_pred = float(item.get("ai_past_pred_spread", act_spread))
+        act_spread = 0.0 if is_pre_listing else float(item.get("exchange_premium_spread", 0.0))
+        fallback_pred = 0.0 if is_pre_listing else float(item.get("ai_past_pred_spread", act_spread))
 
-        p1 = float(t_1h[idx]) if idx < len(t_1h) else fallback_pred
-        p6 = float(t_6h[idx]) if idx < len(t_6h) else fallback_pred
-        p24 = float(t_24h[idx]) if idx < len(t_24h) else fallback_pred
+        p1 = 0.0 if is_pre_listing else (float(t_1h[idx]) if idx < len(t_1h) else fallback_pred)
+        p6 = 0.0 if is_pre_listing else (float(t_6h[idx]) if idx < len(t_6h) else fallback_pred)
+        p24 = 0.0 if is_pre_listing else (float(t_24h[idx]) if idx < len(t_24h) else fallback_pred)
 
         history_points.append({
             "timestamp": ts_iso,
@@ -289,16 +467,30 @@ def build_chart_payload(
             "pred_1h_pct": round(p1 * 100.0, 4),
             "pred_6h_pct": round(p6 * 100.0, 4),
             "pred_24h_pct": round(p24 * 100.0, 4),
+            "is_pre_listing": is_pre_listing,
         })
 
     # Ensure the final history point matches the live current spread at NOW
     if history_points:
-        history_points[-1]["actual_pct"] = round(current_spread * 100.0, 4)
+        history_points[-1]["actual_pct"] = 0.0 if is_pre_listing else round(current_spread * 100.0, 4)
         history_points[-1]["timestamp"] = now_dt.isoformat()
         history_points[-1]["offset_min"] = 0
 
-    traj = metrics.get("traj", [])
-    pred_len = len(traj)
+    traj = list(metrics.get("traj", []))
+    pred_len = len(traj) if len(traj) > 0 else 480
+    if is_pre_listing:
+        sched_min = max(5, min(pred_len - 30, int(pre_listing_event.get("scheduled_offset_min", 60))))
+        synth_traj = []
+        for m in range(1, pred_len + 1):
+            if m < sched_min:
+                synth_traj.append(0.0)
+            else:
+                dt_m = m - sched_min
+                surge = 0.068 * np.exp(-dt_m / 95.0) + 0.024 * (1.0 - np.exp(-dt_m / 25.0))
+                synth_traj.append(float(surge))
+        traj = synth_traj
+        pred_len = len(traj)
+
     sample_offsets = set(range(2, pred_len + 1, 2))
     sample_offsets.add(1)
     if pred_len > 0:
@@ -306,12 +498,16 @@ def build_chart_payload(
     sample_offsets.add(int(metrics.get("max_offset_min", 1)))
     sample_offsets.add(int(metrics.get("min_offset_min", 1)))
     sample_offsets.add(int(metrics.get("first_wave_offset_min", 1)))
+    for ev in events:
+        so = int(ev.get("scheduled_offset_min") or 0)
+        if 1 <= so <= pred_len:
+            sample_offsets.add(so)
 
     forecast_points = [
         {
             "timestamp": now_dt.isoformat(),
             "offset_min": 0,
-            "predicted_pct": round(current_spread * 100.0, 4),
+            "predicted_pct": 0.0 if is_pre_listing else round(current_spread * 100.0, 4),
         }
     ]
     for offset in sorted(o for o in sample_offsets if 1 <= o <= pred_len):
@@ -324,9 +520,13 @@ def build_chart_payload(
         })
 
     fw_edge = float(metrics.get("first_wave_edge", 0.0))
-    direction = "WIDENING" if fw_edge > 0 else "NARROWING"
-    target_spread = float(metrics.get("first_wave_target", metrics.get("mean", current_spread)))
-    target_offset_min = int(metrics.get("first_wave_offset_min", 60))
+    direction = "WIDENING" if (fw_edge > 0 or is_pre_listing) else "NARROWING"
+    target_spread = 0.068 if is_pre_listing else float(metrics.get("first_wave_target", metrics.get("mean", current_spread)))
+    target_offset_min = (
+        int(pre_listing_event.get("scheduled_offset_min", 60)) + 15
+        if is_pre_listing
+        else int(metrics.get("first_wave_offset_min", 60))
+    )
 
     return {
         "base_exchange": pair_key[0],
@@ -335,17 +535,19 @@ def build_chart_payload(
         "foreign_symbol": pair_key[3],
         "step_min": 1,
         "updated_at": now_ts,
+        "is_pre_listing": is_pre_listing,
+        "events": events,
         "summary": {
-            "current_pct": round(current_spread * 100.0, 4),
+            "current_pct": 0.0 if is_pre_listing else round(current_spread * 100.0, 4),
             "target_pct": round(target_spread * 100.0, 4),
             "target_offset_min": target_offset_min,
-            "mean_8h_pct": round(float(metrics.get("mean", current_spread)) * 100.0, 4),
-            "max_8h_pct": round(float(metrics.get("max", current_spread)) * 100.0, 4),
-            "max_offset_min": int(metrics.get("max_offset_min", 60)),
-            "min_8h_pct": round(float(metrics.get("min", current_spread)) * 100.0, 4),
+            "mean_8h_pct": round((float(np.mean(traj)) if is_pre_listing and traj else float(metrics.get("mean", current_spread))) * 100.0, 4),
+            "max_8h_pct": round((float(np.max(traj)) if is_pre_listing and traj else float(metrics.get("max", current_spread))) * 100.0, 4),
+            "max_offset_min": target_offset_min if is_pre_listing else int(metrics.get("max_offset_min", 60)),
+            "min_8h_pct": round((float(np.min(traj)) if is_pre_listing and traj else float(metrics.get("min", current_spread))) * 100.0, 4),
             "min_offset_min": int(metrics.get("min_offset_min", 60)),
-            "first_wave_pct": round(float(metrics.get("first_wave_target", current_spread)) * 100.0, 4),
-            "first_wave_offset_min": int(metrics.get("first_wave_offset_min", 60)),
+            "first_wave_pct": round(target_spread * 100.0, 4),
+            "first_wave_offset_min": target_offset_min,
             "direction": direction,
         },
         "history": history_points,
@@ -476,6 +678,8 @@ class LongRangeChartManager:
                 "range": range_code,
                 "step_min": step_min,
                 "updated_at": now_ts,
+                "is_pre_listing": base_chart_payload.get("is_pre_listing", False),
+                "events": base_chart_payload.get("events", []),
                 "summary": base_chart_payload.get("summary", {}),
                 "history": pts_copy,
                 "forecast": base_chart_payload.get("forecast", []),
@@ -497,6 +701,10 @@ def run_daemon():
     
     user_cache = UserAccountCache(r)
     user_cache.start_subscriber()
+
+    ann_cache = AnnouncementCache(r)
+    ann_cache.start_subscriber()
+    start_announcement_http_server(ann_cache=ann_cache, port=int(os.getenv("AI_HTTP_PORT", "8000")))
     
     rl_agent = PortfolioRLAgent(model_path="model/weights/ppo_arbitrage_final.zip", device="cpu", n_stack=15)
     
@@ -718,6 +926,8 @@ def run_daemon():
                     pred_len=PRED_LEN,
                 )
 
+                coin_events = ann_cache.get_events_for_symbol(opp["base_symbol"], now_ts=now_ts)
+
                 # Publish chart payload to Redis at most once every 2 seconds per pair
                 if now_ts - last_chart_publish.get(pair_key, 0.0) >= 2.0:
                     chart_payload = build_chart_payload(
@@ -727,6 +937,7 @@ def run_daemon():
                         current_spread=current_spread,
                         now_ts=now_ts,
                         past_trajs=past_trajs,
+                        events=coin_events,
                     )
                     chart_key = f"market:premium_chart:{pair_key[0]}:{pair_key[1]}:{pair_key[2]}:{pair_key[3]}"
                     try:
@@ -773,7 +984,8 @@ def run_daemon():
                     "current_spread": current_spread,
                     "base_fund": opp.get("base_funding_rate_pct", 0.0) / 100.0,
                     "foreign_fund": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
-                    "fx_rate": fx_rate
+                    "fx_rate": fx_rate,
+                    "events": coin_events,
                 }
 
             # --- [User Specific DRL Inference Step] ---
@@ -807,9 +1019,9 @@ def run_daemon():
                     slippage = float(opp.get("slippage", 0.0005))
 
                     state_neutral = 1.0 if pair_state == 0 else 0.0
-                    state_holding = 1.0 if pair_state == 1 else 0.0
+                    state_holding = 1.0 if pair_state in (1, 4) else 0.0
                     state_transferring = 1.0 if pair_state == 2 else 0.0
-                    state_repaying = 1.0 if pair_state == 3 else 0.0
+                    state_repaying = 1.0 if pair_state == 3 else (0.5 if pair_state == 4 else 0.0)
 
                     scalar_26 = np.array([
                         m_data["current_spread"],
@@ -849,10 +1061,33 @@ def run_daemon():
                     stacked_obs = np.concatenate(list(feature_cache[user_id][pair_key]), axis=-1).reshape(1, -1)
                     action_score, target_weight, action_type = rl_agent.predict(stacked_obs)
 
+                    # Causal LLM Announcement Catalyst Override
+                    active_events = m_data.get("events", [])
+                    has_delisting = any(
+                        e.get("event_type") == "DELISTING" and int(e.get("offset_min", 0)) >= -720
+                        for e in active_events
+                    )
+                    has_surge_catalyst = any(
+                        e.get("event_type") in ("NEW_KRW_LISTING", "INVESTMENT_WARNING", "WALLET_SUSPENSION")
+                        and int(e.get("offset_min", 0)) >= -180
+                        for e in active_events
+                    )
+                    if has_delisting:
+                        action_type = 2  # Emergency Veto / Unwind
+                        target_weight = 0.0
+                        action_score = 5.0
+                    elif has_surge_catalyst and m_data["current_spread"] <= 0.008:
+                        action_type = 3  # STAGE_ASSASSINATION
+                        target_weight = max(0.35, float(target_weight))
+                        action_score = 9.0
+
                     # Determine directional target spread and arrival time for Go Engine & UI
                     if action_score > 5.0:
-                        direction = "WIDENING"
-                        if m_data["first_wave_edge"] > 0:
+                        direction = "ASSASSINATION" if action_type == 3 else "WIDENING"
+                        if has_surge_catalyst:
+                            target_spread = max(float(m_data["max"]), m_data["current_spread"] + 0.045)
+                            target_offset_min = 60
+                        elif m_data["first_wave_edge"] > 0:
                             target_spread = m_data["first_wave_target"]
                             target_offset_min = m_data["first_wave_offset_min"]
                         else:

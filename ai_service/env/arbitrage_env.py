@@ -98,6 +98,37 @@ class ArbitrageEnv(gym.Env):
         else:
             self._col_borrow = np.full(len(self.df), 0.0041, dtype=np.float32)
 
+        if "tether_real_premium_spread" in self.df.columns:
+            self._col_real_spread = self.df["tether_real_premium_spread"].values.astype(np.float32)
+        else:
+            self._col_real_spread = self._col_spread.copy()
+
+        self._col_event_listing = (
+            self.df["event_new_listing"].values.astype(np.float32)
+            if "event_new_listing" in self.df.columns
+            else np.zeros(len(self.df), dtype=np.float32)
+        )
+        self._col_event_warning = (
+            self.df["event_warning"].values.astype(np.float32)
+            if "event_warning" in self.df.columns
+            else np.zeros(len(self.df), dtype=np.float32)
+        )
+        self._col_event_delisting = (
+            self.df["event_delisting"].values.astype(np.float32)
+            if "event_delisting" in self.df.columns
+            else np.zeros(len(self.df), dtype=np.float32)
+        )
+        self._col_event_suspension = (
+            self.df["event_wallet_suspension"].values.astype(np.float32)
+            if "event_wallet_suspension" in self.df.columns
+            else np.zeros(len(self.df), dtype=np.float32)
+        )
+        self._col_vasp_tier = (
+            self.df["vasp_tier"].values.astype(np.int32)
+            if "vasp_tier" in self.df.columns
+            else np.ones(len(self.df), dtype=np.int32)
+        )
+
         self._static_market_features = np.column_stack(
             [
                 self._col_spread,
@@ -148,9 +179,15 @@ class ArbitrageEnv(gym.Env):
         self.STATE_HOLDING_LEG = 1
         self.STATE_TRANSFERRING = 2
         self.STATE_REPAYING = 3
-        
+        self.STATE_STAGED = 4  # STAGED_ASSASSINATION / PRE_STAGED_LISTING
+
         self.state = self.STATE_NEUTRAL
         self.transfer_remaining_steps = 0
+        self.staged_hold_steps = 0
+        self.max_staged_hold_steps = 720  # 12 hours max stage window before in-place unwind
+        self.staged_entry_basis = 0.0
+        self.staged_trigger_type = ""
+        self.in_transit_hedge_mode = "BASE_BORROW"  # or "FOREIGN_HEDGE" (3-Stage Fallback)
 
         # Action Space: index 0 is exposure [-1.0, 1.0], index 1 is action_decision [-1.0, 1.0]
         self.action_space = spaces.Box(
@@ -182,6 +219,10 @@ class ArbitrageEnv(gym.Env):
         self.entry_spread = 0.0
         self.state = self.STATE_NEUTRAL
         self.transfer_remaining_steps = 0
+        self.staged_hold_steps = 0
+        self.staged_entry_basis = 0.0
+        self.staged_trigger_type = ""
+        self.in_transit_hedge_mode = "BASE_BORROW"
         # Backend-identical Foreign USD Capital Skew & Dual-Trigger Rebalance thresholds (GEMINI.md Section 8.3)
         self.foreign_usd_skew = 0.50
         self.balance_skew_threshold = 0.15
@@ -212,18 +253,28 @@ class ArbitrageEnv(gym.Env):
         obs[20] = self.current_slippage
         obs[21] = (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage
         obs[22] = 1.0 if self.state == self.STATE_NEUTRAL else 0.0
-        obs[23] = 1.0 if self.state == self.STATE_HOLDING_LEG else 0.0
+        obs[23] = 1.0 if self.state in (self.STATE_HOLDING_LEG, self.STATE_STAGED) else 0.0
         obs[24] = 1.0 if self.state == self.STATE_TRANSFERRING else 0.0
-        obs[25] = 1.0 if self.state == self.STATE_REPAYING else 0.0
+        obs[25] = (
+            1.0
+            if self.state == self.STATE_REPAYING
+            else (0.5 if self.state == self.STATE_STAGED else 0.0)
+        )
         obs[26:] = self.traj_deltas[idx]
         return obs
 
     def _get_unrealized_pnl(self, current_spread):
         if self.exposure == 0:
             return 0.0
+        # In STAGED_ASSASSINATION (Spot on Base + 1x Short on Foreign), profit when current_spread rises above staged_entry_basis
+        if self.state == self.STATE_STAGED:
+            return abs(self.exposure) * self.initial_balance * (current_spread - self.staged_entry_basis)
         # In Transfer Arbitrage (TRANSFERRING or REPAYING state with Short Base / Long Foreign),
-        # the coin bought on Foreign is transferred to repay the Base coin loan 1:1, locking in entry_spread.
+        # if hedged via Base coin loan, the coin bought on Foreign repays the Base loan 1:1, locking in entry_spread.
+        # If hedged via Foreign Futures 1x Short (3-Stage Fallback), PnL tracks current_spread until sold on Base.
         if self.state in (self.STATE_TRANSFERRING, self.STATE_REPAYING) and self.exposure < 0:
+            if self.in_transit_hedge_mode == "FOREIGN_HEDGE":
+                return abs(self.exposure) * self.initial_balance * current_spread
             return abs(self.exposure) * self.initial_balance * max(0.0, self.entry_spread)
         # Bidirectional PnL equation matching physics of convergence trades:
         # If exposure > 0 (Long Base, Short Foreign), profit when spread RISES
@@ -239,7 +290,9 @@ class ArbitrageEnv(gym.Env):
         # Center interval [-0.33, +0.33] maps to 0 (TRADE/HOLD) so Gaussian mean 0.0 naturally trades/holds
         action_exposure = float(np.clip(action[0], -1.0, 1.0).item())
         action_dec = float(np.clip(action[1], -1.0, 1.0).item())
-        if action_dec > 0.33:
+        if action_dec > 0.66 and action_exposure > 0:
+            action_type = 3  # STAGE_ASSASSINATION (Pre-position Spot on Base + 1x Short on Foreign)
+        elif action_dec > 0.33:
             action_type = 1  # TRANSFER (Strategy C)
         elif action_dec < -0.33:
             action_type = 2  # REPAY / EXIT
@@ -248,8 +301,14 @@ class ArbitrageEnv(gym.Env):
 
         idx = self.current_step
         current_spread = float(self._col_spread[idx])
+        real_spread = float(self._col_real_spread[idx])
         base_funding = float(self._col_base_fund[idx])
         foreign_funding = float(self._col_for_fund[idx])
+        ev_listing = float(self._col_event_listing[idx]) > 0.5
+        ev_warning = float(self._col_event_warning[idx]) > 0.5
+        ev_delisting = float(self._col_event_delisting[idx]) > 0.5
+        ev_suspension = float(self._col_event_suspension[idx]) > 0.5
+        vasp_tier = int(self._col_vasp_tier[idx])
 
         # 2. Calculate Previous Equity
         unrealized_pnl_prev = self._get_unrealized_pnl(current_spread)
@@ -263,6 +322,10 @@ class ArbitrageEnv(gym.Env):
         step_fees_paid = 0.0
         repay_via_transfer = False
         rebalance_triggered = False
+        assassination_sniped = False
+        staged_timeout_unwind = False
+        in_transit_defense_triggered = False
+        delisting_veto_or_exit = False
 
         # 3b. Dual-Trigger 100% Delta-Neutral Reverse Transfer Rebalancing (GEMINI.md Section 8.3)
         # Triggered when in NEUTRAL state, Foreign USD Skew <= 20% (RebalanceTriggerSkew), and spread <= RebalanceMaxPremium
@@ -270,6 +333,7 @@ class ArbitrageEnv(gym.Env):
             self.state == self.STATE_NEUTRAL
             and self.foreign_usd_skew <= self.rebalance_trigger_skew
             and current_spread <= self.rebalance_max_premium
+            and not ev_delisting
         ):
             rebalance_amount = 0.50 - self.foreign_usd_skew
             rebalance_notional = rebalance_amount * self.initial_balance
@@ -283,32 +347,110 @@ class ArbitrageEnv(gym.Env):
 
         # 4. State Machine Transition Logic
         target_exposure = self.exposure
+        round_trip_breakeven = (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage
 
-        if self.state == self.STATE_TRANSFERRING:
+        # Hard Safety Guardrail: DELISTING announcement blocks new entries and forces immediate exit
+        if ev_delisting:
+            delisting_veto_or_exit = True
+            if self.state == self.STATE_NEUTRAL:
+                target_exposure = 0.0
+            elif self.state in (self.STATE_HOLDING_LEG, self.STATE_STAGED, self.STATE_REPAYING):
+                target_exposure = 0.0
+                self.state = self.STATE_NEUTRAL
+                self.staged_hold_steps = 0
+                action_type = 2
+
+        elif self.state == self.STATE_TRANSFERRING:
             # Undergoing transfer - lock exposure and ignore user actions
             target_exposure = self.exposure
             self.transfer_remaining_steps -= 1
             if self.transfer_remaining_steps <= 0:
-                self.state = self.STATE_REPAYING  # Transfer completed, awaiting repayment
+                # Check Post-Arrival Kimp Drop Defense (Ch 05 Section 5)
+                if (
+                    self.in_transit_hedge_mode == "FOREIGN_HEDGE"
+                    and real_spread < round_trip_breakeven
+                ):
+                    # Do NOT market-sell at a loss upon arrival! Auto-transition to STAGED_ASSASSINATION
+                    self.state = self.STATE_STAGED
+                    self.staged_hold_steps = 0
+                    self.staged_entry_basis = 0.0  # Foreign Spot + Foreign 1x Short locked 0.0 basis
+                    self.staged_trigger_type = "IN_TRANSIT_KIMP_DROP_DEFENSE"
+                    in_transit_defense_triggered = True
+                else:
+                    self.state = self.STATE_REPAYING  # Transfer completed, awaiting repayment/execution
+
+        elif self.state == self.STATE_STAGED:
+            self.staged_hold_steps += 1
+            if self.staged_trigger_type == "IN_TRANSIT_KIMP_DROP_DEFENSE":
+                target_exit_spread = max(self.staged_entry_basis + 0.015, round_trip_breakeven * 1.5, 0.018)
+            else:
+                target_exit_spread = max(self.staged_entry_basis + 0.032, round_trip_breakeven * 2.0, 0.035)
+            if current_spread >= target_exit_spread or (
+                action_type == 2 and current_spread > self.staged_entry_basis + round_trip_breakeven
+            ):
+                # Instant 0-latency assassination exit on Base (Base Spot Sell + Foreign Short Cover)
+                target_exposure = 0.0
+                self.state = self.STATE_NEUTRAL
+                self.staged_hold_steps = 0
+                assassination_sniped = True
+            elif self.staged_hold_steps >= self.max_staged_hold_steps or action_type == 2:
+                # Timeout or manual exit: simultaneous in-place unwind (Base Spot Sell + Foreign Short Cover)
+                # Zero reverse blockchain gas fee!
+                target_exposure = 0.0
+                self.state = self.STATE_NEUTRAL
+                self.staged_hold_steps = 0
+                staged_timeout_unwind = True
+            else:
+                target_exposure = self.exposure
 
         elif self.state == self.STATE_NEUTRAL:
-            # In Neutral state, there is no open position to transfer or repay; any exposure >= threshold is an entry
-            if abs(action_exposure) >= self.execution_threshold:
+            # Check if staging an Assassination pre-position (Action 3 or causal Listing/Warning/Suspension catalyst)
+            can_stage_catalyst = (
+                action_type == 3
+                or (
+                    (ev_listing or ev_warning or ev_suspension)
+                    and current_spread <= 0.008
+                    and float(self._col_pred_max[idx]) - current_spread >= 0.020
+                    and abs(action_exposure) >= self.execution_threshold
+                )
+            )
+            if can_stage_catalyst and self.foreign_usd_skew >= self.balance_skew_threshold:
+                target_exposure = abs(action_exposure) if abs(action_exposure) >= self.execution_threshold else 0.50
+                self.state = self.STATE_STAGED
+                self.staged_hold_steps = 0
+                self.staged_entry_basis = current_spread
+                self.staged_trigger_type = "LLM_EVENT_PRE_POSITION" if (ev_listing or ev_warning or ev_suspension) else "AI_SURGE_FORECAST"
+                gas_fee = 5.00 if vasp_tier == 3 else 2.50
+                self.balance -= gas_fee
+                step_fees_paid += gas_fee
+                self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(target_exposure) * 0.15)
+            elif abs(action_exposure) >= self.execution_threshold:
                 target_exposure = action_exposure
                 self.state = self.STATE_HOLDING_LEG
             else:
                 target_exposure = 0.0
 
         elif self.state == self.STATE_HOLDING_LEG:
-            if action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, entry_spread >= 0.5%, and Foreign USD Skew >= 15%)
+            if action_type == 3 and self.foreign_usd_skew >= self.balance_skew_threshold:
+                # Transition existing hedge into STAGED_ASSASSINATION by pre-depositing to Base
+                target_exposure = abs(self.exposure) if abs(self.exposure) >= self.execution_threshold else 0.50
+                self.state = self.STATE_STAGED
+                self.staged_hold_steps = 0
+                self.staged_entry_basis = current_spread
+                self.staged_trigger_type = "LLM_EVENT_PRE_POSITION"
+                gas_fee = 5.00 if vasp_tier == 3 else 2.50
+                self.balance -= gas_fee
+                step_fees_paid += gas_fee
+                self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(target_exposure) * 0.15)
+            elif action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, real_spread >= 0.5%, and Foreign USD Skew >= 15%)
                 if (
                     self.exposure < 0
-                    and self.entry_spread >= 0.005
+                    and real_spread >= 0.005
                     and self.foreign_usd_skew >= self.balance_skew_threshold
                 ):
                     self.state = self.STATE_TRANSFERRING
-                    self.transfer_remaining_steps = 8 if self.is_eval else np.random.randint(5, 15)
-                    gas_fee = 2.50
+                    self.transfer_remaining_steps = (14 if vasp_tier == 3 else 8) if self.is_eval else np.random.randint(5, 15)
+                    gas_fee = 5.00 if vasp_tier == 3 else 2.50
                     self.balance -= gas_fee
                     step_fees_paid += gas_fee
                     # Moving coin from Foreign to Base consumes Foreign USD allocation
@@ -366,7 +508,7 @@ class ArbitrageEnv(gym.Env):
         cheapest_foreign_exec = min(foreign_spot_cost, foreign_future_cost)
         optimal_round_trip_fee = max(0.0005, cheapest_base_exec + cheapest_foreign_exec)
 
-        vetoed = False
+        vetoed = bool(ev_delisting and prev_state == self.STATE_NEUTRAL and abs(action_exposure) >= self.execution_threshold)
         # Only run Veto Manager when INCREASING exposure or flipping direction (never block exits or scale-outs!)
         is_opening_or_increasing = (
             target_exposure != 0.0
@@ -380,18 +522,19 @@ class ArbitrageEnv(gym.Env):
             actual_slippage = self.current_slippage * (1.0 + (trade_value / 5000.0) ** 2)
             optimal_round_trip_fee = optimal_round_trip_fee - self.current_slippage + actual_slippage
 
-            if target_exposure > 0:
-                # Long Base / Short Foreign: profits when spread widens (regardless of current spread sign!)
+            if target_exposure > 0 or self.state == self.STATE_STAGED:
+                # Long Base / Short Foreign or Pre-Staged Assassination: profits when spread widens
                 forecast_widening = float(self._col_pred_max[idx]) - current_spread
                 first_wave_up = max(0.0, float(self._col_fw_edge[idx]))
                 mean_reversion_up = float(self._col_sma_24h[idx]) - current_spread
-                predicted_jump = max(forecast_widening, first_wave_up, mean_reversion_up * 0.6)
+                catalyst_bonus = 0.030 if (ev_listing or ev_warning or ev_suspension) else 0.0
+                predicted_jump = max(forecast_widening, first_wave_up, mean_reversion_up * 0.6, catalyst_bonus)
             else:
                 # Short Base / Long Foreign: profits from spread narrowing OR instant transfer spread
                 convergence_jump = current_spread - float(self._col_pred_min[idx])
                 first_wave_dn = max(0.0, -float(self._col_fw_edge[idx]))
                 mean_reversion_down = current_spread - float(self._col_sma_24h[idx])
-                transfer_spread = max(0.0, current_spread)
+                transfer_spread = max(0.0, real_spread)
                 predicted_jump = max(convergence_jump, first_wave_dn, mean_reversion_down * 0.6, transfer_spread)
 
             fee_percentage_wall = optimal_round_trip_fee
@@ -433,9 +576,16 @@ class ArbitrageEnv(gym.Env):
                         closed_exposure = 0.0
 
                 if closed_exposure != 0:
-                    if repay_via_transfer and closed_exposure < 0:
-                        # Strategy C (Transfer Arbitrage): locked in entry_spread directly
-                        realized_pnl = abs(closed_exposure) * self.initial_balance * max(0.0, self.entry_spread)
+                    if prev_state == self.STATE_STAGED:
+                        # STAGED_ASSASSINATION exit (sniped surge or in-place simultaneous unwind):
+                        # captures (current_spread - staged_entry_basis) with ZERO reverse blockchain gas fee
+                        realized_pnl = abs(closed_exposure) * self.initial_balance * (current_spread - self.staged_entry_basis)
+                    elif repay_via_transfer and closed_exposure < 0:
+                        # Strategy C (Transfer Arbitrage): locked in entry_spread directly (or current_spread if foreign hedged)
+                        if self.in_transit_hedge_mode == "FOREIGN_HEDGE":
+                            realized_pnl = abs(closed_exposure) * self.initial_balance * current_spread
+                        else:
+                            realized_pnl = abs(closed_exposure) * self.initial_balance * max(0.0, self.entry_spread)
                     else:
                         # Strategy A/B/D/E (Convergence Arbitrage): realized spread difference
                         realized_pnl = closed_exposure * self.initial_balance * (current_spread - self.entry_spread)
@@ -461,7 +611,7 @@ class ArbitrageEnv(gym.Env):
 
         # Apply continuous funding fee yield accruals
         accrual_factor = 1.0 / (8 * 60)
-        if self.exposure > 0:
+        if self.exposure > 0 or self.state == self.STATE_STAGED:
             funding_pnl = self.initial_balance * abs(self.exposure) * (foreign_funding_dec - base_funding_dec) * accrual_factor
         elif self.exposure < 0:
             funding_pnl = self.initial_balance * abs(self.exposure) * (base_funding_dec - foreign_funding_dec) * accrual_factor
@@ -470,7 +620,7 @@ class ArbitrageEnv(gym.Env):
         self.balance += funding_pnl
 
         # Base Borrow interest fee hourly accrual applied per step
-        if self.exposure < 0:
+        if self.exposure < 0 and self.state != self.STATE_STAGED:
             borrow_fee = abs(self.exposure) * self.initial_balance * borrow_rate * (1.0 / 60.0)
             self.balance -= borrow_fee
             step_fees_paid += borrow_fee
@@ -500,6 +650,12 @@ class ArbitrageEnv(gym.Env):
             "trade_executed": bool(trade_executed),
             "repay_via_transfer": bool(repay_via_transfer),
             "rebalance_triggered": bool(rebalance_triggered),
+            "assassination_sniped": bool(assassination_sniped),
+            "staged_timeout_unwind": bool(staged_timeout_unwind),
+            "in_transit_defense_triggered": bool(in_transit_defense_triggered),
+            "delisting_veto_or_exit": bool(delisting_veto_or_exit),
+            "staged_trigger_type": str(self.staged_trigger_type),
+            "staged_hold_steps": int(self.staged_hold_steps),
             "foreign_usd_skew": float(self.foreign_usd_skew),
             "vetoed": bool(vetoed),
             "step_fees_paid": float(step_fees_paid),

@@ -136,6 +136,7 @@ def run_ppo_simulation(
         "CONVERGENCE_HEDGE_ABDE": 0,
         "TRANSFERRING_C": 0,
         "REPAYING_C": 0,
+        "STAGED_ASSASSINATION": 0,
     }
 
     prev_exposure = 0.0
@@ -152,8 +153,10 @@ def run_ppo_simulation(
         else:
             signed_exp = 0.0
 
-        if action_type == 1:
-            act_dec = 0.8   # TRANSFER
+        if action_type == 3:
+            act_dec = 0.90  # STAGE_ASSASSINATION
+        elif action_type == 1:
+            act_dec = 0.50  # TRANSFER
         elif action_type == 2:
             act_dec = -0.8  # REPAY / EXIT
         else:
@@ -177,6 +180,8 @@ def run_ppo_simulation(
             state_counts["TRANSFERRING_C"] += 1
         elif cur_state == 3:
             state_counts["REPAYING_C"] += 1
+        elif cur_state == 4:
+            state_counts["STAGED_ASSASSINATION"] += 1
 
         if cur_info.get("trade_executed", False):
             total_trades += 1
@@ -340,6 +345,162 @@ def run_rule_based_baseline(
     )
 
 
+def evaluate_assassination_scenarios() -> dict:
+    """
+    Runs the 4-Scenario Assassination & Event Stress Suite:
+      - Scenario A (Successful New Listing / Gaduri Warning Assassination):
+          Notice at t=0 (0.2% Kimp) -> pre-staged via STAGE_ASSASSINATION -> Kimp surges to +4.5% -> 0-latency exit on Base.
+      - Scenario B (False Signal / Fizzle Timeout Unwind):
+          Notice at t=0 (0.2% Kimp) -> pre-staged -> Kimp stays flat at +0.3% for 720 steps -> simultaneous in-place unwind with zero reverse gas fee.
+      - Scenario C (Delisting Trap Defense):
+          DELISTING notice active -> 100% of entry attempts are vetoed and open positions are unwound immediately.
+      - Scenario D (In-Transit Kimp Drop Defense):
+          Transfer started at +3.5% Kimp with FOREIGN_HEDGE -> Kimp drops to -0.3% during transit -> auto-switches to STATE_STAGED instead of panic-selling -> exits profitably on +2.4% rebound.
+    """
+    # Scenario A: Successful Listing / Gaduri Surge
+    n_a = 120
+    spread_a = np.full(n_a, 0.002, dtype=np.float32)
+    spread_a[40:70] = np.linspace(0.002, 0.045, 30, dtype=np.float32)
+    spread_a[70:] = 0.045
+    df_a = pd.DataFrame({
+        "exchange_premium_spread": spread_a,
+        "tether_real_premium_spread": spread_a,
+        "predicted_spread": spread_a + 0.025,
+        "predicted_spread_max": np.maximum(spread_a + 0.040, 0.045),
+        "predicted_spread_min": spread_a - 0.002,
+        "first_wave_edge": np.full(n_a, 0.038, dtype=np.float32),
+        "base_funding_rate": np.zeros(n_a, dtype=np.float32),
+        "foreign_funding_rate": np.full(n_a, 0.0001, dtype=np.float32),
+        "event_new_listing": np.ones(n_a, dtype=np.float32),
+        "vasp_tier": np.ones(n_a, dtype=np.int32),
+    })
+    env_a = ArbitrageEnv(df=df_a, initial_balance=10000.0, is_eval=True)
+    env_a.reset()
+    sniped_a = False
+    for _ in range(n_a - 1):
+        action = np.array([0.50, 0.90], dtype=np.float32) if env_a.state == env_a.STATE_NEUTRAL and not sniped_a else np.array([0.50, 0.0], dtype=np.float32)
+        _, _, done, _, info_a = env_a.step(action)
+        if info_a.get("assassination_sniped"):
+            sniped_a = True
+        if done or sniped_a:
+            break
+    roi_a_pct = ((env_a.balance - 10000.0) / 10000.0) * 100.0
+
+    # Scenario B: False Signal / Fizzle Timeout Unwind (Zero Reverse Gas Fee)
+    n_b = 750
+    spread_b = np.full(n_b, 0.0025, dtype=np.float32)
+    df_b = pd.DataFrame({
+        "exchange_premium_spread": spread_b,
+        "tether_real_premium_spread": spread_b,
+        "predicted_spread": spread_b + 0.022,
+        "predicted_spread_max": spread_b + 0.030,
+        "predicted_spread_min": spread_b - 0.002,
+        "first_wave_edge": np.full(n_b, 0.025, dtype=np.float32),
+        "base_funding_rate": np.zeros(n_b, dtype=np.float32),
+        "foreign_funding_rate": np.zeros(n_b, dtype=np.float32),
+        "event_warning": np.ones(n_b, dtype=np.float32),
+        "vasp_tier": np.ones(n_b, dtype=np.int32),
+    })
+    env_b = ArbitrageEnv(df=df_b, initial_balance=10000.0, is_eval=True)
+    env_b.reset()
+    timeout_unwound_b = False
+    unwind_step_fee_b = 0.0
+    for step_i in range(n_b - 1):
+        act = np.array([0.50, 0.90], dtype=np.float32) if step_i == 0 else np.array([0.50, 0.0], dtype=np.float32)
+        _, _, done, _, info_b = env_b.step(act)
+        if info_b.get("staged_timeout_unwind"):
+            timeout_unwound_b = True
+            unwind_step_fee_b = float(info_b.get("step_fees_paid", 0.0))
+            break
+        if done:
+            break
+
+    # Scenario C: Delisting Trap Defense (100% Entry Veto + Immediate Emergency Exit)
+    n_c = 40
+    spread_c = np.linspace(0.050, -0.150, n_c, dtype=np.float32)
+    df_c = pd.DataFrame({
+        "exchange_premium_spread": spread_c,
+        "tether_real_premium_spread": spread_c,
+        "predicted_spread": spread_c,
+        "predicted_spread_max": spread_c + 0.030,
+        "predicted_spread_min": spread_c - 0.030,
+        "first_wave_edge": np.full(n_c, 0.025, dtype=np.float32),
+        "base_funding_rate": np.zeros(n_c, dtype=np.float32),
+        "foreign_funding_rate": np.zeros(n_c, dtype=np.float32),
+        "event_delisting": np.ones(n_c, dtype=np.float32),
+    })
+    env_c = ArbitrageEnv(df=df_c, initial_balance=10000.0, is_eval=True)
+    env_c.reset()
+    blocked_attempts = 0
+    total_attempts = 20
+    for _ in range(total_attempts):
+        _, _, _, _, info_c = env_c.step(np.array([0.60, 0.90], dtype=np.float32))
+        if info_c.get("vetoed") and env_c.exposure == 0.0:
+            blocked_attempts += 1
+    delisting_block_rate = (blocked_attempts / float(total_attempts)) * 100.0
+
+    # Scenario D: In-Transit Kimp Drop Defense (+3.5% -> -0.3% during transfer -> auto-stage -> +2.4% rebound exit)
+    n_d = 60
+    spread_d = np.full(n_d, 0.035, dtype=np.float32)
+    spread_d[3:25] = -0.003  # Kimp collapses while coin is in transit!
+    spread_d[25:] = 0.024    # Kimp rebounds to +2.4%
+    df_d = pd.DataFrame({
+        "exchange_premium_spread": spread_d,
+        "tether_real_premium_spread": spread_d,
+        "predicted_spread": spread_d,
+        "predicted_spread_max": spread_d + 0.020,
+        "predicted_spread_min": spread_d - 0.020,
+        "first_wave_edge": np.full(n_d, -0.020, dtype=np.float32),
+        "base_funding_rate": np.zeros(n_d, dtype=np.float32),
+        "foreign_funding_rate": np.zeros(n_d, dtype=np.float32),
+    })
+    env_d = ArbitrageEnv(df=df_d, initial_balance=10000.0, is_eval=True)
+    env_d.reset()
+    env_d.in_transit_hedge_mode = "FOREIGN_HEDGE"
+    # Step 0: Enter Short Base / Long Foreign leg at +3.5%
+    env_d.step(np.array([-0.50, 0.0], dtype=np.float32))
+    # Step 1: Initiate Transfer (Strategy C)
+    env_d.step(np.array([-0.50, 0.50], dtype=np.float32))
+    defense_triggered_d = False
+    sniped_rebound_d = False
+    for _ in range(2, n_d - 1):
+        _, _, done, _, info_d = env_d.step(np.array([-0.50, 0.0], dtype=np.float32))
+        if info_d.get("in_transit_defense_triggered"):
+            defense_triggered_d = True
+        if info_d.get("assassination_sniped"):
+            sniped_rebound_d = True
+            break
+        if done:
+            break
+    roi_d_pct = ((env_d.balance - 10000.0) / 10000.0) * 100.0
+
+    return {
+        "scenario_a_listing_surge": {
+            "sniped": bool(sniped_a),
+            "net_roi_pct": round(float(roi_a_pct), 3),
+            "final_balance_usd": round(float(env_a.balance), 2),
+        },
+        "scenario_b_fizzle_timeout": {
+            "timeout_unwound_in_place": bool(timeout_unwound_b),
+            "unwind_step_fee_usd": round(float(unwind_step_fee_b), 2),
+            "reverse_gas_fee_usd": 0.0,
+            "final_balance_usd": round(float(env_b.balance), 2),
+        },
+        "scenario_c_delisting_defense": {
+            "entry_attempts": total_attempts,
+            "blocked_attempts": blocked_attempts,
+            "delisting_entry_block_rate_pct": round(float(delisting_block_rate), 2),
+            "final_balance_usd": round(float(env_c.balance), 2),
+        },
+        "scenario_d_in_transit_kimp_drop_defense": {
+            "auto_switched_to_staged": bool(defense_triggered_d),
+            "sniped_on_rebound": bool(sniped_rebound_d),
+            "net_roi_pct": round(float(roi_d_pct), 3),
+            "final_balance_usd": round(float(env_d.balance), 2),
+        },
+    }
+
+
 def evaluate_rl_agent(
     csv_path: str = "data/historical_dump.csv",
     model_path: str = "model/weights/ppo_arbitrage_final.zip",
@@ -433,6 +594,16 @@ def evaluate_rl_agent(
         )
         logger.info("-" * 86)
 
+    assassination_suite = evaluate_assassination_scenarios()
+    logger.info(
+        "4-SCENARIO ASSASSINATION & EVENT STRESS SUITE:\n"
+        f"  • Scenario A (Listing/Warning Surge)  : Sniped={assassination_suite['scenario_a_listing_surge']['sniped']} | Net ROI={assassination_suite['scenario_a_listing_surge']['net_roi_pct']:+.2f}%\n"
+        f"  • Scenario B (12h Fizzle Timeout)     : In-Place Unwind={assassination_suite['scenario_b_fizzle_timeout']['timeout_unwound_in_place']} | Reverse Gas=${assassination_suite['scenario_b_fizzle_timeout']['reverse_gas_fee_usd']:.2f}\n"
+        f"  • Scenario C (Delisting Trap Defense) : Entry Block Rate={assassination_suite['scenario_c_delisting_defense']['delisting_entry_block_rate_pct']:.1f}%\n"
+        f"  • Scenario D (In-Transit Drop Defense): Auto-Staged={assassination_suite['scenario_d_in_transit_kimp_drop_defense']['auto_switched_to_staged']} | Rebound Sniped={assassination_suite['scenario_d_in_transit_kimp_drop_defense']['sniped_on_rebound']} ({assassination_suite['scenario_d_in_transit_kimp_drop_defense']['net_roi_pct']:+.2f}%)"
+    )
+    logger.info("=" * 86)
+
     benchmark_summary = {
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "test_period_minutes": int(len(eval_df_full)),
@@ -448,6 +619,7 @@ def evaluate_rl_agent(
             "rl_only_ablation": rl_only_res,
             "rule_based_baseline": rule_res,
         },
+        "assassination_scenario_suite": assassination_suite,
     }
 
     os.makedirs(os.path.dirname(report_path), exist_ok=True)

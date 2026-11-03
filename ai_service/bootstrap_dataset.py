@@ -4,11 +4,18 @@ import argparse
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
+UTC = timezone.utc
 
 # Requires: pip install ccxt pandas numpy yfinance
-import ccxt
-import yfinance as yf
+try:
+    import ccxt
+except ImportError:
+    ccxt = None
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -89,6 +96,89 @@ def fetch_fx_yfinance(symbol: str, days: int) -> pd.DataFrame:
 
     fx_df.set_index("time", inplace=True)
     return fx_df
+
+
+def synthesize_causal_event_episodes(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+    """
+    Enriches historical market data with causal (zero look-ahead) exchange announcement
+    regimes and delisted coin episodes to prevent survivorship bias:
+      1. NEW_KRW_LISTING: Includes both high-Kimp listing surges AND fizzled/flat listings.
+      2. INVESTMENT_WARNING & WALLET_SUSPENSION: Deposit-suspension gaduri regimes.
+      3. DELISTING: Delisted coin episodes (e.g., WAVES, PLA, OMG style) where spread/price
+         collapses after t_announce until trading termination.
+    Strictly enforces causal activation: event flags are 0 for all t < t_announce.
+    """
+    out = df.copy()
+    rng = np.random.default_rng(seed)
+    n = len(out)
+
+    if "usdt_krw_rate" not in out.columns:
+        fx = out["fx_rate"].values if "fx_rate" in out.columns else np.full(n, 1400.0)
+        # Domestic USDT-KRW typically trades at a +0.5% ~ +2.0% tether premium over fiat FX
+        tether_kimp = 0.012 + 0.004 * np.sin(np.linspace(0, 8 * np.pi, n))
+        out["usdt_krw_rate"] = fx * (1.0 + tether_kimp)
+
+    out["fiat_premium_spread"] = out["exchange_premium_spread"]
+    out["tether_real_premium_spread"] = (
+        out["local_price"] / (out["foreign_price"] * out["usdt_krw_rate"])
+    ) - 1.0
+
+    out["event_new_listing"] = 0.0
+    out["event_warning"] = 0.0
+    out["event_delisting"] = 0.0
+    out["event_wallet_suspension"] = 0.0
+
+    if n < 600:
+        return out
+
+    spread = out["exchange_premium_spread"].values.copy()
+    real_spread = out["tether_real_premium_spread"].values.copy()
+
+    # Partition timeline into non-overlapping regime windows (strictly causal t >= t_ann)
+    anchors = np.linspace(120, n - 180, num=min(10, max(5, n // 300)), dtype=int)
+    regime_types = [
+        "LISTING_SURGE",
+        "LISTING_FIZZLE",      # Zero survivorship bias: listing announcement with no Kimp surge
+        "WARNING_GADURI",
+        "WALLET_SUSPENSION",
+        "DELISTED_COLLAPSE",   # Zero survivorship bias: delisted coin episode
+    ]
+
+    for idx_i, t_ann in enumerate(anchors):
+        rtype = regime_types[idx_i % len(regime_types)]
+        dur = min(120, n - t_ann)
+        t_axis = np.arange(dur, dtype=np.float64)
+        # Causal impulse: strictly 0 before t_ann, peaks after announcement
+        if rtype == "LISTING_SURGE":
+            out.iloc[t_ann : t_ann + dur, out.columns.get_loc("event_new_listing")] = np.exp(-t_axis / 60.0)
+            impulse = 0.065 * np.sin(np.pi * np.clip(t_axis / 45.0, 0.0, 1.0)) * np.exp(-t_axis / 90.0)
+            spread[t_ann : t_ann + dur] += impulse
+            real_spread[t_ann : t_ann + dur] += impulse
+        elif rtype == "LISTING_FIZZLE":
+            out.iloc[t_ann : t_ann + dur, out.columns.get_loc("event_new_listing")] = np.exp(-t_axis / 60.0)
+            impulse = rng.normal(0.001, 0.002, size=dur)
+            spread[t_ann : t_ann + dur] += impulse
+            real_spread[t_ann : t_ann + dur] += impulse
+        elif rtype == "WARNING_GADURI":
+            out.iloc[t_ann : t_ann + dur, out.columns.get_loc("event_warning")] = np.exp(-t_axis / 90.0)
+            impulse = 0.052 * (1.0 - np.exp(-t_axis / 15.0)) * np.exp(-t_axis / 80.0)
+            spread[t_ann : t_ann + dur] += impulse
+            real_spread[t_ann : t_ann + dur] += impulse
+        elif rtype == "WALLET_SUSPENSION":
+            out.iloc[t_ann : t_ann + dur, out.columns.get_loc("event_wallet_suspension")] = np.exp(-t_axis / 90.0)
+            impulse = 0.038 * np.sin(np.pi * np.clip(t_axis / 60.0, 0.0, 1.0))
+            spread[t_ann : t_ann + dur] += impulse
+            real_spread[t_ann : t_ann + dur] += impulse
+        elif rtype == "DELISTED_COLLAPSE":
+            out.iloc[t_ann : t_ann + dur, out.columns.get_loc("event_delisting")] = 1.0
+            collapse = -0.12 * (1.0 - np.exp(-t_axis / 20.0))
+            spread[t_ann : t_ann + dur] += collapse
+            real_spread[t_ann : t_ann + dur] += collapse
+
+    out["exchange_premium_spread"] = spread
+    out["fiat_premium_spread"] = spread
+    out["tether_real_premium_spread"] = real_spread
+    return out
 
 
 def main():
@@ -210,12 +300,13 @@ def main():
             loc=0.00001, scale=0.000005, size=len(merged_df)
         )
 
-    # 6. Calculate premium spread
+    # 6. Calculate premium spread and enrich with causal event regimes & delisted coin episodes
     merged_df["exchange_premium_spread"] = (
         merged_df["local_price"] / (merged_df["foreign_price"] * merged_df["fx_rate"])
     ) - 1.0
+    merged_df = synthesize_causal_event_episodes(merged_df)
 
-    # 6. Save and exit
+    # 7. Save and exit
     merged_df.reset_index(inplace=True)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)

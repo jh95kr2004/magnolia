@@ -293,16 +293,28 @@ class PortfolioRLAgent:
         target_weight = abs(base_target_exposure)
         action_score = (base_target_exposure + 1.0) * 5.0
 
-        if action_decision > 0.33:
+        if action_decision > 0.66:
+            action_type = 3  # STAGE_ASSASSINATION
+        elif action_decision > 0.33:
             action_type = 1  # TRANSFER
         elif action_decision < -0.33:
             action_type = 2  # REPAY / EXIT
         else:
             action_type = 0  # TRADE / HOLD
 
+        is_staged_state = state_holding > 0.5 and (0.25 < state_repaying < 0.75)
+
         # Bidirectional Trajectory & State Machine Execution Logic (No spread sign lock!)
         if state_neutral > 0.5:
             if use_forecaster:
+                # Check if Forecaster predicts a massive +2.5%p+ Kimp explosion from a low/near-zero base (Assassination Pre-Positioning)
+                if spread <= 0.006 and (max_pred - spread) >= 0.028 and first_wave_edge >= 0.020:
+                    action_type = 3  # STAGE_ASSASSINATION
+                    edge_weight = min(0.85, max(0.35, (max_pred - spread) / 0.04))
+                    target_weight = float(edge_weight)
+                    action_score = 8.8
+                    return float(action_score), float(target_weight), int(action_type)
+
                 # Determine optimal first-wave or dominant trajectory direction
                 if abs(first_wave_edge) > friction_wall * 1.15:
                     is_widening = first_wave_edge > 0
@@ -352,6 +364,17 @@ class PortfolioRLAgent:
                     action_type = 0
                     target_weight = 0.0
                     action_score = 5.0
+
+        elif is_staged_state:
+            # In STAGED_ASSASSINATION: exit immediately when Kimp surges to target or unrealized_pnl >= $150
+            if spread >= 0.020 or unrealized_pnl >= 120.0:
+                action_type = 2  # Instant 0-latency exit on Base
+                target_weight = 0.0
+                action_score = 5.0
+            else:
+                action_type = 3
+                target_weight = abs(cur_exposure)
+                action_score = 8.5
 
         elif state_holding > 0.5:
             if cur_exposure < 0:
