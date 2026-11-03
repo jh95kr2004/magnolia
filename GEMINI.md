@@ -261,9 +261,18 @@ k8s위에서 Pod으로 작동하는 서버로 각 사용자 별 go routine을 �
   - **자산 쏠림 현상 (Balance Skew) 및 100% 델타 중립 자동 리밸런싱 (Reverse Transfer Rebalancing)**:
     - Coinbase(Foreign)의 USD/quote 자본이 Upbit(Base)로 전부 이동하여 향후 매매 기회를 막는 리스크를 방지하기 위해 `BalanceSkewThreshold` (기본 0.15)를 설정하여 Foreign 거래소의 USD/quote 자산 비중이 15% 미만이 될 경우 진입을 자동으로 제한합니다.
     - 나아가 **이중 조건(Dual-Trigger: Foreign USD 비중 <= 20% `RebalanceTriggerSkew` AND 현재 프리미엄 <= 손익분기/역프 `RebalanceMaxPremium`)** 충족 시, 업비트 원화로 현물 매수 + 해외 거래소 숏(마진 대여 매도 또는 선물 1배 숏) 동시 체결 후 코인을 해외로 역전송하여 **100% 델타 중립 상태**로 자본 비율이 `50:50` (`RebalanceTargetSkew = 0.50`)에 도달할 때까지 USD 잔고를 자동 복구합니다.
-  - **웹 기반 코인 대여 자동화 (`WebLendingDriver` & `noVNC` 세션 워치독)**:
+  - **웹 기반 코인 대여 자동화 (`WebLendingDriver` & `noVNC` 세션 워치독) 및 3단계 헤징 폴백 (`BASE_BORROW` ➔ `FOREIGN_BORROW` ➔ `FOREIGN_FUTURES_HEDGE`)**:
     - 업비트 등 공식 OpenAPI에 코인 대여가 없지만 웹에서 대여 서비스를 제공하는 거래소를 위해 `WebLendingDriver` 인터페이스(`web_lending.go`, `upbit_lending.go`)를 통해 CDP로 브라우저 대여/상환을 자동화합니다.
-    - 사용자별 `runUserEngine` 고루틴 하위에서 세션 워치독이 돌며, 세션 단절 시 즉시 대여 전략 진입을 차단하고, **이미 코인을 대여한 상태에서 세션이 끊기면 최고 수위의 긴급 경보(CRITICAL Alert)**를 발송합니다.
+    - 만약 국내·해외 거래소 모두에서 해당 코인의 대여 물량이 품절된 경우에도 기회를 놓치지 않도록, **해외 거래소에서 현물 매수 + 동일 수량 선물 1배 숏(`FOREIGN_FUTURES_HEDGE`)**을 동시에 잡아 100% 델타 중립을 유지한 채 코인을 국내로 전송하고, 도착 즉시 국내 현물 매도와 해외 선물 숏 커버를 동시에 수행합니다.
+  - **명목 법정화폐 김프(`PremiumPct`) vs 거래소별 테더(USDT) 정품 기준 실질 김프(`RealCoinPremiumPct`) 이원화**:
+    - 코인을 실제로 이동시키지 않고 제자리에서 수렴·확대 차익을 노리는 `Strategy A, B, D, E` 및 역전송 리밸런싱은 **명목 법정화폐 김프(`PremiumPct`)**를 기준으로 판단합니다.
+    - 반면 코인을 해외에서 사서 국내로 전송해 원화로 파는 `Strategy C (보따리·암살)`는 테더(USDT) 자체의 김프를 제외한 **거래소별 정품 테더 대비 실질 코인 김프(`RealCoinPremiumPct`)**를 기준으로 판단하여, 알트코인이 테더보다 역프일 때 보따리를 싸서 손실을 보는 현상을 원천 차단합니다.
+  - **업비트 VASP 3단계 등급 분류, 공식 트래블룰 OpenAPI 자동 검증(`VerifyTravelRuleDeposit`) 및 2-Hop 개인지갑 경유 정량 비교**:
+    - 해외 거래소를 `VASPTier1Solution`(자동 입금), `VASPTier2OwnerLinked`(OpenAPI `POST /v1/travel_rule/deposit/uuid` 자동 계정주 검증), `VASPTier3RiskAssessed`(코인베이스 등 직접 입금 불가 ➔ 개인지갑 2-Hop 경유 필수)로 분류합니다.
+    - 2-Hop 경유 시에는 2회 온체인 출금 수수료 및 지연 감쇠를 차감한 `NetROI`를 `Strategy A/B/D/E`와 정량 비교하며, 출발 전 개인지갑의 네이티브 가스비(`ETH`, `SOL`, `TRX` 등)를 사전 검증(`CheckPreflightWalletGas`)합니다.
+  - **선제 입금 암살 모드 (`STAGED_ASSASSINATION`), 전송 중 김프 급락 자동 방어 (`IN_TRANSIT_KIMP_DROP_DEFENSE`) 및 원화 신규 상장 2단계 장전 (`PRE_STAGED_LISTING`)**:
+    - 하이브리드 LLM 공지 분류기(`announcement_classifier.py`)가 원화 신규 상장(`NEW_KRW_LISTING`), 유의 종목 지정(`INVESTMENT_WARNING`), 입출금 일시 중단(`WALLET_SUSPENSION`), 상장폐지(`DELISTING`) 및 예정 시각(`scheduled_at`)을 실시간 추출합니다.
+    - 전송 도중 김프가 손익분기 밑으로 급락하면 손절 매도하는 대신 자동으로 `STAGED_ASSASSINATION` 상태로 전환하여 반등/가두리 펌핑을 대기하며, 타임아웃 만료 시 역전송 가스비 없이 제자리에서 동시 청산(`Domestic Spot Sell + Foreign Short Cover`)합니다.
 - **장점**
   - 다른 전략들과 달리 포지션 진입 당시에 발생한 프리미엄을 이용해 즉시 수익 실현 가능
   - 프리미엄이 유지되는 경우에는 추가적인 수익을 반복 실현 가능

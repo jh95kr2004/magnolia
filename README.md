@@ -146,8 +146,10 @@ docker compose up -d --build
   - **`LongRangeChartManager` (장기 다중 해상도 차트 집계기)**: 백그라운드 스레드에서 **`7D`(15분봉, 672포인트)**, **`1M`(1시간봉, 720포인트)**, **`1Y`(1일봉, 365포인트)** 히스토리와 과거 AI 인과적 균형 추세선(`_compute_causal_equilibrium_target`)을 주기적으로 계산하여 각각 `market:premium_chart:{7D|1M|1Y}:...` 키로 Redis에 별도 캐싱합니다.
 - [`ai_service/data/influx_client.py`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/data/influx_client.py):
   - InfluxDB 시계열 쿼리 및 거래소 공개 캔들 API(Upbit 분봉/일봉, Coinbase 캔들, 일별 과거 USD/KRW 환율) 백필 로직(`fetch_long_range_spreads`, `fetch_recent_spreads`)이 구현되어 있습니다. 새로운 거래소나 시간 프레임(예: `3M`, `6M`)을 추가할 때 이 파일을 수정합니다.
+- [`ai_service/data/announcement_classifier.py`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/data/announcement_classifier.py):
+  - 업비트/빗썸 공지 제목을 실시간 분석하여 `NEW_KRW_LISTING`(원화 신규 상장), `INVESTMENT_WARNING`(유의 지정), `WALLET_SUSPENSION`(입출금 중단 예고), `DELISTING`(상장폐지) 및 미래 예정 시각(`scheduled_at`, `scheduled_offset_min`)을 추출하는 하이브리드 LLM 공지 분류기입니다.
 - [`ai_service/model/predictor.py`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/model/predictor.py) & [`ai_service/model/rl_agent.py`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/model/rl_agent.py):
-  - 각각 프리미엄 예측 신경망(`PremiumForecaster`)과 포지션 진입/종료 강화학습 에이전트(PPO `RLAgent`) 모델 아키텍처가 정의되어 있습니다.
+  - 각각 프리미엄 예측 신경망(`PremiumForecaster`)과 5-State(`FLAT`, `OPEN`, `TRANSFERRING`, `AWAITING_REPAY`, `STATE_STAGED`) 포지션 진입/암살 대기/종료 강화학습 에이전트(PPO `RLAgent`) 모델 아키텍처가 정의되어 있습니다.
 - [`ai_service/env/`](file:///home/jh95kr2004/Workspace/magnolia/ai_service/env):
   - 강화학습 학습용 아비트라지 시뮬레이션 환경으로, 백엔드(`backend/internal/strategy`)의 수수료·펀딩비·슬리피지 로직과 동일하게 유지해야 합니다.
 

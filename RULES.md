@@ -74,3 +74,7 @@
 ## 5. 문서 최신화 규칙 (Documentation Rules)
 
 - 시스템 구조, 매매 전략, 빌드/테스트/배포 절차, 또는 운영 스크립트([`magnolia.sh`](file:///home/jh95kr2004/Workspace/magnolia/magnolia.sh))가 변경되면 [`GEMINI.md`](file:///home/jh95kr2004/Workspace/magnolia/GEMINI.md), [`README.md`](file:///home/jh95kr2004/Workspace/magnolia/README.md), [`RULES.md`](file:///home/jh95kr2004/Workspace/magnolia/RULES.md)를 함께 업데이트하여 문서와 실제 코드 간 불일치가 발생하지 않도록 유지합니다.
+- **보따리·암살 전략(`Strategy C`) 및 트래블룰·가스비 안전 원칙**:
+  - 제자리 수렴/확대 전략(`Strategy A, B, D, E`)은 **명목 법정화폐 김프(`PremiumPct`)**를, 코인을 전송해 원화로 매도하는 `Strategy C`는 **거래소별 테더(USDT) 정품 기준 실질 김프(`RealCoinPremiumPct`)**를 기준으로 평가합니다.
+  - `VASPTier3RiskAssessed`(코인베이스 등) 경로로 2-Hop 개인지갑 경유 전송을 수행할 때는 출발 전 개인지갑의 네이티브 가스비(`ETH`, `SOL`, `TRX`) 잔고를 사전 검증(`CheckPreflightWalletGas`)합니다.
+  - 암살 대기(`STAGED_ASSASSINATION` / `PRE_STAGED_LISTING`) 진입 시에는 대시보드에 진입 사유(`AssassinationRationale`)를 표시하고, 차트 위에 공지 발생 시점(실선)과 예정 시각(점선 + 펄스 배지)을 오버레이합니다.
