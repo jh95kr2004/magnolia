@@ -1,111 +1,198 @@
 {
   "forecaster": {
-    "evaluated_at": "2026-11-03T01:34:14.273734+00:00",
+    "evaluated_at": "2026-11-03T19:25:36.334839+00:00",
     "dataset_path": "data/historical_dump.csv",
-    "total_rows": 85610,
-    "validation_rows": 17122,
-    "evaluated_sequences": 15203,
-    "seq_len_minutes": 1440,
+    "input_features_count": 12,
+    "total_raw_rows": 153137,
+    "total_dollar_bar_rows": 134991,
+    "validation_rows": 41128,
+    "evaluated_sequences": 7024,
+    "evaluated_coins": 26,
+    "evaluated_pairs": 82,
+    "seq_len_bars": 120,
     "pred_len_minutes": 480,
     "horizons": {
       "1h": {
         "horizon_minutes": 60,
-        "mae_pct": 0.2314,
-        "rmse_pct": 0.3873,
-        "naive_mae_pct": 0.2217,
-        "naive_rmse_pct": 0.3817,
-        "skill_score_mae_pct": -4.39,
-        "skill_score_rmse_pct": -1.45,
-        "directional_accuracy_all_pct": 52.91,
-        "directional_accuracy_significant_pct": 53.46
+        "mae_pct": 0.787,
+        "rmse_pct": 2.234,
+        "naive_mae_pct": 0.7918,
+        "naive_rmse_pct": 2.2853,
+        "skill_score_mae_pct": 0.62,
+        "skill_score_rmse_pct": 2.25,
+        "directional_accuracy_all_pct": 56.45,
+        "directional_accuracy_significant_pct": 57.18
       },
       "4h": {
         "horizon_minutes": 240,
-        "mae_pct": 0.4342,
-        "rmse_pct": 0.6343,
-        "naive_mae_pct": 0.432,
-        "naive_rmse_pct": 0.6467,
-        "skill_score_mae_pct": -0.5,
-        "skill_score_rmse_pct": 1.93,
-        "directional_accuracy_all_pct": 55.6,
-        "directional_accuracy_significant_pct": 56.23
+        "mae_pct": 1.3686,
+        "rmse_pct": 3.4619,
+        "naive_mae_pct": 1.4242,
+        "naive_rmse_pct": 3.5862,
+        "skill_score_mae_pct": 3.9,
+        "skill_score_rmse_pct": 3.47,
+        "directional_accuracy_all_pct": 65.19,
+        "directional_accuracy_significant_pct": 66.02
       },
       "full_horizon": {
         "horizon_minutes": 480,
-        "mae_pct": 0.6055,
-        "rmse_pct": 0.8205,
-        "naive_mae_pct": 0.6183,
-        "naive_rmse_pct": 0.8532,
-        "skill_score_mae_pct": 2.08,
-        "skill_score_rmse_pct": 3.83,
-        "directional_accuracy_all_pct": 55.69,
-        "directional_accuracy_significant_pct": 56.6
+        "mae_pct": 1.9919,
+        "rmse_pct": 4.579,
+        "naive_mae_pct": 2.0988,
+        "naive_rmse_pct": 4.7299,
+        "skill_score_mae_pct": 5.1,
+        "skill_score_rmse_pct": 3.19,
+        "directional_accuracy_all_pct": 73.86,
+        "directional_accuracy_significant_pct": 75.08
+      }
+    },
+    "tether_real_spread_horizons": {
+      "1h": {
+        "horizon_minutes": 60,
+        "mae_pct": 0.2637,
+        "rmse_pct": 0.4465,
+        "naive_mae_pct": 1.1644,
+        "naive_rmse_pct": 3.4392,
+        "skill_score_mae_pct": 77.36,
+        "skill_score_rmse_pct": 87.02,
+        "directional_accuracy_all_pct": 64.34,
+        "directional_accuracy_significant_pct": 67.92
+      },
+      "4h": {
+        "horizon_minutes": 240,
+        "mae_pct": 0.3054,
+        "rmse_pct": 0.5382,
+        "naive_mae_pct": 1.2294,
+        "naive_rmse_pct": 3.4578,
+        "skill_score_mae_pct": 75.16,
+        "skill_score_rmse_pct": 84.44,
+        "directional_accuracy_all_pct": 81.39,
+        "directional_accuracy_significant_pct": 86.94
+      },
+      "full_horizon": {
+        "horizon_minutes": 480,
+        "mae_pct": 0.3654,
+        "rmse_pct": 0.6381,
+        "naive_mae_pct": 1.2937,
+        "naive_rmse_pct": 3.4778,
+        "skill_score_mae_pct": 71.76,
+        "skill_score_rmse_pct": 81.65,
+        "directional_accuracy_all_pct": 80.44,
+        "directional_accuracy_significant_pct": 84.8
       }
     },
     "summary_features_mae_pct": {
-      "window_mean_spread_mae_pct": 0.5073,
-      "window_max_spread_mae_pct": 0.8845,
-      "window_min_spread_mae_pct": 0.7758
+      "window_mean_spread_mae_pct": 1.7624,
+      "window_max_spread_mae_pct": 2.658,
+      "window_min_spread_mae_pct": 3.7995
+    },
+    "regime_breakdown": {
+      "CONTINUOUS": {
+        "evaluated_sequences": 925,
+        "1h_mae_pct": 0.5317,
+        "4h_mae_pct": 0.5698,
+        "8h_mae_pct": 0.5767,
+        "8h_skill_score_pct": 31.01,
+        "8h_directional_accuracy_pct": 86.16,
+        "8h_significant_dir_acc_pct": 86.91
+      },
+      "NEW_LISTING": {
+        "evaluated_sequences": 1944,
+        "1h_mae_pct": 0.3902,
+        "4h_mae_pct": 0.5659,
+        "8h_mae_pct": 0.5506,
+        "8h_skill_score_pct": 12.43,
+        "8h_directional_accuracy_pct": 69.86,
+        "8h_significant_dir_acc_pct": 71.83
+      },
+      "INVESTMENT_WARNING": {
+        "evaluated_sequences": 1562,
+        "1h_mae_pct": 0.296,
+        "4h_mae_pct": 0.4411,
+        "8h_mae_pct": 0.4799,
+        "8h_skill_score_pct": 12.13,
+        "8h_directional_accuracy_pct": 69.21,
+        "8h_significant_dir_acc_pct": 70.15
+      },
+      "WALLET_SUSPENSION": {
+        "evaluated_sequences": 430,
+        "1h_mae_pct": 0.3278,
+        "4h_mae_pct": 0.548,
+        "8h_mae_pct": 0.5226,
+        "8h_skill_score_pct": 21.61,
+        "8h_directional_accuracy_pct": 77.91,
+        "8h_significant_dir_acc_pct": 80.3
+      },
+      "DELISTED": {
+        "evaluated_sequences": 2163,
+        "1h_mae_pct": 1.6985,
+        "4h_mae_pct": 3.2645,
+        "8h_mae_pct": 5.2764,
+        "8h_skill_score_pct": 1.67,
+        "8h_directional_accuracy_pct": 74.76,
+        "8h_significant_dir_acc_pct": 75.18
+      }
     }
   },
   "rl_agent_benchmark": {
-    "evaluated_at": "2026-11-03T01:35:05.234327+00:00",
-    "test_period_minutes": 17122,
-    "test_period_days": 11.89,
+    "evaluated_at": "2026-11-04T02:21:09.832654+00:00",
+    "test_period_minutes": 11002,
+    "test_period_days": 7.64,
+    "evaluated_coins": 23,
     "friction_assumptions": {
       "base_fee_rate": 0.0005,
       "foreign_fee_rate": 0.002,
-      "slippage": 0.0005,
+      "slippage": "dynamic_l2_calibrated",
       "execution_threshold": 0.1
     },
     "models": {
       "full_magnolia_ai": {
-        "strategy_name": "Full Magnolia AI (8h Forecaster + PPO Agent)",
+        "strategy_name": "Full Magnolia AI (12-Feat 8h Forecaster + PPO Agent)",
         "initial_capital_usd": 10000.0,
-        "final_equity_usd": 12132.6,
-        "net_profit_usd": 2132.6,
-        "net_roi_pct": 21.326,
-        "max_drawdown_pct": 1.803,
-        "sharpe_ratio": 22.467,
-        "sortino_ratio": 36.691,
-        "total_trades": 149,
-        "closed_round_trips": 82,
-        "win_rate_pct": 92.68,
-        "transfer_arbitrage_cycles": 39,
-        "reverse_rebalance_events": 5,
-        "final_foreign_usd_skew_pct": 30.54,
-        "vetoed_entries": 0,
-        "total_fees_paid_usd": 766.94,
-        "total_funding_pnl_usd": 0.43,
+        "final_equity_usd": 12338.39,
+        "net_profit_usd": 2338.39,
+        "net_roi_pct": 23.384,
+        "max_drawdown_pct": 3.993,
+        "sharpe_ratio": 12.423,
+        "sortino_ratio": 15.307,
+        "total_trades": 207,
+        "closed_round_trips": 116,
+        "win_rate_pct": 84.48,
+        "transfer_arbitrage_cycles": 2,
+        "reverse_rebalance_events": 1,
+        "final_foreign_usd_skew_pct": 34.32,
+        "vetoed_entries": 169,
+        "total_fees_paid_usd": 3495.33,
+        "total_funding_pnl_usd": -0.93,
         "state_residence_pct": {
-          "NEUTRAL_HOLD": 3.36,
-          "CONVERGENCE_HEDGE_ABDE": 94.59,
-          "TRANSFERRING_C": 1.82,
-          "REPAYING_C": 0.23,
-          "STAGED_ASSASSINATION": 0.0
+          "NEUTRAL_HOLD": 27.12,
+          "CONVERGENCE_HEDGE_ABDE": 72.71,
+          "TRANSFERRING_C": 0.09,
+          "REPAYING_C": 0.02,
+          "STAGED_ASSASSINATION": 0.06
         }
       },
       "rl_only_ablation": {
         "strategy_name": "RL-Only Ablation (PPO w/o Forecaster)",
         "initial_capital_usd": 10000.0,
-        "final_equity_usd": 10623.03,
-        "net_profit_usd": 623.03,
-        "net_roi_pct": 6.23,
-        "max_drawdown_pct": 1.45,
-        "sharpe_ratio": 8.063,
-        "sortino_ratio": 11.38,
-        "total_trades": 45,
-        "closed_round_trips": 22,
-        "win_rate_pct": 100.0,
+        "final_equity_usd": 10576.97,
+        "net_profit_usd": 576.97,
+        "net_roi_pct": 5.77,
+        "max_drawdown_pct": 3.855,
+        "sharpe_ratio": 4.231,
+        "sortino_ratio": 2.138,
+        "total_trades": 53,
+        "closed_round_trips": 28,
+        "win_rate_pct": 89.29,
         "transfer_arbitrage_cycles": 0,
         "reverse_rebalance_events": 0,
         "final_foreign_usd_skew_pct": 50.0,
-        "vetoed_entries": 0,
-        "total_fees_paid_usd": 222.93,
-        "total_funding_pnl_usd": 0.83,
+        "vetoed_entries": 113,
+        "total_fees_paid_usd": 901.28,
+        "total_funding_pnl_usd": 0.5,
         "state_residence_pct": {
-          "NEUTRAL_HOLD": 32.63,
-          "CONVERGENCE_HEDGE_ABDE": 67.37,
+          "NEUTRAL_HOLD": 87.08,
+          "CONVERGENCE_HEDGE_ABDE": 12.92,
           "TRANSFERRING_C": 0.0,
           "REPAYING_C": 0.0,
           "STAGED_ASSASSINATION": 0.0
@@ -114,27 +201,74 @@
       "rule_based_baseline": {
         "strategy_name": "Rule-Based Static Threshold Bot",
         "initial_capital_usd": 10000.0,
-        "final_equity_usd": 10903.63,
-        "net_profit_usd": 903.63,
-        "net_roi_pct": 9.036,
-        "max_drawdown_pct": 1.529,
-        "sharpe_ratio": 10.733,
-        "sortino_ratio": 15.478,
-        "total_trades": 53,
-        "closed_round_trips": 26,
-        "win_rate_pct": 100.0,
+        "final_equity_usd": 11230.99,
+        "net_profit_usd": 1230.99,
+        "net_roi_pct": 12.31,
+        "max_drawdown_pct": 11.728,
+        "sharpe_ratio": 4.072,
+        "sortino_ratio": 4.107,
+        "total_trades": 235,
+        "closed_round_trips": 121,
+        "win_rate_pct": 67.77,
         "transfer_arbitrage_cycles": 0,
         "reverse_rebalance_events": 0,
         "final_foreign_usd_skew_pct": 50.0,
-        "vetoed_entries": 0,
-        "total_fees_paid_usd": 284.21,
-        "total_funding_pnl_usd": 0.89,
+        "vetoed_entries": 302,
+        "total_fees_paid_usd": 6210.95,
+        "total_funding_pnl_usd": 4.73,
         "state_residence_pct": {
-          "NEUTRAL_HOLD": 30.37,
-          "CONVERGENCE_HEDGE_ABDE": 69.63,
+          "NEUTRAL_HOLD": 35.71,
+          "CONVERGENCE_HEDGE_ABDE": 64.29,
           "TRANSFERRING_C": 0.0,
           "REPAYING_C": 0.0
         }
+      }
+    },
+    "regime_backtests": {
+      "CONTINUOUS": {
+        "steps": 2400,
+        "net_roi_pct": 3.621,
+        "max_drawdown_pct": 1.211,
+        "sharpe_ratio": 13.156,
+        "win_rate_pct": 79.17,
+        "total_trades": 43,
+        "vetoed_entries": 4
+      },
+      "NEW_LISTING": {
+        "steps": 2400,
+        "net_roi_pct": 6.473,
+        "max_drawdown_pct": 1.136,
+        "sharpe_ratio": 27.389,
+        "win_rate_pct": 100.0,
+        "total_trades": 49,
+        "vetoed_entries": 10
+      },
+      "INVESTMENT_WARNING": {
+        "steps": 2400,
+        "net_roi_pct": -0.056,
+        "max_drawdown_pct": 3.04,
+        "sharpe_ratio": 0.117,
+        "win_rate_pct": 50.0,
+        "total_trades": 7,
+        "vetoed_entries": 0
+      },
+      "WALLET_SUSPENSION": {
+        "steps": 1402,
+        "net_roi_pct": 0.487,
+        "max_drawdown_pct": 0.372,
+        "sharpe_ratio": 6.445,
+        "win_rate_pct": 100.0,
+        "total_trades": 6,
+        "vetoed_entries": 29
+      },
+      "DELISTED": {
+        "steps": 2400,
+        "net_roi_pct": 13.248,
+        "max_drawdown_pct": 4.396,
+        "sharpe_ratio": 17.467,
+        "win_rate_pct": 83.93,
+        "total_trades": 102,
+        "vetoed_entries": 126
       }
     },
     "assassination_scenario_suite": {
@@ -162,5 +296,57 @@
         "final_balance_usd": 10102.47
       }
     }
+  },
+  "forecaster_ratio_experiments": {
+    "selected_best_ratio": "70:30",
+    "candidates": [
+      {
+        "normal_event_ratio": "90:10",
+        "event_sample_ratio": 0.1,
+        "best_val_huber_loss": 0.705018,
+        "best_val_4h_mae_pct": 1.3981
+      },
+      {
+        "normal_event_ratio": "70:30",
+        "event_sample_ratio": 0.3,
+        "best_val_huber_loss": 0.701793,
+        "best_val_4h_mae_pct": 1.3686
+      },
+      {
+        "normal_event_ratio": "50:50",
+        "event_sample_ratio": 0.5,
+        "best_val_huber_loss": 0.706031,
+        "best_val_4h_mae_pct": 1.3817
+      }
+    ]
+  },
+  "rl_ratio_experiments": {
+    "selected_best_ratio": "50:50",
+    "candidates": [
+      {
+        "net_roi_pct": 14.151,
+        "max_drawdown_pct": 5.556,
+        "sharpe_ratio": 12.752,
+        "selection_score": 10.28,
+        "normal_event_ratio": "90:10",
+        "event_sample_ratio": 0.1
+      },
+      {
+        "net_roi_pct": 13.976,
+        "max_drawdown_pct": 5.326,
+        "sharpe_ratio": 12.757,
+        "selection_score": 10.451,
+        "normal_event_ratio": "70:30",
+        "event_sample_ratio": 0.3
+      },
+      {
+        "net_roi_pct": 16.046,
+        "max_drawdown_pct": 5.514,
+        "sharpe_ratio": 14.45,
+        "selection_score": 12.832,
+        "normal_event_ratio": "50:50",
+        "event_sample_ratio": 0.5
+      }
+    ]
   }
 }

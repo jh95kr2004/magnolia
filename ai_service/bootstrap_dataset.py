@@ -430,7 +430,7 @@ def fetch_upbit_candles(coin: str, count_total: int = 1200, unit_min: int = 60, 
             oldest_utc = data[-1].get("candle_date_time_utc")
             if not oldest_utc or len(data) < batch:
                 break
-            to_param = oldest_utc + "Z"
+            to_param = oldest_utc
             rem -= len(data)
             time.sleep(0.08)
         except Exception:
@@ -471,7 +471,7 @@ def fetch_bithumb_candles(coin: str, count_total: int = 1200, unit_min: int = 60
             oldest_utc = data[-1].get("candle_date_time_utc")
             if not oldest_utc or len(data) < batch:
                 break
-            to_param = oldest_utc + "Z"
+            to_param = oldest_utc
             rem -= len(data)
             time.sleep(0.06)
         except Exception:

@@ -491,17 +491,10 @@ def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=120, device
     dummy_y = np.zeros((len(df_proc), 3), dtype=np.float32)
     # Use seq_len-only sliding window for inference so every row >= eff_seq_len gets a prediction
     dataset = CryptoArbitrageDataset(scaled_x, dummy_y, eff_seq_len, 1)
-    loader = DataLoader(dataset, batch_size=1024, shuffle=False)
+    loader = DataLoader(dataset, batch_size=2048, shuffle=False)
 
-    all_preds = []
-    print(f"Precomputing {len(dataset):,} predictions using PremiumForecaster on {device}...")
-    with torch.no_grad():
-        for batch_x, _ in loader:
-            batch_x = batch_x.to(device)
-            preds = model(batch_x)
-            all_preds.append(preds.cpu().numpy())
-
-    if len(all_preds) == 0:
+    n_samples = len(dataset)
+    if n_samples == 0:
         df_copy = df_proc.copy()
         df_copy["predicted_spread"] = df_copy["exchange_premium_spread"]
         df_copy["predicted_spread_max"] = df_copy["exchange_premium_spread"] + 0.005
@@ -511,78 +504,85 @@ def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=120, device
         df_copy["first_wave_edge"] = 0.005
         df_copy["first_wave_time"] = 0.5
         df_copy["_row_id"] = np.arange(len(df_copy))
-        df_copy.attrs["full_traj_deltas"] = np.zeros((len(df_copy), pred_len), dtype=np.float32)
         return df_copy
 
-    flat_preds_scaled = np.concatenate(all_preds, axis=0)  # [N_samples, loaded_pred_len, 3]
-    n_samples, p_len, n_targs = flat_preds_scaled.shape
-    unscaled_all = target_scaler.inverse_transform(flat_preds_scaled.reshape(-1, n_targs)).reshape(
-        n_samples, p_len, n_targs
-    )
-
-    unscaled_traj_matrix = unscaled_all[:, :, 0]
-    unscaled_real_traj_matrix = unscaled_all[:, :, 1] if n_targs >= 2 else unscaled_traj_matrix
-
-    if unscaled_traj_matrix.shape[1] >= pred_len:
-        unscaled_traj_matrix = unscaled_traj_matrix[:, :pred_len]
-        unscaled_real_traj_matrix = unscaled_real_traj_matrix[:, :pred_len]
-    else:
-        pad_w = pred_len - unscaled_traj_matrix.shape[1]
-        unscaled_traj_matrix = np.pad(unscaled_traj_matrix, ((0, 0), (0, pad_w)), mode="edge")
-        unscaled_real_traj_matrix = np.pad(unscaled_real_traj_matrix, ((0, 0), (0, pad_w)), mode="edge")
-
-    unscaled_mean = np.mean(unscaled_traj_matrix, axis=1)
-    unscaled_max = np.max(unscaled_traj_matrix, axis=1)
-    unscaled_min = np.min(unscaled_traj_matrix, axis=1)
-    unscaled_real_mean = np.mean(unscaled_real_traj_matrix, axis=1)
-
-    max_idx = np.argmax(unscaled_traj_matrix, axis=1) + 1
-    min_idx = np.argmin(unscaled_traj_matrix, axis=1) + 1
-    unscaled_time_to_max = (max_idx / float(pred_len)).astype(np.float32)
-    unscaled_time_to_min = (min_idx / float(pred_len)).astype(np.float32)
+    unscaled_mean = np.empty(n_samples, dtype=np.float32)
+    unscaled_real_mean = np.empty(n_samples, dtype=np.float32)
+    unscaled_max = np.empty(n_samples, dtype=np.float32)
+    unscaled_min = np.empty(n_samples, dtype=np.float32)
+    unscaled_time_to_max = np.empty(n_samples, dtype=np.float32)
+    unscaled_time_to_min = np.empty(n_samples, dtype=np.float32)
+    first_wave_edge = np.empty(n_samples, dtype=np.float32)
+    first_wave_time = np.empty(n_samples, dtype=np.float32)
 
     start_idx = eff_seq_len - 1
-    end_idx = start_idx + len(unscaled_traj_matrix)
-    sample_cur_spreads = df_proc["exchange_premium_spread"].values[start_idx:end_idx].astype(np.float32)
-    sample_deltas = unscaled_traj_matrix - sample_cur_spreads[:, None]
-
+    all_cur_spreads = df_proc["exchange_premium_spread"].values.astype(np.float32)
     friction_thresh = 0.0025
-    up_edges = unscaled_max - sample_cur_spreads
-    down_edges = sample_cur_spreads - unscaled_min
-
     early_len = min(120, pred_len)
-    early_max_delta = np.max(sample_deltas[:, :early_len], axis=1)
-    early_min_delta = np.min(sample_deltas[:, :early_len], axis=1)
-    early_max_idx = np.argmax(sample_deltas[:, :early_len], axis=1) + 1
-    early_min_idx = np.argmin(sample_deltas[:, :early_len], axis=1) + 1
 
-    e_dn_abs = -early_min_delta
-    cond_early_up = (early_max_delta >= friction_thresh) & (
-        (e_dn_abs < friction_thresh) | (early_max_idx <= early_min_idx)
-    )
-    cond_early_dn = (~cond_early_up) & (e_dn_abs >= friction_thresh)
-    cond_global_both = (up_edges >= friction_thresh) & (down_edges >= friction_thresh)
-    cond_global_up = np.where(cond_global_both, max_idx <= min_idx, up_edges >= down_edges)
+    print(f"Precomputing {n_samples:,} predictions using PremiumForecaster on {device} (streaming batch mode)...")
+    offset = 0
+    with torch.no_grad():
+        for batch_x, _ in loader:
+            bsz = batch_x.size(0)
+            batch_x = batch_x.to(device, non_blocking=True)
+            preds_b = model(batch_x).cpu().numpy()  # [bsz, loaded_pred_len, 3]
+            _, p_len, n_targs = preds_b.shape
 
-    first_wave_edge = np.where(
-        cond_early_up,
-        early_max_delta,
-        np.where(
-            cond_early_dn,
-            early_min_delta,
-            np.where(cond_global_up, up_edges, -down_edges),
-        ),
-    ).astype(np.float32)
+            unscaled_b = target_scaler.inverse_transform(preds_b.reshape(-1, n_targs)).reshape(
+                bsz, p_len, n_targs
+            )
+            traj_b = unscaled_b[:, : min(p_len, pred_len), 0]
+            real_b = unscaled_b[:, : min(p_len, pred_len), 1] if n_targs >= 2 else traj_b
 
-    first_wave_time = np.where(
-        cond_early_up,
-        early_max_idx / float(pred_len),
-        np.where(
-            cond_early_dn,
-            early_min_idx / float(pred_len),
-            np.where(cond_global_up, unscaled_time_to_max, unscaled_time_to_min),
-        ),
-    ).astype(np.float32)
+            b_mean = np.mean(traj_b, axis=1)
+            b_real_mean = np.mean(real_b, axis=1)
+            b_max = np.max(traj_b, axis=1)
+            b_min = np.min(traj_b, axis=1)
+
+            b_max_idx = np.argmax(traj_b, axis=1) + 1
+            b_min_idx = np.argmin(traj_b, axis=1) + 1
+            b_t_max = (b_max_idx / float(pred_len)).astype(np.float32)
+            b_t_min = (b_min_idx / float(pred_len)).astype(np.float32)
+
+            cur_s = all_cur_spreads[start_idx + offset : start_idx + offset + bsz]
+            deltas_b = traj_b - cur_s[:, None]
+
+            up_e = b_max - cur_s
+            dn_e = cur_s - b_min
+
+            e_len = min(early_len, deltas_b.shape[1])
+            e_max_d = np.max(deltas_b[:, :e_len], axis=1)
+            e_min_d = np.min(deltas_b[:, :e_len], axis=1)
+            e_max_i = np.argmax(deltas_b[:, :e_len], axis=1) + 1
+            e_min_i = np.argmin(deltas_b[:, :e_len], axis=1) + 1
+
+            e_dn_abs = -e_min_d
+            c_e_up = (e_max_d >= friction_thresh) & ((e_dn_abs < friction_thresh) | (e_max_i <= e_min_i))
+            c_e_dn = (~c_e_up) & (e_dn_abs >= friction_thresh)
+            c_g_both = (up_e >= friction_thresh) & (dn_e >= friction_thresh)
+            c_g_up = np.where(c_g_both, b_max_idx <= b_min_idx, up_e >= dn_e)
+
+            b_fw_edge = np.where(
+                c_e_up, e_max_d, np.where(c_e_dn, e_min_d, np.where(c_g_up, up_e, -dn_e))
+            ).astype(np.float32)
+            b_fw_time = np.where(
+                c_e_up,
+                e_max_i / float(pred_len),
+                np.where(c_e_dn, e_min_i / float(pred_len), np.where(c_g_up, b_t_max, b_t_min)),
+            ).astype(np.float32)
+
+            unscaled_mean[offset : offset + bsz] = b_mean
+            unscaled_real_mean[offset : offset + bsz] = b_real_mean
+            unscaled_max[offset : offset + bsz] = b_max
+            unscaled_min[offset : offset + bsz] = b_min
+            unscaled_time_to_max[offset : offset + bsz] = b_t_max
+            unscaled_time_to_min[offset : offset + bsz] = b_t_min
+            first_wave_edge[offset : offset + bsz] = b_fw_edge
+            first_wave_time[offset : offset + bsz] = b_fw_time
+            offset += bsz
+
+    end_idx = start_idx + n_samples
 
     def pad_and_fill(unscaled):
         final_preds = np.zeros(len(df_proc), dtype=np.float32)
@@ -591,12 +591,6 @@ def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=120, device
             final_preds[:start_idx] = unscaled[0]
             final_preds[end_idx:] = unscaled[-1]
         return final_preds
-
-    full_traj_deltas = np.zeros((len(df_proc), pred_len), dtype=np.float32)
-    full_traj_deltas[start_idx:end_idx] = sample_deltas
-    if len(sample_deltas) > 0:
-        full_traj_deltas[:start_idx] = sample_deltas[0]
-        full_traj_deltas[end_idx:] = sample_deltas[-1]
 
     df_copy = df_proc.copy()
     df_copy["predicted_spread"] = pad_and_fill(unscaled_mean)
@@ -608,6 +602,5 @@ def append_forecast_features(df: pd.DataFrame, pred_len=480, seq_len=120, device
     df_copy["first_wave_edge"] = pad_and_fill(first_wave_edge)
     df_copy["first_wave_time"] = pad_and_fill(first_wave_time)
     df_copy["_row_id"] = np.arange(len(df_copy))
-    df_copy.attrs["full_traj_deltas"] = full_traj_deltas
-    print("Precomputation successfully integrated 480-step trajectories & inflection features into memory.")
+    print("Precomputation successfully integrated 480-step trajectory features into memory.")
     return df_copy

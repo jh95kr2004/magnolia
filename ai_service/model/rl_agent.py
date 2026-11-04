@@ -244,6 +244,10 @@ class PortfolioRLAgent:
         state_repaying = float(latest_frame[25])
 
         friction_wall = base_fee + foreign_fee + slippage
+        # L2 Liquidity-Aware Position Cap: scale down clip size on thin orderbooks to avoid quadratic L2 impact
+        max_liq_weight = float(np.clip(0.0016 / max(slippage, 0.0004), 0.20, 0.85))
+        eff_slippage = slippage * (1.0 + ((max_liq_weight * 10000.0) / 5000.0) ** 2)
+        eff_friction_wall = base_fee + foreign_fee + eff_slippage
 
         # Bidirectional edges independent of current spread sign
         widen_edge = max(
@@ -339,12 +343,12 @@ class PortfolioRLAgent:
                     is_widening = False
                     active_edge = narrow_edge
 
-                # Digital Twin Veto Manager: enter whenever expected directional move beats round-trip friction
-                if active_edge > friction_wall * 1.25:
+                # Digital Twin Veto Manager: enter whenever expected directional move beats L2-adjusted round-trip friction
+                if active_edge > eff_friction_wall * 1.30:
                     action_type = 0
-                    edge_weight = min(0.85, max(0.25, active_edge / 0.018))
+                    edge_weight = min(max_liq_weight, max(0.20, active_edge / 0.018))
                     target_weight = float(
-                        np.clip(0.5 * target_weight + 0.5 * edge_weight, 0.25, 0.85)
+                        np.clip(0.5 * target_weight + 0.5 * edge_weight, 0.20, max_liq_weight)
                     )
                     action_score = 8.5 if is_widening else 1.5
                 else:
@@ -354,10 +358,10 @@ class PortfolioRLAgent:
             else:
                 # RL-Only Ablation (w/o Forecaster): rely on 24h SMA deviation & PPO output
                 sma_edge = abs(spread - sma_24h)
-                if sma_edge > friction_wall * 1.25 and abs(spread) >= 0.0065:
+                if sma_edge > eff_friction_wall * 1.30 and abs(spread) >= 0.0065:
                     action_type = 0
                     target_weight = float(
-                        np.clip(0.5 * target_weight + 0.45, 0.30, 0.70)
+                        np.clip(0.5 * target_weight + 0.35, 0.20, max_liq_weight)
                     )
                     action_score = 1.5 if spread >= 0 else 8.5
                 else:
@@ -377,27 +381,31 @@ class PortfolioRLAgent:
                 action_score = 8.5
 
         elif state_holding > 0.5:
+            min_tp_usd = max(
+                25.0,
+                abs(cur_exposure) * 10000.0 * (base_fee + foreign_fee + eff_slippage) * 0.75 + 15.0,
+            )
             if cur_exposure < 0:
                 # Holding Short Base / Long Foreign (Narrowing / Transfer position)
-                if use_forecaster and spread >= 0.011 and mean_pred >= 0.005:
+                if use_forecaster and spread >= 0.011 and mean_pred >= 0.005 and slippage <= 0.0025:
                     action_type = 1  # TRANSFER (Strategy C)
                     target_weight = abs(cur_exposure)
                     action_score = 1.5
                 elif (
                     use_forecaster
-                    and first_wave_edge > friction_wall * 1.5
+                    and first_wave_edge > eff_friction_wall * 1.5
                     and (max_pred - spread) > (spread - min_pred) * 1.6
-                    and unrealized_pnl > 20.0
+                    and unrealized_pnl > min_tp_usd
                 ):
                     # Two-Wave Flip: Narrowing wave bottomed out and strong Widening wave starting
                     action_type = 0
-                    edge_weight = min(0.85, max(0.25, first_wave_edge / 0.020))
+                    edge_weight = min(max_liq_weight, max(0.20, first_wave_edge / 0.020))
                     target_weight = float(edge_weight)
                     action_score = 8.5
                 elif (
-                    (spread <= 0.0010 and unrealized_pnl > 15.0)
-                    or (use_forecaster and unrealized_pnl > 30.0 and spread <= mean_pred)
-                ) or (not use_forecaster and spread <= 0.0012):
+                    (spread <= 0.0010 and unrealized_pnl > min_tp_usd)
+                    or (use_forecaster and unrealized_pnl > min_tp_usd and spread <= mean_pred)
+                ) or (not use_forecaster and spread <= 0.0012 and unrealized_pnl > min_tp_usd):
                     action_type = 2  # REPAY / EXIT
                     target_weight = 0.0
                     action_score = 5.0
@@ -409,19 +417,19 @@ class PortfolioRLAgent:
                 # Holding Long Base / Short Foreign (Widening position)
                 if (
                     use_forecaster
-                    and (-first_wave_edge) > friction_wall * 1.5
+                    and (-first_wave_edge) > eff_friction_wall * 1.5
                     and (spread - min_pred) > (max_pred - spread) * 1.6
-                    and unrealized_pnl > 20.0
+                    and unrealized_pnl > min_tp_usd
                 ):
                     # Two-Wave Flip: Widening wave peaked and strong Narrowing reversion wave starting
                     action_type = 0
-                    edge_weight = min(0.85, max(0.25, (-first_wave_edge) / 0.020))
+                    edge_weight = min(max_liq_weight, max(0.20, (-first_wave_edge) / 0.020))
                     target_weight = float(edge_weight)
                     action_score = 1.5
                 elif (
-                    (spread >= -0.0010 and unrealized_pnl > 15.0)
-                    or (use_forecaster and unrealized_pnl > 30.0 and (spread >= mean_pred or (max_pred - spread) <= friction_wall * 0.5))
-                ) or (not use_forecaster and spread >= -0.0012):
+                    (spread >= -0.0010 and unrealized_pnl > min_tp_usd)
+                    or (use_forecaster and unrealized_pnl > min_tp_usd and (spread >= mean_pred or (max_pred - spread) <= eff_friction_wall * 0.5))
+                ) or (not use_forecaster and spread >= -0.0012 and unrealized_pnl > min_tp_usd):
                     action_type = 2  # EXIT
                     target_weight = 0.0
                     action_score = 5.0

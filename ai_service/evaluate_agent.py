@@ -6,8 +6,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import torch
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 from env.arbitrage_env import ArbitrageEnv
 from model.predictor import append_forecast_features
@@ -17,6 +16,66 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("EvaluateRLAgent")
+
+
+def _slice_df_preserving_attrs(df: pd.DataFrame, mask_or_idx) -> pd.DataFrame:
+    saved_traj = df.attrs.get("full_traj_deltas")
+    df.attrs = {}
+    try:
+        if isinstance(mask_or_idx, (pd.Series, np.ndarray)) and mask_or_idx.dtype == bool:
+            sub = df[mask_or_idx].copy().reset_index(drop=True)
+        else:
+            sub = df.iloc[mask_or_idx].copy().reset_index(drop=True)
+    finally:
+        if saved_traj is not None:
+            df.attrs["full_traj_deltas"] = saved_traj
+    if saved_traj is not None and "_row_id" in sub.columns:
+        rids = sub["_row_id"].values.astype(np.int64)
+        sub["_row_id"] = np.arange(len(sub), dtype=np.int64)
+        sub.attrs["full_traj_deltas"] = np.asarray(saved_traj[rids], dtype=np.float32)
+    return sub
+
+
+def _build_stratified_eval_portfolio(
+    val_df: pd.DataFrame, max_rows_per_regime: int = 2400
+) -> pd.DataFrame:
+    """
+    Constructs a stratified out-of-sample evaluation portfolio across all 5 market regimes
+    (`CONTINUOUS`, `NEW_LISTING`, `INVESTMENT_WARNING`, `WALLET_SUSPENSION`, `DELISTED`)
+    while preserving `_row_id` and `full_traj_deltas` alignment.
+    """
+    if "regime" not in val_df.columns:
+        return val_df
+
+    saved_traj = val_df.attrs.get("full_traj_deltas")
+    val_df.attrs = {}
+    parts = []
+    try:
+        for reg in [
+            "CONTINUOUS",
+            "NEW_LISTING",
+            "INVESTMENT_WARNING",
+            "WALLET_SUSPENSION",
+            "DELISTED",
+        ]:
+            sub = val_df[val_df["regime"] == reg]
+            if len(sub) > 0:
+                part = sub.iloc[: min(len(sub), max_rows_per_regime)].copy()
+                part.attrs = {}
+                parts.append(part)
+    finally:
+        if saved_traj is not None:
+            val_df.attrs["full_traj_deltas"] = saved_traj
+
+    if not parts:
+        return val_df
+
+    combined = pd.concat(parts, ignore_index=True)
+    if saved_traj is not None and "_row_id" in combined.columns:
+        rids = combined["_row_id"].values.astype(np.int64)
+        combined["_row_id"] = np.arange(len(combined), dtype=np.int64)
+        combined.attrs["full_traj_deltas"] = np.asarray(saved_traj[rids], dtype=np.float32)
+    return combined
 
 
 def compute_backtest_metrics(
@@ -37,13 +96,11 @@ def compute_backtest_metrics(
     net_profit = final_equity - initial_balance
     roi_pct = (net_profit / initial_balance) * 100.0
 
-    # Max Drawdown
     eq_arr = np.array(capital_history, dtype=np.float64)
     peaks = np.maximum.accumulate(eq_arr)
     drawdowns = (peaks - eq_arr) / np.maximum(peaks, 1e-8)
     max_dd_pct = float(np.max(drawdowns) * 100.0)
 
-    # Sharpe & Sortino (1-minute returns annualized)
     returns = pd.Series(eq_arr).pct_change().dropna()
     ann_factor = 365.0 * 24.0 * 60.0
     mean_ret = float(returns.mean()) if len(returns) > 0 else 0.0
@@ -160,7 +217,7 @@ def run_ppo_simulation(
         elif action_type == 2:
             act_dec = -0.8  # REPAY / EXIT
         else:
-            act_dec = 0.0   # TRADE / HOLD
+            act_dec = 0.0  # TRADE / HOLD
         action = np.array([[signed_exp, act_dec]], dtype=np.float32)
 
         obs, reward, done_arr, info_arr = vec_env.step(action)
@@ -195,7 +252,6 @@ def run_ppo_simulation(
         total_fees += float(cur_info.get("step_fees_paid", 0.0))
         total_funding += float(cur_info.get("step_funding_pnl", 0.0))
 
-        # Track round-trip trade PnL when transitioning from 0 -> non-zero -> 0 or flipping sign
         if prev_exposure == 0.0 and cur_exposure != 0.0:
             entry_equity = capital_history[-1]
         elif prev_exposure != 0.0 and (
@@ -230,14 +286,7 @@ def run_rule_based_baseline(
     slippage: float = 0.0005,
     execution_threshold: float = 0.10,
 ) -> dict:
-    """
-    Classic Static-Threshold Arbitrage Bot Baseline:
-      - Short Base / Long Foreign (-0.50 weight) when spread >= +0.8% (0.008)
-      - Long Base / Short Foreign (+0.50 weight) when spread <= -0.8% (-0.008)
-      - Exit to Neutral (0.0 weight) when spread converges within [-0.15%, +0.15%]
-    """
     df_rule = eval_df.copy()
-    # Provide generous max/min bands so static rules are not blocked by Forecaster Veto
     df_rule["predicted_spread"] = df_rule["exchange_premium_spread"] * 0.5
     df_rule["predicted_spread_max"] = df_rule["exchange_premium_spread"] + 0.015
     df_rule["predicted_spread_min"] = df_rule["exchange_premium_spread"] - 0.015
@@ -277,19 +326,19 @@ def run_rule_based_baseline(
         spread = float(obs[0])
         if env.exposure == 0.0:
             if spread >= 0.008:
-                action = np.array([-0.50, 0.0], dtype=np.float32)  # Short Base / Long Foreign
+                action = np.array([-0.50, 0.0], dtype=np.float32)
             elif spread <= -0.008:
-                action = np.array([0.50, 0.0], dtype=np.float32)   # Long Base / Short Foreign
+                action = np.array([0.50, 0.0], dtype=np.float32)
             else:
                 action = np.array([0.0, 0.0], dtype=np.float32)
         elif env.exposure < 0.0:
             if spread <= 0.0015:
-                action = np.array([0.0, -0.8], dtype=np.float32)    # Exit on convergence
+                action = np.array([0.0, -0.8], dtype=np.float32)
             else:
                 action = np.array([env.exposure, 0.0], dtype=np.float32)
         else:
             if spread >= -0.0015:
-                action = np.array([0.0, -0.8], dtype=np.float32)    # Exit on convergence
+                action = np.array([0.0, -0.8], dtype=np.float32)
             else:
                 action = np.array([env.exposure, 0.0], dtype=np.float32)
 
@@ -348,37 +397,39 @@ def run_rule_based_baseline(
 def evaluate_assassination_scenarios() -> dict:
     """
     Runs the 4-Scenario Assassination & Event Stress Suite:
-      - Scenario A (Successful New Listing / Gaduri Warning Assassination):
-          Notice at t=0 (0.2% Kimp) -> pre-staged via STAGE_ASSASSINATION -> Kimp surges to +4.5% -> 0-latency exit on Base.
-      - Scenario B (False Signal / Fizzle Timeout Unwind):
-          Notice at t=0 (0.2% Kimp) -> pre-staged -> Kimp stays flat at +0.3% for 720 steps -> simultaneous in-place unwind with zero reverse gas fee.
-      - Scenario C (Delisting Trap Defense):
-          DELISTING notice active -> 100% of entry attempts are vetoed and open positions are unwound immediately.
-      - Scenario D (In-Transit Kimp Drop Defense):
-          Transfer started at +3.5% Kimp with FOREIGN_HEDGE -> Kimp drops to -0.3% during transit -> auto-switches to STATE_STAGED instead of panic-selling -> exits profitably on +2.4% rebound.
+      - Scenario A (Successful New Listing / Gaduri Warning Assassination)
+      - Scenario B (False Signal / Fizzle Timeout Unwind with Zero Reverse Gas Fee)
+      - Scenario C (Delisting Trap Defense: 100% Entry Veto + Immediate Emergency Exit)
+      - Scenario D (In-Transit Kimp Drop Defense: Auto-Stage + Rebound Snipe)
     """
     # Scenario A: Successful Listing / Gaduri Surge
     n_a = 120
     spread_a = np.full(n_a, 0.002, dtype=np.float32)
     spread_a[40:70] = np.linspace(0.002, 0.045, 30, dtype=np.float32)
     spread_a[70:] = 0.045
-    df_a = pd.DataFrame({
-        "exchange_premium_spread": spread_a,
-        "tether_real_premium_spread": spread_a,
-        "predicted_spread": spread_a + 0.025,
-        "predicted_spread_max": np.maximum(spread_a + 0.040, 0.045),
-        "predicted_spread_min": spread_a - 0.002,
-        "first_wave_edge": np.full(n_a, 0.038, dtype=np.float32),
-        "base_funding_rate": np.zeros(n_a, dtype=np.float32),
-        "foreign_funding_rate": np.full(n_a, 0.0001, dtype=np.float32),
-        "event_new_listing": np.ones(n_a, dtype=np.float32),
-        "vasp_tier": np.ones(n_a, dtype=np.int32),
-    })
+    df_a = pd.DataFrame(
+        {
+            "exchange_premium_spread": spread_a,
+            "tether_real_premium_spread": spread_a,
+            "predicted_spread": spread_a + 0.025,
+            "predicted_spread_max": np.maximum(spread_a + 0.040, 0.045),
+            "predicted_spread_min": spread_a - 0.002,
+            "first_wave_edge": np.full(n_a, 0.038, dtype=np.float32),
+            "base_funding_rate": np.zeros(n_a, dtype=np.float32),
+            "foreign_funding_rate": np.full(n_a, 0.0001, dtype=np.float32),
+            "event_new_listing": np.ones(n_a, dtype=np.float32),
+            "vasp_tier": np.ones(n_a, dtype=np.int32),
+        }
+    )
     env_a = ArbitrageEnv(df=df_a, initial_balance=10000.0, is_eval=True)
     env_a.reset()
     sniped_a = False
     for _ in range(n_a - 1):
-        action = np.array([0.50, 0.90], dtype=np.float32) if env_a.state == env_a.STATE_NEUTRAL and not sniped_a else np.array([0.50, 0.0], dtype=np.float32)
+        action = (
+            np.array([0.50, 0.90], dtype=np.float32)
+            if env_a.state == env_a.STATE_NEUTRAL and not sniped_a
+            else np.array([0.50, 0.0], dtype=np.float32)
+        )
         _, _, done, _, info_a = env_a.step(action)
         if info_a.get("assassination_sniped"):
             sniped_a = True
@@ -389,24 +440,30 @@ def evaluate_assassination_scenarios() -> dict:
     # Scenario B: False Signal / Fizzle Timeout Unwind (Zero Reverse Gas Fee)
     n_b = 750
     spread_b = np.full(n_b, 0.0025, dtype=np.float32)
-    df_b = pd.DataFrame({
-        "exchange_premium_spread": spread_b,
-        "tether_real_premium_spread": spread_b,
-        "predicted_spread": spread_b + 0.022,
-        "predicted_spread_max": spread_b + 0.030,
-        "predicted_spread_min": spread_b - 0.002,
-        "first_wave_edge": np.full(n_b, 0.025, dtype=np.float32),
-        "base_funding_rate": np.zeros(n_b, dtype=np.float32),
-        "foreign_funding_rate": np.zeros(n_b, dtype=np.float32),
-        "event_warning": np.ones(n_b, dtype=np.float32),
-        "vasp_tier": np.ones(n_b, dtype=np.int32),
-    })
+    df_b = pd.DataFrame(
+        {
+            "exchange_premium_spread": spread_b,
+            "tether_real_premium_spread": spread_b,
+            "predicted_spread": spread_b + 0.022,
+            "predicted_spread_max": spread_b + 0.030,
+            "predicted_spread_min": spread_b - 0.002,
+            "first_wave_edge": np.full(n_b, 0.025, dtype=np.float32),
+            "base_funding_rate": np.zeros(n_b, dtype=np.float32),
+            "foreign_funding_rate": np.zeros(n_b, dtype=np.float32),
+            "event_warning": np.ones(n_b, dtype=np.float32),
+            "vasp_tier": np.ones(n_b, dtype=np.int32),
+        }
+    )
     env_b = ArbitrageEnv(df=df_b, initial_balance=10000.0, is_eval=True)
     env_b.reset()
     timeout_unwound_b = False
     unwind_step_fee_b = 0.0
     for step_i in range(n_b - 1):
-        act = np.array([0.50, 0.90], dtype=np.float32) if step_i == 0 else np.array([0.50, 0.0], dtype=np.float32)
+        act = (
+            np.array([0.50, 0.90], dtype=np.float32)
+            if step_i == 0
+            else np.array([0.50, 0.0], dtype=np.float32)
+        )
         _, _, done, _, info_b = env_b.step(act)
         if info_b.get("staged_timeout_unwind"):
             timeout_unwound_b = True
@@ -418,17 +475,19 @@ def evaluate_assassination_scenarios() -> dict:
     # Scenario C: Delisting Trap Defense (100% Entry Veto + Immediate Emergency Exit)
     n_c = 40
     spread_c = np.linspace(0.050, -0.150, n_c, dtype=np.float32)
-    df_c = pd.DataFrame({
-        "exchange_premium_spread": spread_c,
-        "tether_real_premium_spread": spread_c,
-        "predicted_spread": spread_c,
-        "predicted_spread_max": spread_c + 0.030,
-        "predicted_spread_min": spread_c - 0.030,
-        "first_wave_edge": np.full(n_c, 0.025, dtype=np.float32),
-        "base_funding_rate": np.zeros(n_c, dtype=np.float32),
-        "foreign_funding_rate": np.zeros(n_c, dtype=np.float32),
-        "event_delisting": np.ones(n_c, dtype=np.float32),
-    })
+    df_c = pd.DataFrame(
+        {
+            "exchange_premium_spread": spread_c,
+            "tether_real_premium_spread": spread_c,
+            "predicted_spread": spread_c,
+            "predicted_spread_max": spread_c + 0.030,
+            "predicted_spread_min": spread_c - 0.030,
+            "first_wave_edge": np.full(n_c, 0.025, dtype=np.float32),
+            "base_funding_rate": np.zeros(n_c, dtype=np.float32),
+            "foreign_funding_rate": np.zeros(n_c, dtype=np.float32),
+            "event_delisting": np.ones(n_c, dtype=np.float32),
+        }
+    )
     env_c = ArbitrageEnv(df=df_c, initial_balance=10000.0, is_eval=True)
     env_c.reset()
     blocked_attempts = 0
@@ -439,27 +498,27 @@ def evaluate_assassination_scenarios() -> dict:
             blocked_attempts += 1
     delisting_block_rate = (blocked_attempts / float(total_attempts)) * 100.0
 
-    # Scenario D: In-Transit Kimp Drop Defense (+3.5% -> -0.3% during transfer -> auto-stage -> +2.4% rebound exit)
+    # Scenario D: In-Transit Kimp Drop Defense
     n_d = 60
     spread_d = np.full(n_d, 0.035, dtype=np.float32)
-    spread_d[3:25] = -0.003  # Kimp collapses while coin is in transit!
-    spread_d[25:] = 0.024    # Kimp rebounds to +2.4%
-    df_d = pd.DataFrame({
-        "exchange_premium_spread": spread_d,
-        "tether_real_premium_spread": spread_d,
-        "predicted_spread": spread_d,
-        "predicted_spread_max": spread_d + 0.020,
-        "predicted_spread_min": spread_d - 0.020,
-        "first_wave_edge": np.full(n_d, -0.020, dtype=np.float32),
-        "base_funding_rate": np.zeros(n_d, dtype=np.float32),
-        "foreign_funding_rate": np.zeros(n_d, dtype=np.float32),
-    })
+    spread_d[3:25] = -0.003
+    spread_d[25:] = 0.024
+    df_d = pd.DataFrame(
+        {
+            "exchange_premium_spread": spread_d,
+            "tether_real_premium_spread": spread_d,
+            "predicted_spread": spread_d,
+            "predicted_spread_max": spread_d + 0.020,
+            "predicted_spread_min": spread_d - 0.020,
+            "first_wave_edge": np.full(n_d, -0.020, dtype=np.float32),
+            "base_funding_rate": np.zeros(n_d, dtype=np.float32),
+            "foreign_funding_rate": np.zeros(n_d, dtype=np.float32),
+        }
+    )
     env_d = ArbitrageEnv(df=df_d, initial_balance=10000.0, is_eval=True)
     env_d.reset()
     env_d.in_transit_hedge_mode = "FOREIGN_HEDGE"
-    # Step 0: Enter Short Base / Long Foreign leg at +3.5%
     env_d.step(np.array([-0.50, 0.0], dtype=np.float32))
-    # Step 1: Initiate Transfer (Strategy C)
     env_d.step(np.array([-0.50, 0.50], dtype=np.float32))
     defense_triggered_d = False
     sniped_rebound_d = False
@@ -514,16 +573,30 @@ def evaluate_rl_agent(
     logger.info(f"Loading historical data from {csv_path}...")
     df = pd.read_csv(csv_path)
 
-    if "time" in df.columns:
+    if "pair_id" in df.columns and "ts_utc" in df.columns:
+        df = df.sort_values(["pair_id", "ts_utc"]).reset_index(drop=True)
+    elif "pair_id" in df.columns and "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.sort_values(["pair_id", "time"]).reset_index(drop=True)
+    elif "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"])
         df = df.sort_values("time").reset_index(drop=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Injecting 8-hour PremiumForecaster predictions on {device}...")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Injecting 12-Feature 8-hour PremiumForecaster predictions on {device}...")
     df_with_forecast = append_forecast_features(df, device=device)
 
-    split_idx = int(len(df_with_forecast) * 0.8)
-    eval_df_full = df_with_forecast.iloc[split_idx:].reset_index(drop=True)
+    if "split_group" in df_with_forecast.columns and (df_with_forecast["split_group"] == "val").any():
+        val_raw_df = _slice_df_preserving_attrs(
+            df_with_forecast, df_with_forecast["split_group"] == "val"
+        )
+    else:
+        split_idx = int(len(df_with_forecast) * 0.8)
+        val_raw_df = _slice_df_preserving_attrs(
+            df_with_forecast, slice(split_idx, len(df_with_forecast))
+        )
+
+    eval_df_full = _build_stratified_eval_portfolio(val_raw_df, max_rows_per_regime=2400)
 
     if not os.path.exists(model_path):
         alt_path = "model/weights/best_model.zip"
@@ -534,14 +607,15 @@ def evaluate_rl_agent(
             return {}
 
     logger.info(
-        f"Running 3-Way Out-of-Sample Backtest over {len(eval_df_full):,} minutes (~{len(eval_df_full)/1440:.1f} days)..."
+        f"Running 3-Way Out-of-Sample Multi-Coin Backtest over {len(eval_df_full):,} steps "
+        f"(coins={eval_df_full['coin'].nunique() if 'coin' in eval_df_full.columns else 1})..."
     )
 
-    # 1. Full Magnolia AI (Forecaster + PPO Agent)
+    # 1. Full Magnolia AI (12-Feature Forecaster + PPO Agent)
     full_ai_res = run_ppo_simulation(
         eval_df=eval_df_full,
         model_path=model_path,
-        label="Full Magnolia AI (8h Forecaster + PPO Agent)",
+        label="Full Magnolia AI (12-Feat 8h Forecaster + PPO Agent)",
         use_forecaster_fusion=True,
         n_stack=n_stack,
         base_fee=base_fee,
@@ -552,6 +626,10 @@ def evaluate_rl_agent(
 
     # 2. RL-Only Ablation (PPO Agent without Forecaster — naive flat forecast)
     eval_df_no_forecast = eval_df_full.copy()
+    if "full_traj_deltas" in eval_df_full.attrs:
+        eval_df_no_forecast.attrs["full_traj_deltas"] = np.zeros_like(
+            eval_df_full.attrs["full_traj_deltas"]
+        )
     eval_df_no_forecast["predicted_spread"] = eval_df_no_forecast["exchange_premium_spread"]
     eval_df_no_forecast["predicted_spread_max"] = (
         eval_df_no_forecast["exchange_premium_spread"] + 0.0035
@@ -580,8 +658,45 @@ def evaluate_rl_agent(
         execution_threshold=execution_threshold,
     )
 
+    # 4. Per-Regime Breakdown for Full Magnolia AI
+    regime_backtests = {}
+    if "regime" in eval_df_full.columns:
+        for reg_name in [
+            "CONTINUOUS",
+            "NEW_LISTING",
+            "INVESTMENT_WARNING",
+            "WALLET_SUSPENSION",
+            "DELISTED",
+        ]:
+            sub_r = _slice_df_preserving_attrs(
+                eval_df_full, eval_df_full["regime"] == reg_name
+            )
+            if len(sub_r) >= 50:
+                r_res = run_ppo_simulation(
+                    eval_df=sub_r,
+                    model_path=model_path,
+                    label=f"Full Magnolia AI [{reg_name}]",
+                    use_forecaster_fusion=True,
+                    n_stack=n_stack,
+                    base_fee=base_fee,
+                    foreign_fee=foreign_fee,
+                    slippage=slippage,
+                    execution_threshold=execution_threshold,
+                )
+                regime_backtests[reg_name] = {
+                    "steps": int(len(sub_r)),
+                    "net_roi_pct": r_res["net_roi_pct"],
+                    "max_drawdown_pct": r_res["max_drawdown_pct"],
+                    "sharpe_ratio": r_res["sharpe_ratio"],
+                    "win_rate_pct": r_res["win_rate_pct"],
+                    "total_trades": r_res["total_trades"],
+                    "vetoed_entries": r_res["vetoed_entries"],
+                }
+
     logger.info("\n" + "=" * 86)
-    logger.info("3-WAY OUT-OF-SAMPLE ARBITRAGE BACKTEST COMPARISON (INITIAL CAPITAL: $10,000)")
+    logger.info(
+        "3-WAY OUT-OF-SAMPLE MULTI-COIN ARBITRAGE BACKTEST (INITIAL CAPITAL: $10,000)"
+    )
     logger.info("=" * 86)
     for res in [full_ai_res, rl_only_res, rule_res]:
         logger.info(
@@ -592,6 +707,16 @@ def evaluate_rl_agent(
             f"  • Friction/Yld : Fees Paid ${res['total_fees_paid_usd']:,.2f} | Funding Yield ${res['total_funding_pnl_usd']:+,.2f} | Vetoed: {res['vetoed_entries']}\n"
             f"  • State Share  : {res['state_residence_pct']}"
         )
+        logger.info("-" * 86)
+
+    if regime_backtests:
+        logger.info("PER-REGIME BACKTEST BREAKDOWN (Full Magnolia AI):")
+        for r_name, r_stat in regime_backtests.items():
+            logger.info(
+                f"  • {r_name:<20} (steps={r_stat['steps']:>4}) | "
+                f"Net ROI: {r_stat['net_roi_pct']:+.2f}% | Max DD: {r_stat['max_drawdown_pct']:.2f}% | "
+                f"Sharpe: {r_stat['sharpe_ratio']:.2f} | Win Rate: {r_stat['win_rate_pct']:.1f}% | Vetoed: {r_stat['vetoed_entries']}"
+            )
         logger.info("-" * 86)
 
     assassination_suite = evaluate_assassination_scenarios()
@@ -608,10 +733,13 @@ def evaluate_rl_agent(
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "test_period_minutes": int(len(eval_df_full)),
         "test_period_days": round(len(eval_df_full) / 1440.0, 2),
+        "evaluated_coins": int(eval_df_full["coin"].nunique())
+        if "coin" in eval_df_full.columns
+        else 1,
         "friction_assumptions": {
             "base_fee_rate": base_fee,
             "foreign_fee_rate": foreign_fee,
-            "slippage": slippage,
+            "slippage": "dynamic_l2_calibrated",
             "execution_threshold": execution_threshold,
         },
         "models": {
@@ -619,6 +747,7 @@ def evaluate_rl_agent(
             "rl_only_ablation": rl_only_res,
             "rule_based_baseline": rule_res,
         },
+        "regime_backtests": regime_backtests,
         "assassination_scenario_suite": assassination_suite,
     }
 
@@ -639,9 +768,13 @@ def evaluate_rl_agent(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Trained Arbitrage Agent")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Trained Multi-Coin Arbitrage Agent"
+    )
     parser.add_argument("--data", type=str, default="data/historical_dump.csv")
-    parser.add_argument("--model", type=str, default="model/weights/ppo_arbitrage_final.zip")
+    parser.add_argument(
+        "--model", type=str, default="model/weights/ppo_arbitrage_final.zip"
+    )
     parser.add_argument("--base_fee", type=float, default=0.0005)
     parser.add_argument("--foreign_fee", type=float, default=0.002)
     parser.add_argument("--slippage", type=float, default=0.0005)

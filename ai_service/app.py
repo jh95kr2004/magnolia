@@ -805,16 +805,28 @@ def run_daemon():
                                     else:
                                         minute_bucket = int(time.time() // 60) - len(df) + idx
                                         ts_iso = datetime.fromtimestamp(minute_bucket * 60, tz=timezone.utc).isoformat()
+                                    loc_px = float(row["local_price"])
+                                    for_px = max(float(row["foreign_price"]), 1e-9)
+                                    fx_v = float(row["fx_rate"])
+                                    tether_v = fx_cache.get_tether_rate(opp["base_exchange"], quote)
+                                    real_spr = (loc_px / (for_px * max(tether_v, 500.0))) - 1.0 if quote.upper() == "KRW" else float(row["exchange_premium_spread"])
                                     tick_data = {
                                         "minute_bucket": minute_bucket,
                                         "timestamp_iso": ts_iso,
                                         "exchange_premium_spread": float(row["exchange_premium_spread"]),
+                                        "tether_real_premium_spread": float(real_spr),
+                                        "usdt_krw_rate": float(tether_v),
                                         "ai_past_pred_spread": float(past_ai_preds.loc[idx]),
-                                        "local_price": float(row["local_price"]),
-                                        "foreign_price": float(row["foreign_price"]),
-                                        "fx_rate": float(row["fx_rate"]),
+                                        "local_price": loc_px,
+                                        "foreign_price": for_px,
+                                        "fx_rate": fx_v,
                                         "base_funding_rate": float(row["base_funding_rate"]),
                                         "foreign_funding_rate": float(row["foreign_funding_rate"]),
+                                        "quote_volume_usd": float(row.get("quote_volume_usd", 50000.0)),
+                                        "base_event_listing": 0.0,
+                                        "base_event_warning_or_susp": 0.0,
+                                        "base_event_delisting": 0.0,
+                                        "peer_or_foreign_event": 0.0,
                                         "base_fee": 0.0005,
                                         "foreign_fee": 0.002,
                                         "slippage": 0.0005,
@@ -831,6 +843,37 @@ def run_daemon():
                 now_ts = time.time()
                 current_minute_bucket = int(now_ts // 60)
                 current_spread = opp.get("premium_pct", 0.0) / 100.0
+                tether_rate = fx_cache.get_tether_rate(opp["base_exchange"], quote)
+                local_px_krw = opp.get("base_price_usd", 0.0) * fx_rate
+                foreign_px_usd = max(opp.get("foreign_price_usd", 0.0), 1e-9)
+                if "real_coin_premium_pct" in opp:
+                    current_real_spread = float(opp["real_coin_premium_pct"]) / 100.0
+                elif quote.upper() == "KRW" and local_px_krw > 0:
+                    current_real_spread = (local_px_krw / (foreign_px_usd * max(tether_rate, 500.0))) - 1.0
+                else:
+                    current_real_spread = current_spread
+
+                coin_events = ann_cache.get_events_for_symbol(opp["base_symbol"], now_ts=now_ts)
+                ev_list_sig, ev_warn_sig, ev_delist_sig, ev_peer_sig = 0.0, 0.0, 0.0, 0.0
+                base_ex_u = str(opp["base_exchange"]).upper()
+                for ev in coin_events:
+                    # Strictly causal: offset_min <= 0 means announced_at <= now_ts
+                    off_m = int(ev.get("offset_min", 0))
+                    if off_m > 0:
+                        continue
+                    age_m = float(abs(off_m))
+                    etype = str(ev.get("event_type", "NONE")).upper()
+                    ev_ex = str(ev.get("exchange", "UPBIT")).upper()
+                    if ev_ex == base_ex_u:
+                        if etype == "NEW_KRW_LISTING":
+                            ev_list_sig = max(ev_list_sig, float(np.exp(-age_m / 360.0)))
+                        elif etype in ("INVESTMENT_WARNING", "WALLET_SUSPENSION"):
+                            ev_warn_sig = max(ev_warn_sig, float(np.exp(-age_m / 1440.0)))
+                        elif etype == "DELISTING":
+                            ev_delist_sig = max(ev_delist_sig, float(np.exp(-age_m / 2880.0)))
+                    else:
+                        decay_p = float(np.exp(-age_m / 1440.0))
+                        ev_peer_sig = -max(abs(ev_peer_sig), decay_p) if etype == "DELISTING" else max(ev_peer_sig, decay_p)
 
                 # Retrieve what the AI previously forecasted for this minute bucket (if available)
                 past_pred_for_now = future_pred_lookup[pair_key].get(current_minute_bucket)
@@ -844,12 +887,19 @@ def run_daemon():
                     "minute_bucket": current_minute_bucket,
                     "timestamp_iso": datetime.fromtimestamp(current_minute_bucket * 60, tz=timezone.utc).isoformat(),
                     "exchange_premium_spread": current_spread,
+                    "tether_real_premium_spread": current_real_spread,
+                    "usdt_krw_rate": float(tether_rate),
                     "ai_past_pred_spread": float(past_pred_for_now),
-                    "local_price": opp.get("base_price_usd", 0.0) * fx_rate, 
-                    "foreign_price": opp.get("foreign_price_usd", 0.0),
+                    "local_price": local_px_krw, 
+                    "foreign_price": foreign_px_usd,
                     "fx_rate": fx_rate,
                     "base_funding_rate": opp.get("base_funding_rate_pct", 0.0) / 100.0, 
                     "foreign_funding_rate": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
+                    "quote_volume_usd": float(opp.get("quote_volume_usd", 50000.0)),
+                    "base_event_listing": ev_list_sig,
+                    "base_event_warning_or_susp": ev_warn_sig,
+                    "base_event_delisting": ev_delist_sig,
+                    "peer_or_foreign_event": ev_peer_sig,
                     "base_fee": 0.0005,
                     "foreign_fee": 0.002,
                     "slippage": 0.0005,

@@ -190,7 +190,7 @@ def resample_to_dynamic_dollar_bars(
         )
         base_dur = ep["bar_duration_min"].values.astype(np.float64)
 
-        # Fast volume-clock emission indices
+        # Fast volume-clock emission indices (compresses quiet bars < Theta, expands burst bars >= 1.45 * Theta)
         emit_indices = []
         emit_durations = []
         emit_vol_ratios = []
@@ -204,12 +204,31 @@ def resample_to_dynamic_dollar_bars(
             th = thresh_arr[i]
             d = base_dur[i]
 
-            # If a single bar has a massive volume burst (>= 2.0x threshold), emit immediately
+            if v >= 1.45 * th:
+                # Flush any pending quiet accumulation first
+                if steps_merged > 0:
+                    emit_indices.append(max(0, i - 1))
+                    emit_durations.append(float(np.clip(acc_dur, 0.25, 360.0)))
+                    emit_vol_ratios.append(float(np.clip((acc_vol / steps_merged) / max(th, 100.0), 0.05, 20.0)))
+                    acc_vol = 0.0
+                    acc_dur = 0.0
+                    steps_merged = 0
+
+                # Subdivide high-volume burst candle into k Dollar Bars
+                k_sub = min(int(round(v / max(th, 100.0))), 3)
+                sub_dur = float(np.clip(d / float(k_sub), 0.20, 360.0))
+                vol_r = float(np.clip(v / max(th, 100.0), 0.05, 20.0))
+                for _ in range(k_sub):
+                    emit_indices.append(i)
+                    emit_durations.append(sub_dur)
+                    emit_vol_ratios.append(vol_r)
+                continue
+
             acc_vol += v
             acc_dur += d
             steps_merged += 1
 
-            if acc_vol >= th or steps_merged >= 3 or i == n - 1:
+            if acc_vol >= th or steps_merged >= 2 or i == n - 1:
                 emit_indices.append(i)
                 emit_durations.append(float(np.clip(acc_dur, 0.25, 360.0)))
                 vol_rate_ratio = (acc_vol / max(steps_merged, 1)) / max(th, 100.0)
@@ -315,6 +334,52 @@ class CryptoArbitrageDataset(Dataset):
         return torch.tensor(seq_x), torch.tensor(seq_y)
 
 
+def split_train_val_episodes(
+    df_proc: pd.DataFrame,
+    seq_len: int,
+    pred_len: int,
+    split_ratio: float = 0.8,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Splits `df_proc` into `(train_df, val_df)` following Decision #1 from `/grill-me`:
+      - `train_df` strictly contains `split_group == 'train'` (zero future leakage).
+      - For held-out event/delisted pairs (where the entire `pair_id` is in `val`), the full episode is in `val_df`.
+      - For `CONTINUOUS` pairs (split chronologically at 80% time cutoff), `val_df` includes the causal
+        lookback warmup rows right before the validation tail so out-of-sample windows of length
+        `seq_len + pred_len` can be evaluated on every continuous coin pair as well.
+    """
+    min_win = seq_len + pred_len
+    if "split_group" in df_proc.columns and (df_proc["split_group"] == "val").any():
+        train_df = df_proc[df_proc["split_group"] == "train"].reset_index(drop=True)
+        if "pair_id" in df_proc.columns:
+            val_parts = []
+            for _, g in df_proc.groupby("pair_id", sort=False):
+                val_mask = g["split_group"] == "val"
+                if not val_mask.any():
+                    continue
+                if val_mask.all():
+                    val_parts.append(g)
+                else:
+                    # Continuous pair split in time: include causal warmup lookback from the end of g
+                    need_len = max(int(val_mask.sum()) + seq_len, min_win + 24)
+                    if len(g) >= min_win:
+                        val_parts.append(g.iloc[-min(len(g), need_len) :])
+            val_df = pd.concat(val_parts, ignore_index=True) if val_parts else df_proc[df_proc["split_group"] == "val"].reset_index(drop=True)
+        else:
+            val_df = df_proc[df_proc["split_group"] == "val"].reset_index(drop=True)
+
+        if len(train_df) < min_win or len(val_df) < min_win:
+            train_size = int(len(df_proc) * split_ratio)
+            train_df = df_proc.iloc[:train_size].reset_index(drop=True)
+            val_df = df_proc.iloc[max(0, train_size - seq_len) :].reset_index(drop=True)
+    else:
+        train_size = int(len(df_proc) * split_ratio)
+        train_df = df_proc.iloc[:train_size].reset_index(drop=True)
+        val_df = df_proc.iloc[max(0, train_size - seq_len) :].reset_index(drop=True)
+
+    return train_df, val_df
+
+
 def create_dataloaders(
     df: pd.DataFrame,
     seq_len: int,
@@ -336,17 +401,7 @@ def create_dataloaders(
         df_proc = resample_to_dynamic_dollar_bars(df_proc)
 
     # 1. Hybrid Train/Val Split (Decision #1 from /grill-me)
-    if "split_group" in df_proc.columns and (df_proc["split_group"] == "val").any():
-        train_df = df_proc[df_proc["split_group"] == "train"].reset_index(drop=True)
-        val_df = df_proc[df_proc["split_group"] == "val"].reset_index(drop=True)
-        if len(train_df) < seq_len + pred_len or len(val_df) < seq_len + pred_len:
-            train_size = int(len(df_proc) * split_ratio)
-            train_df = df_proc.iloc[:train_size].reset_index(drop=True)
-            val_df = df_proc.iloc[train_size:].reset_index(drop=True)
-    else:
-        train_size = int(len(df_proc) * split_ratio)
-        train_df = df_proc.iloc[:train_size].reset_index(drop=True)
-        val_df = df_proc.iloc[train_size:].reset_index(drop=True)
+    train_df, val_df = split_train_val_episodes(df_proc, seq_len=seq_len, pred_len=pred_len, split_ratio=split_ratio)
 
     # Identify spread/relative-price columns for Symlog compression
     symlog_feat_cols = [

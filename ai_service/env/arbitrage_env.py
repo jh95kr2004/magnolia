@@ -26,21 +26,33 @@ class ArbitrageEnv(gym.Env):
         execution_threshold=0.10,
         randomize_fees=False,
         is_eval=False,
+        event_sample_ratio=0.50,
     ):
         super(ArbitrageEnv, self).__init__()
 
         raw_attrs = getattr(df, "attrs", {})
         self.df = df.reset_index(drop=True)
 
-        self.df["sma_1h"] = (
-            self.df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
-        )
-        self.df["sma_24h"] = (
-            self.df["exchange_premium_spread"].rolling(1440, min_periods=1).mean()
-        )
-        self.df["std_24h"] = (
-            self.df["exchange_premium_spread"].rolling(1440, min_periods=1).std()
-        )
+        if "pair_id" in self.df.columns and self.df["pair_id"].nunique() > 1:
+            grp = self.df.groupby("pair_id", sort=False)["exchange_premium_spread"]
+            self.df["sma_1h"] = grp.transform(lambda s: s.rolling(60, min_periods=1).mean())
+            self.df["sma_24h"] = grp.transform(lambda s: s.rolling(1440, min_periods=1).mean())
+            self.df["std_24h"] = grp.transform(lambda s: s.rolling(1440, min_periods=1).std()).fillna(0.0005)
+            ema_12 = grp.transform(lambda s: s.ewm(span=12, adjust=False).mean())
+            ema_26 = grp.transform(lambda s: s.ewm(span=26, adjust=False).mean())
+        else:
+            self.df["sma_1h"] = (
+                self.df["exchange_premium_spread"].rolling(60, min_periods=1).mean()
+            )
+            self.df["sma_24h"] = (
+                self.df["exchange_premium_spread"].rolling(1440, min_periods=1).mean()
+            )
+            self.df["std_24h"] = (
+                self.df["exchange_premium_spread"].rolling(1440, min_periods=1).std()
+            )
+            ema_12 = self.df["exchange_premium_spread"].ewm(span=12, adjust=False).mean()
+            ema_26 = self.df["exchange_premium_spread"].ewm(span=26, adjust=False).mean()
+
         self.df["z_score"] = (
             self.df["exchange_premium_spread"] - self.df["sma_24h"]
         ) / (self.df["std_24h"] + 1e-8)
@@ -49,11 +61,8 @@ class ArbitrageEnv(gym.Env):
         self.df["bb_upper"] = self.df["sma_24h"] + (2.0 * self.df["std_24h"])
         self.df["bb_lower"] = self.df["sma_24h"] - (2.0 * self.df["std_24h"])
         self.df["bb_width"] = (self.df["bb_upper"] - self.df["bb_lower"]) / (
-            self.df["sma_24h"] + 1e-8
+            self.df["sma_24h"].abs() + 1e-8
         )
-
-        ema_12 = self.df["exchange_premium_spread"].ewm(span=12, adjust=False).mean()
-        ema_26 = self.df["exchange_premium_spread"].ewm(span=26, adjust=False).mean()
         self.df["macd"] = ema_12 - ema_26
 
         if "predicted_spread" not in self.df.columns:
@@ -128,6 +137,40 @@ class ArbitrageEnv(gym.Env):
             if "vasp_tier" in self.df.columns
             else np.ones(len(self.df), dtype=np.int32)
         )
+        self._col_slippage = (
+            self.df["slippage"].values.astype(np.float32)
+            if "slippage" in self.df.columns
+            else np.full(len(self.df), slippage, dtype=np.float32)
+        )
+        self._col_transfer_delay = (
+            self.df["transfer_delay_mins"].values.astype(np.int32)
+            if "transfer_delay_mins" in self.df.columns
+            else np.where(self._col_vasp_tier == 3, 14, 8).astype(np.int32)
+        )
+        self._col_gas_fee = (
+            self.df["network_gas_fee_usd"].values.astype(np.float32)
+            if "network_gas_fee_usd" in self.df.columns
+            else np.where(self._col_vasp_tier == 3, 5.0, 2.5).astype(np.float32)
+        )
+        # Terminal delisting flag: strictly env-internal at final candle t == t_end, NEVER in _get_obs()!
+        self._col_is_terminated = (
+            self.df["is_terminated"].values.astype(np.float32)
+            if "is_terminated" in self.df.columns
+            else np.zeros(len(self.df), dtype=np.float32)
+        )
+        self._col_pair_id = (
+            self.df["pair_id"].values
+            if "pair_id" in self.df.columns
+            else np.full(len(self.df), "DEFAULT")
+        )
+        self.event_sample_ratio = float(event_sample_ratio)
+        ev_sum = (
+            self._col_event_listing
+            + self._col_event_warning
+            + self._col_event_delisting
+            + self._col_event_suspension
+        )
+        self._event_start_candidates = np.where(ev_sum > 0.05)[0]
 
         self._static_market_features = np.column_stack(
             [
@@ -149,19 +192,20 @@ class ArbitrageEnv(gym.Env):
             ]
         ).astype(np.float32)
 
-        if "full_traj_deltas" in raw_attrs and "_row_id" in self.df.columns:
-            row_ids = self.df["_row_id"].values.astype(np.int64)
-            self.traj_deltas = np.asarray(raw_attrs["full_traj_deltas"][row_ids], dtype=np.float32)
-        else:
-            # Synthesize smooth 480-step relative trajectory from summary columns
-            n_rows = len(self.df)
-            cur_s = self.df["exchange_premium_spread"].values.astype(np.float32)
-            mean_d = (self.df["predicted_spread"].values.astype(np.float32) - cur_s)[:, None]
-            fw_d = self.df["first_wave_edge"].values.astype(np.float32)[:, None]
-            t_grid = np.linspace(1.0 / self.TRAJ_DIM, 1.0, self.TRAJ_DIM, dtype=np.float32)[None, :]
-            wave_pulse = fw_d * np.sin(np.pi * np.clip(t_grid * 2.0, 0.0, 1.0))
-            trend_line = mean_d * t_grid
-            self.traj_deltas = (0.5 * wave_pulse + 0.5 * trend_line).astype(np.float32)
+        self._t_grid = np.linspace(
+            1.0 / self.TRAJ_DIM, 1.0, self.TRAJ_DIM, dtype=np.float32
+        )
+        self._wave_sin = np.sin(np.pi * np.clip(self._t_grid * 2.0, 0.0, 1.0)).astype(
+            np.float32
+        )
+        self.traj_deltas = None
+        if "full_traj_deltas" in raw_attrs and len(self.df) <= 5000:
+            ftd = raw_attrs["full_traj_deltas"]
+            if len(ftd) == len(self.df):
+                self.traj_deltas = ftd
+            elif "_row_id" in self.df.columns:
+                row_ids = self.df["_row_id"].values.astype(np.int64)
+                self.traj_deltas = np.asarray(ftd[row_ids], dtype=np.float32)
 
         self.initial_balance = initial_balance
         self.base_fee_rate_default = base_fee_rate
@@ -208,8 +252,15 @@ class ArbitrageEnv(gym.Env):
             self.max_steps = len(self.df) - 1
         else:
             if len(self.df) > 1000:
-                self.current_step = np.random.randint(0, len(self.df) - 1000)
-                self.max_steps = self.current_step + 1000
+                if (
+                    len(self._event_start_candidates) > 0
+                    and np.random.rand() < self.event_sample_ratio
+                ):
+                    cand = int(np.random.choice(self._event_start_candidates))
+                    self.current_step = max(0, min(cand - 10, len(self.df) - 1000))
+                else:
+                    self.current_step = np.random.randint(0, len(self.df) - 1000)
+                self.max_steps = min(len(self.df) - 1, self.current_step + 1000)
             else:
                 self.current_step = 0
                 self.max_steps = len(self.df) - 1
@@ -237,7 +288,7 @@ class ArbitrageEnv(gym.Env):
         else:
             self.current_base_fee_rate = self.base_fee_rate_default
             self.current_foreign_fee_rate = self.foreign_fee_rate_default
-            self.current_slippage = self.slippage_default
+            self.current_slippage = float(self._col_slippage[self.current_step])
 
         return self._get_obs(), {}
 
@@ -260,7 +311,12 @@ class ArbitrageEnv(gym.Env):
             if self.state == self.STATE_REPAYING
             else (0.5 if self.state == self.STATE_STAGED else 0.0)
         )
-        obs[26:] = self.traj_deltas[idx]
+        if self.traj_deltas is not None:
+            obs[26:] = self.traj_deltas[idx]
+        else:
+            mean_d = float(self._col_pred_mean[idx] - self._col_spread[idx])
+            fw_d = float(self._col_fw_edge[idx])
+            obs[26:] = (0.5 * fw_d) * self._wave_sin + (0.5 * mean_d) * self._t_grid
         return obs
 
     def _get_unrealized_pnl(self, current_spread):
@@ -309,6 +365,10 @@ class ArbitrageEnv(gym.Env):
         ev_delisting = float(self._col_event_delisting[idx]) > 0.5
         ev_suspension = float(self._col_event_suspension[idx]) > 0.5
         vasp_tier = int(self._col_vasp_tier[idx])
+        if not self.randomize_fees:
+            self.current_slippage = float(self._col_slippage[idx])
+        step_gas_fee = float(self._col_gas_fee[idx])
+        step_transfer_delay = int(self._col_transfer_delay[idx])
 
         # 2. Calculate Previous Equity
         unrealized_pnl_prev = self._get_unrealized_pnl(current_spread)
@@ -337,7 +397,7 @@ class ArbitrageEnv(gym.Env):
         ):
             rebalance_amount = 0.50 - self.foreign_usd_skew
             rebalance_notional = rebalance_amount * self.initial_balance
-            rebalance_fee = rebalance_notional * (self.current_base_fee_rate + self.current_foreign_fee_rate) + 2.50
+            rebalance_fee = rebalance_notional * (self.current_base_fee_rate + self.current_foreign_fee_rate) + step_gas_fee
             # Reverse premium bonus/cost when buying Spot Base at negative/near-zero spread and shorting Foreign
             rebalance_spread_pnl = rebalance_notional * (-current_spread)
             self.balance = self.balance - rebalance_fee + rebalance_spread_pnl
@@ -420,7 +480,7 @@ class ArbitrageEnv(gym.Env):
                 self.staged_hold_steps = 0
                 self.staged_entry_basis = current_spread
                 self.staged_trigger_type = "LLM_EVENT_PRE_POSITION" if (ev_listing or ev_warning or ev_suspension) else "AI_SURGE_FORECAST"
-                gas_fee = 5.00 if vasp_tier == 3 else 2.50
+                gas_fee = step_gas_fee
                 self.balance -= gas_fee
                 step_fees_paid += gas_fee
                 self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(target_exposure) * 0.15)
@@ -438,19 +498,20 @@ class ArbitrageEnv(gym.Env):
                 self.staged_hold_steps = 0
                 self.staged_entry_basis = current_spread
                 self.staged_trigger_type = "LLM_EVENT_PRE_POSITION"
-                gas_fee = 5.00 if vasp_tier == 3 else 2.50
+                gas_fee = step_gas_fee
                 self.balance -= gas_fee
                 step_fees_paid += gas_fee
                 self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(target_exposure) * 0.15)
-            elif action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, real_spread >= 0.5%, and Foreign USD Skew >= 15%)
+            elif action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, wallet not suspended, real_spread >= 0.5%, and Foreign USD Skew >= 15%)
                 if (
                     self.exposure < 0
+                    and not ev_suspension
                     and real_spread >= 0.005
                     and self.foreign_usd_skew >= self.balance_skew_threshold
                 ):
                     self.state = self.STATE_TRANSFERRING
-                    self.transfer_remaining_steps = (14 if vasp_tier == 3 else 8) if self.is_eval else np.random.randint(5, 15)
-                    gas_fee = 5.00 if vasp_tier == 3 else 2.50
+                    self.transfer_remaining_steps = step_transfer_delay if self.is_eval else max(2, int(step_transfer_delay * np.random.uniform(0.8, 1.25)))
+                    gas_fee = step_gas_fee
                     self.balance -= gas_fee
                     step_fees_paid += gas_fee
                     # Moving coin from Foreign to Base consumes Foreign USD allocation
@@ -460,12 +521,15 @@ class ArbitrageEnv(gym.Env):
                     self.state = self.STATE_NEUTRAL
                     target_exposure = 0.0
                 else:
-                    target_exposure = action_exposure
+                    target_exposure = self.exposure if np.sign(action_exposure) == np.sign(self.exposure) else action_exposure
             elif action_type == 2 or abs(action_exposure) < self.execution_threshold:  # REPAY / Market Unwind
                 target_exposure = 0.0
                 self.state = self.STATE_NEUTRAL
-            else:  # TRADE (Hold / Scale-In / Scale-Out)
-                target_exposure = action_exposure
+            else:  # TRADE (Hold existing leg unless flipping direction to prevent fee churning)
+                if self.exposure != 0.0 and np.sign(action_exposure) == np.sign(self.exposure):
+                    target_exposure = self.exposure
+                else:
+                    target_exposure = action_exposure
 
         elif self.state == self.STATE_REPAYING:
             if action_type == 2 or abs(action_exposure) < self.execution_threshold or current_spread <= 0.002:
@@ -534,8 +598,13 @@ class ArbitrageEnv(gym.Env):
                 convergence_jump = current_spread - float(self._col_pred_min[idx])
                 first_wave_dn = max(0.0, -float(self._col_fw_edge[idx]))
                 mean_reversion_down = current_spread - float(self._col_sma_24h[idx])
-                transfer_spread = max(0.0, real_spread)
-                predicted_jump = max(convergence_jump, first_wave_dn, mean_reversion_down * 0.6, transfer_spread)
+                if ev_warning or ev_suspension:
+                    # During Gaduri Warning / Wallet Suspension, deposits are blocked and upward squeeze risk is high;
+                    # only allow Short Base entry when Forecaster explicitly predicts a strong downward reversion wave
+                    predicted_jump = first_wave_dn if float(self._col_fw_edge[idx]) < -0.005 else 0.0
+                else:
+                    transfer_spread = max(0.0, real_spread)
+                    predicted_jump = max(convergence_jump, first_wave_dn, mean_reversion_down * 0.6, transfer_spread)
 
             fee_percentage_wall = optimal_round_trip_fee
             if predicted_jump < fee_percentage_wall:
@@ -609,6 +678,27 @@ class ArbitrageEnv(gym.Env):
         self.current_step += 1
         done = self.current_step >= self.max_steps
 
+        # 6b. Terminal Delisting Settlement (strictly at t == t_end, zero look-ahead) & Episode Boundary Settlement
+        if float(self._col_is_terminated[idx]) > 0.5 and self.exposure != 0.0:
+            # Forced liquidation penalty if agent ignored delisting notice and held until market termination
+            delist_haircut = abs(self.exposure) * self.initial_balance * 0.05
+            self.balance += self._get_unrealized_pnl(current_spread) - delist_haircut
+            step_fees_paid += delist_haircut
+            self.exposure = 0.0
+            self.entry_spread = 0.0
+            self.state = self.STATE_NEUTRAL
+            self.staged_hold_steps = 0
+        elif not done and self._col_pair_id[self.current_step] != self._col_pair_id[idx]:
+            # Cleanly settle open position at end of current (exchange_pair, coin) episode before next episode starts
+            if self.exposure != 0.0:
+                self.balance += self._get_unrealized_pnl(current_spread)
+                self.exposure = 0.0
+                self.entry_spread = 0.0
+            self.state = self.STATE_NEUTRAL
+            self.transfer_remaining_steps = 0
+            self.staged_hold_steps = 0
+            self.foreign_usd_skew = 0.50
+
         # Apply continuous funding fee yield accruals
         accrual_factor = 1.0 / (8 * 60)
         if self.exposure > 0 or self.state == self.STATE_STAGED:
@@ -626,7 +716,7 @@ class ArbitrageEnv(gym.Env):
             step_fees_paid += borrow_fee
 
         # 7. Reward & Step Output
-        if done:
+        if done or self._col_pair_id[self.current_step] != self._col_pair_id[idx]:
             next_spread = current_spread
         else:
             next_spread = float(self._col_spread[self.current_step])
