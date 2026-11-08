@@ -938,9 +938,9 @@ def run_daemon():
                     "base_event_warning_or_susp": ev_warn_sig,
                     "base_event_delisting": ev_delist_sig,
                     "peer_or_foreign_event": ev_peer_sig,
-                    "base_fee": 0.0005,
-                    "foreign_fee": 0.002,
-                    "slippage": 0.0005,
+                    "base_fee": float(opp.get("base_fee_rate", 0.0005)),
+                    "foreign_fee": float(opp.get("foreign_fee_rate", 0.002)),
+                    "slippage": float(opp.get("slippage", 0.0005)),
                     "state": 0,
                     "user_exposure": 0.0,
                     "user_balance": 10000.0,
@@ -1070,6 +1070,7 @@ def run_daemon():
                     "bb_width": float(last_row.get("bb_width", 0.0)),
                     "macd": float(last_row.get("macd", 0.0)),
                     "current_spread": current_spread,
+                    "current_real_spread": current_real_spread,
                     "base_fund": opp.get("base_funding_rate_pct", 0.0) / 100.0,
                     "foreign_fund": opp.get("foreign_funding_rate_pct", 0.0) / 100.0,
                     "fx_rate": fx_rate,
@@ -1095,6 +1096,8 @@ def run_daemon():
                 current_exposures = acc_state.get("current_exposures", {})
                 unrealized_pnls = acc_state.get("unrealized_pnls", {})
                 pair_states = acc_state.get("pair_states", {})
+                exchange_fees = acc_state.get("exchange_fees", {}) or {}
+                order_notional_usd = max(500.0, min(available_balance * 0.25, 10000.0))
 
                 for opp in raw_data:
                     pair_key = (opp["base_exchange"], opp["base_symbol"], opp["foreign_exchange"], opp["foreign_symbol"])
@@ -1108,9 +1111,44 @@ def run_daemon():
                     user_pnl = float(unrealized_pnls.get(key_str, 0.0))
                     pair_state = int(pair_states.get(key_str, fallback_user_state if abs(user_exposure) > 1e-6 else 0))
                     
-                    base_fee = float(opp.get("base_fee_rate", 0.0005))
-                    foreign_fee = float(opp.get("foreign_fee_rate", 0.002))
+                    base_ex_fee = exchange_fees.get(opp["base_exchange"])
+                    foreign_ex_fee = exchange_fees.get(opp["foreign_exchange"])
+
+                    if isinstance(base_ex_fee, dict):
+                        base_rate = float(base_ex_fee.get("taker_fee_rate", opp.get("base_fee_rate", 0.0005)))
+                        base_fixed_usd = float(opp.get("base_fee_fixed_usd", 0.0))
+                        if "taker_fee_fixed" in base_ex_fee and float(base_ex_fee["taker_fee_fixed"]) > 0:
+                            if opp["base_exchange"].upper() == "UPBIT" and m_data["fx_rate"] > 0:
+                                base_fixed_usd = float(base_ex_fee["taker_fee_fixed"]) / float(m_data["fx_rate"])
+                            else:
+                                base_fixed_usd = float(base_ex_fee["taker_fee_fixed"])
+                    elif isinstance(base_ex_fee, (int, float)) and float(base_ex_fee) > 0:
+                        base_rate = float(base_ex_fee)
+                        base_fixed_usd = float(opp.get("base_fee_fixed_usd", 0.0))
+                    else:
+                        base_rate = float(opp.get("base_fee_rate", 0.0005))
+                        base_fixed_usd = float(opp.get("base_fee_fixed_usd", 0.0))
+
+                    if isinstance(foreign_ex_fee, dict):
+                        foreign_rate = float(foreign_ex_fee.get("taker_fee_rate", opp.get("foreign_fee_rate", 0.002)))
+                        foreign_fixed_usd = float(foreign_ex_fee.get("taker_fee_fixed", opp.get("foreign_fee_fixed_usd", 0.0)))
+                    elif isinstance(foreign_ex_fee, (int, float)) and float(foreign_ex_fee) > 0:
+                        foreign_rate = float(foreign_ex_fee)
+                        foreign_fixed_usd = float(opp.get("foreign_fee_fixed_usd", 0.0))
+                    else:
+                        foreign_rate = float(opp.get("foreign_fee_rate", 0.002))
+                        foreign_fixed_usd = float(opp.get("foreign_fee_fixed_usd", 0.0))
+
+                    base_fee = base_rate + (base_fixed_usd / order_notional_usd if order_notional_usd > 0 else 0.0)
+                    foreign_fee = foreign_rate + (foreign_fixed_usd / order_notional_usd if order_notional_usd > 0 else 0.0)
                     slippage = float(opp.get("slippage", 0.0005))
+
+                    withdraw_fixed_usd = float(opp.get("withdraw_fee_fixed_usd", 0.0))
+                    withdraw_rate = float(opp.get("withdraw_fee_rate", 0.0))
+                    withdraw_fee_pct = (
+                        withdraw_rate + (withdraw_fixed_usd / order_notional_usd if order_notional_usd > 0 else 0.0)
+                    )
+                    foreign_share = float(acc_state.get("foreign_share", 0.50))
 
                     state_neutral = 1.0 if pair_state == 0 else 0.0
                     state_holding = 1.0 if pair_state in (1, 4) else 0.0
@@ -1153,7 +1191,12 @@ def run_daemon():
                         continue
                         
                     stacked_obs = np.concatenate(list(feature_cache[user_key][pair_key]), axis=-1).reshape(1, -1)
-                    action_score, target_weight, action_type = rl_agent.predict(stacked_obs)
+                    action_score, target_weight, action_type = rl_agent.predict(
+                        stacked_obs,
+                        real_spread=float(m_data.get("current_real_spread", m_data["current_spread"])),
+                        withdraw_fee_rate=float(withdraw_fee_pct),
+                        foreign_share=foreign_share,
+                    )
 
                     # Causal LLM Announcement Catalyst Override
                     active_events = m_data.get("events", [])
