@@ -225,36 +225,74 @@ def start_announcement_http_server(ann_cache: AnnouncementCache = None, port: in
 class UserAccountCache:
     def __init__(self, r):
         self.r = r
-        self.users = {}  # key: user_id (str) -> value: account_state dict
+        self.users = {}  # key: f"{user_id}:{mode}" (e.g. "1:PAPER", "1:LIVE") -> value: account_state dict
         self.lock = threading.Lock()
-        
+        self._preload_from_redis()
+
+    def _ingest_state(self, user_id: str, data: dict, channel_hint: str = ""):
+        mode = str(data.get("mode", "")).upper()
+        if mode not in ("PAPER", "LIVE"):
+            if ":paper" in channel_hint.lower():
+                mode = "PAPER"
+            elif ":live" in channel_hint.lower():
+                mode = "LIVE"
+            else:
+                mode = "PAPER"
+        data["mode"] = mode
+        data["user_id"] = int(user_id) if str(user_id).isdigit() else 0
+        user_key = f"{user_id}:{mode}"
+        with self.lock:
+            self.users[user_key] = data
+
+    def _preload_from_redis(self):
+        try:
+            for pattern in ("user:*:state:paper:latest", "user:*:state:live:latest", "user:*:state:latest"):
+                for key in self.r.keys(pattern):
+                    parts = key.split(":")
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        raw = self.r.get(key)
+                        if raw:
+                            data = json.loads(raw)
+                            self._ingest_state(parts[1], data, channel_hint=key)
+        except Exception as e:
+            logger.warning(f"Failed to preload UserAccountCache from Redis: {e}")
+
     def start_subscriber(self):
         def _listen():
             pubsub = self.r.pubsub()
-            pubsub.psubscribe("user:*:state")
+            pubsub.psubscribe("user:*:state", "user:*:state:paper", "user:*:state:live")
             for msg in pubsub.listen():
                 if msg["type"] == "pmessage":
                     try:
                         channel = msg["channel"]
-                        user_id = channel.split(":")[1]
+                        parts = channel.split(":")
+                        if len(parts) < 3 or not parts[1].isdigit():
+                            continue
+                        user_id = parts[1]
                         data = json.loads(msg["data"])
-                        with self.lock:
-                            self.users[user_id] = data
+                        self._ingest_state(user_id, data, channel_hint=channel)
                     except Exception as e:
                         logger.warning(f"Failed to parse User state: {e}")
         t = threading.Thread(target=_listen, daemon=True)
         t.start()
-        
-    def get_state(self, user_id: str):
+
+    def get_state(self, user_key: str):
         with self.lock:
-            return self.users.get(str(user_id), {
+            if ":" in str(user_key):
+                uid_str, mode_str = str(user_key).split(":", 1)
+            else:
+                uid_str, mode_str = str(user_key), "PAPER"
+            return self.users.get(str(user_key), {
+                "user_id": int(uid_str) if uid_str.isdigit() else 0,
+                "mode": mode_str,
                 "available_balance": 10000.0,
                 "current_exposures": {},
                 "unrealized_pnls": {},
                 "pair_states": {},
+                "exchange_fees": {},
                 "state": 0
             })
-        
+
     def get_all_users(self):
         with self.lock:
             return list(self.users.keys())
@@ -1041,10 +1079,16 @@ def run_daemon():
             # --- [User Specific DRL Inference Step] ---
             active_users = user_cache.get_all_users()
             if not active_users:
-                active_users = ["0"]  # Default system user fallback
+                active_users = ["1:PAPER", "1:LIVE"]  # Default user/mode fallback
 
-            for user_id in active_users:
-                acc_state = user_cache.get_state(user_id)
+            for user_key in active_users:
+                acc_state = user_cache.get_state(user_key)
+                if ":" in str(user_key):
+                    uid_str, user_mode = str(user_key).split(":", 1)
+                else:
+                    uid_str, user_mode = str(user_key), str(acc_state.get("mode", "PAPER")).upper()
+                user_id_int = int(acc_state.get("user_id", int(uid_str) if uid_str.isdigit() else 0))
+
                 available_balance = float(acc_state.get("available_balance", 10000.0))
                 fallback_user_state = int(acc_state.get("state", 0))
                 
@@ -1103,12 +1147,12 @@ def run_daemon():
                     ], dtype=np.float32)
 
                     state_vector_506 = np.concatenate([scalar_26, m_data["traj_delta"]], axis=0).astype(np.float32)
-                    feature_cache[user_id][pair_key].append(state_vector_506)
+                    feature_cache[user_key][pair_key].append(state_vector_506)
                     
-                    if len(feature_cache[user_id][pair_key]) < rl_agent.n_stack:
+                    if len(feature_cache[user_key][pair_key]) < rl_agent.n_stack:
                         continue
                         
-                    stacked_obs = np.concatenate(list(feature_cache[user_id][pair_key]), axis=-1).reshape(1, -1)
+                    stacked_obs = np.concatenate(list(feature_cache[user_key][pair_key]), axis=-1).reshape(1, -1)
                     action_score, target_weight, action_type = rl_agent.predict(stacked_obs)
 
                     # Causal LLM Announcement Catalyst Override
@@ -1157,7 +1201,8 @@ def run_daemon():
                         target_offset_min = m_data["first_wave_offset_min"]
                     
                     ai_predictions.append({
-                        "user_id": int(user_id),
+                        "user_id": int(user_id_int),
+                        "mode": user_mode,
                         "base_exchange": opp["base_exchange"],
                         "foreign_exchange": opp["foreign_exchange"],
                         "base_symbol": opp["base_symbol"],
