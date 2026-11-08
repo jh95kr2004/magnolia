@@ -382,6 +382,8 @@ func (p *PubSubClient) PublishUserState(ctx context.Context, userID string, payl
 }
 
 // PublishUserStateByMode broadcasts and caches account state for a specific mode ("paper" or "live").
+// Mode channels ("user:{id}:state:paper" and "user:{id}:state:live") are strictly isolated so that
+// a STOPPED engine in one mode never overwrites active position state in the other mode.
 func (p *PubSubClient) PublishUserStateByMode(ctx context.Context, userID, mode string, payload []byte) error {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
@@ -389,8 +391,10 @@ func (p *PubSubClient) PublishUserStateByMode(ctx context.Context, userID, mode 
 	}
 	modeChannel := "user:" + userID + ":state:" + mode
 	_ = p.client.Set(ctx, modeChannel+":latest", payload, 5*time.Minute).Err()
-	_ = p.client.Publish(ctx, modeChannel, payload).Err()
-	return p.PublishUserState(ctx, userID, payload)
+	if strings.Contains(string(payload), `"bot_status":"RUNNING"`) || mode == "paper" {
+		_ = p.client.Set(ctx, "user:"+userID+":state:latest", payload, 5*time.Minute).Err()
+	}
+	return p.client.Publish(ctx, modeChannel, payload).Err()
 }
 
 // GetLatestUserState retrieves the latest cached account state snapshot for a user.
