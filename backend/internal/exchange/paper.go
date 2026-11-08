@@ -461,8 +461,15 @@ func (p *PaperClient) GetBalances(ctx context.Context) ([]Balance, error) {
 func (p *PaperClient) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	feeInfo, err := p.realClient.GetTradingFee(ctx, req.Symbol)
 	feeRate := 0.001 // Fallback 0.1% fee
-	if err == nil && feeInfo.TakerFeeRate > 0 {
-		feeRate = feeInfo.TakerFeeRate
+	feeFixed := 0.0
+	if err == nil {
+		if req.Type == LimitOrder && feeInfo.MakerFeeRate > 0 {
+			feeRate = feeInfo.MakerFeeRate
+			feeFixed = feeInfo.MakerFeeFixed
+		} else if feeInfo.TakerFeeRate > 0 {
+			feeRate = feeInfo.TakerFeeRate
+			feeFixed = feeInfo.TakerFeeFixed
+		}
 	}
 
 	price := req.Price
@@ -484,7 +491,7 @@ func (p *PaperClient) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderR
 
 	tradeVolumeAssets := req.Amount
 	tradeVolumeQuote := req.Amount * price
-	feeAmountQuote := tradeVolumeQuote * feeRate
+	feeAmountQuote := (tradeVolumeQuote * feeRate) + feeFixed
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -572,7 +579,7 @@ func (p *PaperClient) PlaceOrder(ctx context.Context, req OrderRequest) (*OrderR
 				tradeVolumeAssets = p.balances[base]
 				req.Amount = tradeVolumeAssets
 				tradeVolumeQuote = tradeVolumeAssets * price
-				feeAmountQuote = tradeVolumeQuote * feeRate
+				feeAmountQuote = (tradeVolumeQuote * feeRate) + feeFixed
 			} else {
 				return nil, fmt.Errorf("insufficient paper funds for sell order: requires %.6f %s but have %.6f %s",
 					tradeVolumeAssets, base, p.balances[base], base)
@@ -687,17 +694,53 @@ func (p *PaperClient) GetDepositAddress(ctx context.Context, currency Currency, 
 }
 
 func (p *PaperClient) GetWithdrawalLimit(ctx context.Context, currency Currency, network Network) (WithdrawalLimit, error) {
+	fixedFee, estSec := DefaultNetworkSpec(p.GetName(), currency)
+	spec := NetworkInfo{
+		Network:          network,
+		WithdrawFeeFixed: fixedFee,
+		EstimatedTime:    estSec,
+	}
+	if nets, err := p.GetSupportedNetworks(ctx, currency); err == nil {
+		for _, n := range nets {
+			if strings.EqualFold(string(n.Network), string(network)) || network == "" {
+				spec = n
+				break
+			}
+		}
+	}
 	return WithdrawalLimit{
-		Currency:       currency,
-		Network:        network,
-		MinWithdrawal:  0.0,
-		DailyLimit:     999999.0,
-		DailyRemaining: 999999.0,
-		MaxPerTx:       999999.0,
+		Currency:         currency,
+		Network:          spec.Network,
+		MinWithdrawal:    0.0,
+		DailyLimit:       999999.0,
+		DailyRemaining:   999999.0,
+		MaxPerTx:         999999.0,
+		WithdrawFeeFixed: spec.WithdrawFeeFixed,
+		WithdrawFeeRate:  spec.WithdrawFeeRate,
 	}, nil
 }
 
 func (p *PaperClient) Withdraw(ctx context.Context, req WithdrawRequest) (*WithdrawResponse, error) {
+	fixedFee, estSec := DefaultNetworkSpec(p.GetName(), req.Currency)
+	spec := NetworkInfo{
+		Network:          req.Network,
+		WithdrawFeeFixed: fixedFee,
+		EstimatedTime:    estSec,
+	}
+	if nets, err := p.GetSupportedNetworks(ctx, req.Currency); err == nil {
+		for _, n := range nets {
+			if strings.EqualFold(string(n.Network), string(req.Network)) || req.Network == "" {
+				spec = n
+				break
+			}
+		}
+	}
+	withdrawFee := spec.EffectiveWithdrawFeeCoins(req.Amount)
+	if withdrawFee > req.Amount {
+		withdrawFee = req.Amount
+	}
+	creditedAmt := req.Amount - withdrawFee
+
 	p.mu.Lock()
 	cur := strings.ToUpper(string(req.Currency))
 	cost := req.Amount
@@ -708,7 +751,7 @@ func (p *PaperClient) Withdraw(ctx context.Context, req WithdrawRequest) (*Withd
 	p.balances[cur] -= cost
 	p.mu.Unlock()
 
-	// Route transfer to the same user's destination PaperClient
+	// Route transfer to the same user's destination PaperClient (net of withdrawal fee)
 	if strings.HasPrefix(req.Address, "PAPER-DEPOSIT-") {
 		parts := strings.Split(req.Address, "-")
 		// Format: PAPER-DEPOSIT-{userID}-{exchange}-{currency}-{network}
@@ -717,8 +760,8 @@ func (p *PaperClient) Withdraw(ctx context.Context, req WithdrawRequest) (*Withd
 			paperRegistryMu.RLock()
 			destClient, ok := paperRegistry[paperRegistryKey(p.userID, destExchange)]
 			paperRegistryMu.RUnlock()
-			if ok {
-				destClient.Deposit(cur, req.Amount)
+			if ok && creditedAmt > 0 {
+				destClient.Deposit(cur, creditedAmt)
 			}
 		}
 	}
@@ -726,8 +769,8 @@ func (p *PaperClient) Withdraw(ctx context.Context, req WithdrawRequest) (*Withd
 	return &WithdrawResponse{
 		WithdrawID: fmt.Sprintf("paper-wd-%d", time.Now().UnixNano()),
 		TxID:       "0xpaperhash123",
-		Fee:        0.0,
-		Amount:     req.Amount,
+		Fee:        withdrawFee,
+		Amount:     creditedAmt,
 		Status:     string(WithdrawCompleted),
 	}, nil
 }
