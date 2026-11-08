@@ -200,8 +200,15 @@ def run_ppo_simulation(
     entry_equity = 10000.0
 
     while not done:
+        step_idx = min(raw_env.current_step, len(raw_env._col_real_spread) - 1)
+        cur_real_spread = float(raw_env._col_real_spread[step_idx])
+        cur_wd_fee = float(raw_env._col_gas_fee[step_idx]) / max(raw_env.initial_balance * 0.25, 500.0)
         action_score, target_weight, action_type = agent.predict(
-            obs, use_forecaster=use_forecaster_fusion
+            obs,
+            use_forecaster=use_forecaster_fusion,
+            real_spread=cur_real_spread,
+            withdraw_fee_rate=cur_wd_fee,
+            foreign_share=float(raw_env.foreign_usd_skew),
         )
         if action_score < 5.0:
             signed_exp = -float(target_weight)
