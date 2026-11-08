@@ -1020,6 +1020,7 @@ func (e *Engine) evaluateRebalancing(ctx context.Context, quotes map[string]exch
 // AIPredictedOpportunity matches the JSON payload published by Python AI app.py
 type AIPredictedOpportunity struct {
 	UserID              int     `json:"user_id"`
+	Mode                string  `json:"mode,omitempty"`
 	BaseExchange        string  `json:"base_exchange"`
 	ForeignExchange     string  `json:"foreign_exchange"`
 	BaseSymbol          string  `json:"base_symbol"`
@@ -1057,10 +1058,13 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 				continue
 			}
 
-			// 1. Filter by UserID
+			// 1. Filter by UserID and Mode ("PAPER" vs "LIVE")
 			var filteredOps []AIPredictedOpportunity
 			for _, opp := range aiOps {
 				if opp.UserID != 0 && uint(opp.UserID) != e.userID {
+					continue
+				}
+				if opp.Mode != "" && !strings.EqualFold(opp.Mode, e.ModeString()) {
 					continue
 				}
 				filteredOps = append(filteredOps, opp)
@@ -1390,8 +1394,8 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								if selectedStrategy == StrategyForeignTransfer {
 									expectedBestNetROI = transferNetROI
 								}
-								if !stageAssassination && !preStageListing && expectedBestNetROI <= 0.0005 && entrySpread <= 0.0025 {
-									// Guard against opening a position with negative or sub-fee expected return
+								if !stageAssassination && !preStageListing && expectedBestNetROI <= 0.0005 {
+									// Strictly block opening a position (Strategy A/B/C/D/E) when expected return after real exchange fees is negative or sub-threshold
 									continue
 								}
 
@@ -1453,22 +1457,18 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								}
 							}
 						}
-					} else if delta < -toleranceAmount {
+					} else if delta < -toleranceAmount && opp.TargetWeight > 1e-6 {
+						// Only scale down partially when TargetWeight > 0; full 100% position closure is handled explicitly by opp.ActionType == 2
 						if matchingPos != nil && currentExposure > 0 {
-							exitRatio := math.Min(1.0, (-delta)/currentExposure)
+							exitRatio := math.Min(0.95, (-delta)/currentExposure)
 							targetStrategy := e.findStrategy(StrategyType(matchingPos.Type))
 							posPair := e.findPair(matchingPos.BaseExchange, matchingPos.ForeignExchange, matchingPos.BaseSymbol)
 							if targetStrategy != nil && posPair != nil {
 								if err := targetStrategy.ExecuteExit(ctx, e.executor, *posPair, *matchingPos, exitRatio, e.walletProxy); err == nil {
-									if exitRatio >= 0.99 {
-										_ = e.db.UpdatePositionStatus(matchingPos.PositionID, "CLOSED")
-										e.notifyPositionClosed(ctx, matchingPos.PositionID)
-									} else {
-										reducedUsd := matchingPos.InvestmentUSD * exitRatio
-										reducedBase := matchingPos.BaseAmount * exitRatio
-										reducedForeign := matchingPos.ForeignAmount * exitRatio
-										_ = e.db.ReducePositionAmount(matchingPos.PositionID, reducedUsd, reducedBase, reducedForeign)
-									}
+									reducedUsd := matchingPos.InvestmentUSD * exitRatio
+									reducedBase := matchingPos.BaseAmount * exitRatio
+									reducedForeign := matchingPos.ForeignAmount * exitRatio
+									_ = e.db.ReducePositionAmount(matchingPos.PositionID, reducedUsd, reducedBase, reducedForeign)
 									e.persistPaperState()
 								}
 							}
