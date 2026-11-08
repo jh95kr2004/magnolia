@@ -107,8 +107,15 @@ def _quick_eval_candidate(
     done = False
     cap_hist = [10000.0]
     while not done:
+        step_idx = min(raw_env.current_step, len(raw_env._col_real_spread) - 1)
+        cur_real_spread = float(raw_env._col_real_spread[step_idx])
+        cur_wd_fee = float(raw_env._col_gas_fee[step_idx]) / max(raw_env.initial_balance * 0.25, 500.0)
         action_score, target_weight, action_type = agent.predict(
-            obs, use_forecaster=True
+            obs,
+            use_forecaster=True,
+            real_spread=cur_real_spread,
+            withdraw_fee_rate=cur_wd_fee,
+            foreign_share=float(raw_env.foreign_usd_skew),
         )
         signed_exp = (
             -float(target_weight)
@@ -231,7 +238,7 @@ def train_agent(
             "foreign_fee_rate": 0.002,
             "slippage": 0.0005,
             "execution_threshold": 0.10,
-            "randomize_fees": False,
+            "randomize_fees": True,
             "is_eval": False,
             "event_sample_ratio": float(ratio),
         }
