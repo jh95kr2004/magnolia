@@ -48,15 +48,30 @@ func (p *PubSubClient) PublishTicker(ctx context.Context, update exchange.PriceU
 }
 
 // SubscribeTickers listens to the specified symbols and pipes them into a standard PriceUpdate channel.
+// If symbols is empty or contains "*" or "ALL", it uses PSubscribe("ticker_*") to dynamically receive all coins,
+// including newly listed altcoins added at runtime without restarting the subscriber.
 func (p *PubSubClient) SubscribeTickers(ctx context.Context, symbols []exchange.Symbol, outCh chan<- exchange.PriceUpdate) {
-	channels := make([]string, len(symbols))
-	for i, sym := range symbols {
-		channels[i] = TickerChannelPrefix + string(sym)
+	useWildcard := len(symbols) == 0
+	for _, s := range symbols {
+		u := strings.ToUpper(strings.TrimSpace(string(s)))
+		if u == "*" || u == "ALL" || strings.HasPrefix(u, "ALL-") {
+			useWildcard = true
+			break
+		}
 	}
 
-	pubsub := p.client.Subscribe(ctx, channels...)
+	var pubsub *redisclient.PubSub
+	if useWildcard {
+		pubsub = p.client.PSubscribe(ctx, TickerChannelPrefix+"*")
+	} else {
+		channels := make([]string, len(symbols))
+		for i, sym := range symbols {
+			channels[i] = TickerChannelPrefix + string(sym)
+		}
+		pubsub = p.client.Subscribe(ctx, channels...)
+	}
 	defer pubsub.Close()
-	
+
 	ch := pubsub.Channel()
 
 	for {
@@ -64,6 +79,9 @@ func (p *PubSubClient) SubscribeTickers(ctx context.Context, symbols []exchange.
 		case <-ctx.Done():
 			return
 		case msg := <-ch:
+			if msg == nil {
+				continue
+			}
 			var update exchange.PriceUpdate
 			if err := json.Unmarshal([]byte(msg.Payload), &update); err != nil {
 				log.Printf("[Redis] Failed to unmarshal ticker: %v", err)
@@ -72,6 +90,30 @@ func (p *PubSubClient) SubscribeTickers(ctx context.Context, symbols []exchange.
 			outCh <- update
 		}
 	}
+}
+
+// PublishActiveUniverse caches the currently discovered overlapping coin tickers and exchange symbols in Redis.
+func (p *PubSubClient) PublishActiveUniverse(ctx context.Context, coins []string, symbols []string) error {
+	if coinsBytes, err := json.Marshal(coins); err == nil {
+		_ = p.client.Set(ctx, "market:universe:coins", coinsBytes, 24*time.Hour).Err()
+	}
+	if symsBytes, err := json.Marshal(symbols); err == nil {
+		_ = p.client.Set(ctx, "market:universe:symbols", symsBytes, 24*time.Hour).Err()
+	}
+	return nil
+}
+
+// GetActiveUniverseCoins retrieves the cached list of active base coin tickers (e.g. ["BTC", "ETH", "SOL", ...]).
+func (p *PubSubClient) GetActiveUniverseCoins(ctx context.Context) []string {
+	raw, err := p.client.Get(ctx, "market:universe:coins").Bytes()
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var coins []string
+	if err := json.Unmarshal(raw, &coins); err != nil {
+		return nil
+	}
+	return coins
 }
 
 // PublishFXRate broadcasts a normalized FX rate for a given quote/base pair to the cluster.
