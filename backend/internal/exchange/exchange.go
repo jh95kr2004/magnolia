@@ -103,15 +103,96 @@ type NetworkInfo struct {
 	ExchangeNetID    string  // Exchange's custom identifier (e.g. "TRX")
 	IsDepositEnable  bool
 	IsWithdrawEnable bool
-	WithdrawFeeFixed float64 // Fixed transfer fee magnitude
-	WithdrawFeeRate  float64 // Percentage-based transfer fee (if applicable)
+	WithdrawFeeFixed float64 // Fixed transfer fee magnitude (in coin units)
+	WithdrawFeeRate  float64 // Percentage-based transfer fee (if applicable, e.g. 0.001 for 0.1%)
 	EstimatedTime    int     // Estimated transfer time in seconds
 }
 
-// TradeFeeInfo represents trading fees, varying by user VIP tier
+// EffectiveWithdrawFeeCoins returns the total withdrawal fee in coin units (fixed coin fee + percentage of coin amount).
+func (n NetworkInfo) EffectiveWithdrawFeeCoins(transferAmountCoins float64) float64 {
+	feeCoins := 0.0
+	if n.WithdrawFeeFixed > 0 {
+		feeCoins += n.WithdrawFeeFixed
+	}
+	if n.WithdrawFeeRate > 0 && transferAmountCoins > 0 {
+		feeCoins += transferAmountCoins * n.WithdrawFeeRate
+	}
+	return feeCoins
+}
+
+// EffectiveWithdrawFeeUSD returns the total withdrawal fee in USD (fixed coin fee * coinPriceUSD + transferVolumeUSD * rate).
+func (n NetworkInfo) EffectiveWithdrawFeeUSD(coinPriceUSD, transferVolumeUSD float64) float64 {
+	feeUSD := 0.0
+	if n.WithdrawFeeFixed > 0 && coinPriceUSD > 0 {
+		feeUSD += n.WithdrawFeeFixed * coinPriceUSD
+	}
+	if n.WithdrawFeeRate > 0 && transferVolumeUSD > 0 {
+		feeUSD += transferVolumeUSD * n.WithdrawFeeRate
+	}
+	return feeUSD
+}
+
+// DefaultNetworkSpec returns baseline on-chain withdrawal fee (in coin units) and estimated confirmation time (seconds)
+// when an exchange API is queried in unauthenticated public/paper mode.
+func DefaultNetworkSpec(exchangeName string, currency Currency) (fixedFeeCoins float64, estTimeSec int) {
+	cur := strings.ToUpper(string(currency))
+	isUpbit := strings.EqualFold(exchangeName, "UPBIT") || strings.EqualFold(exchangeName, "BITHUMB")
+	switch cur {
+	case "BTC":
+		if isUpbit {
+			return 0.0002, 600
+		}
+		return 0.00005, 600
+	case "ETH":
+		if isUpbit {
+			return 0.001, 300
+		}
+		return 0.0005, 300
+	case "XRP":
+		if isUpbit {
+			return 0.25, 60
+		}
+		return 0.02, 60
+	case "SOL":
+		if isUpbit {
+			return 0.008, 60
+		}
+		return 0.001, 60
+	case "TRX":
+		return 1.0, 90
+	case "USDT", "USDC":
+		return 1.0, 120
+	case "DOGE":
+		return 2.0, 300
+	default:
+		return 0.0, 300
+	}
+}
+
+// TradeFeeInfo represents trading fees (both percentage rate and fixed fee per order), varying by user VIP tier
 type TradeFeeInfo struct {
-	MakerFeeRate float64
-	TakerFeeRate float64
+	MakerFeeRate  float64 `json:"maker_fee_rate"`
+	TakerFeeRate  float64 `json:"taker_fee_rate"`
+	MakerFeeFixed float64 `json:"maker_fee_fixed"` // Fixed fee per order in quote currency (if applicable)
+	TakerFeeFixed float64 `json:"taker_fee_fixed"` // Fixed fee per order in quote currency (if applicable)
+}
+
+// EffectiveTakerFeeRate returns the combined percentage + fixed fee rate for a given quote currency order volume.
+func (f TradeFeeInfo) EffectiveTakerFeeRate(orderVolumeQuote float64) float64 {
+	rate := f.TakerFeeRate
+	if orderVolumeQuote > 0 && f.TakerFeeFixed > 0 {
+		rate += f.TakerFeeFixed / orderVolumeQuote
+	}
+	return rate
+}
+
+// EffectiveMakerFeeRate returns the combined percentage + fixed fee rate for a given quote currency order volume.
+func (f TradeFeeInfo) EffectiveMakerFeeRate(orderVolumeQuote float64) float64 {
+	rate := f.MakerFeeRate
+	if orderVolumeQuote > 0 && f.MakerFeeFixed > 0 {
+		rate += f.MakerFeeFixed / orderVolumeQuote
+	}
+	return rate
 }
 
 // MarketInfo represents the trading and transfer state of a market symbol.
@@ -221,14 +302,16 @@ type WithdrawRecord struct {
 	CreatedAt  time.Time
 }
 
-// WithdrawalLimit represents the user's remaining transfer capacity
+// WithdrawalLimit represents the user's remaining transfer capacity and fee schedule
 type WithdrawalLimit struct {
-	Currency       Currency
-	Network        Network
-	MinWithdrawal  float64
-	DailyLimit     float64
-	DailyRemaining float64
-	MaxPerTx       float64
+	Currency         Currency
+	Network          Network
+	MinWithdrawal    float64
+	DailyLimit       float64
+	DailyRemaining   float64
+	MaxPerTx         float64
+	WithdrawFeeFixed float64
+	WithdrawFeeRate  float64
 }
 
 // PriceUpdate represents real-time incoming orderbook or ticker data via WS
