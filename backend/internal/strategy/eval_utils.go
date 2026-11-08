@@ -198,7 +198,30 @@ const (
 	StrategyForeignTransfer StrategyType = "FOREIGN_TRANSFER" // Strategy C
 	StrategyFutureSpot      StrategyType = "FUTURE_SPOT"      // Strategy D
 	StrategyFutureFuture    StrategyType = "FUTURE_FUTURE"    // Strategy E
+
+	// Quantitative Guardrails from FastCampus Part 02 [04~09강]:
+	// 1. MaxArbitrageBasisRatio: Maximum allowed Spot-Futures backwardation basis (5.0%) when entering for Kimp convergence / transfer arbitrage.
+	MaxArbitrageBasisRatio = 0.050
+	// 2. MaxFundingHarvestBasisRatio: Maximum allowed Spot-Futures backwardation basis (2.0%) when entering primarily to harvest funding rates.
+	MaxFundingHarvestBasisRatio = 0.020
+	// 3. WorstCaseNegativeKimpRatio: Historical worst-case negative Kimp floor (-15.0%) that futures margin must survive without liquidation.
+	WorstCaseNegativeKimpRatio = -0.150
+	// 4. RecommendedFuturesLeverage: Default safe Cross-Margin leverage (2.5x, within the 2x~3x rule).
+	RecommendedFuturesLeverage = 2.5
 )
+
+// CheckNegativeKimpSurvival verifies that a hedged futures position has sufficient collateral buffer
+// to survive if Kimp drops to WorstCaseNegativeKimpRatio (-15%) without forced liquidation.
+func CheckNegativeKimpSurvival(entryKimpRatio, investmentUSD, availableMarginUSD float64) bool {
+	if investmentUSD <= 0 || availableMarginUSD <= 0 {
+		return false
+	}
+	// Adverse spread expansion if Kimp moves from entryKimpRatio down to -15%
+	adverseKimpMove := math.Max(0.15, entryKimpRatio-WorstCaseNegativeKimpRatio)
+	// Require available margin to cover at least 2.5x the adverse move (equivalent to <= 3x Cross Margin safety buffer)
+	requiredMarginUSD := investmentUSD * math.Max(0.33, adverseKimpMove*1.5)
+	return availableMarginUSD >= requiredMarginUSD
+}
 
 // PremiumEvalParams bundles parameters needed to evaluate an arbitrage opportunity.
 type PremiumEvalParams struct {
@@ -232,6 +255,9 @@ type PremiumEvalParams struct {
 	BaseSupportsMargin         bool               // Whether the base exchange supports margin borrowing/shorting
 	ForeignSupportsMargin      bool               // Whether the foreign exchange supports margin borrowing/shorting
 	ForeignSupportsFutures     bool               // Whether the foreign exchange supports futures hedging
+	SupportsDeFiBorrow         bool               // Whether an on-chain DeFi lending pool (Aave V3, Venus, Morpho, Kamino) has borrow liquidity
+	DeFiBorrowRatePerHour      float64            // Hourly borrow interest rate on the discovered DeFi lending pool
+	DeFiProtocol               string             // Selected on-chain DeFi lending protocol name (e.g. "AAVE_V3", "VENUS")
 	FXRateKRW                  float64            // Fiat USD-KRW exchange rate
 	TetherRateKRW              float64            // Exchange-specific USDT-KRW rate
 	TetherRealPremiumPct       float64            // Real Tether-adjusted Kimp ratio (e.g., 0.035 for +3.5%), used by Strategy C

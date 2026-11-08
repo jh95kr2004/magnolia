@@ -118,11 +118,22 @@ func (s *ForeignTransferStrategy) Evaluate(baseSpot, foreignSpot exchange.PriceU
 		return s.lastEval
 	}
 
-	// 3-Stage Hedge Mode Selection:
+	// 4-Stage Hedge Mode Selection (Part 02 [02~11강]):
 	// 1st priority: BASE_BORROW (Borrow & Sell on Base + Buy on Foreign)
 	// 2nd priority: FOREIGN_BORROW (Borrow & Sell on Foreign + Spot Buy on Foreign -> Transfer -> Sell on Base & Repay on Foreign)
-	// 3rd priority: FOREIGN_FUTURES_HEDGE (Spot Buy on Foreign + Futures 1x Short on Foreign -> Transfer -> Sell on Base & Cover Short on Foreign)
+	// 3rd priority: FOREIGN_FUTURES_HEDGE (Spot Buy on Foreign + Futures Short on Foreign -> Transfer -> Sell on Base & Cover Short on Foreign)
+	// 4th priority: ONCHAIN_DEFI_BORROW (Borrow on Aave V3 / Venus / Morpho / Kamino with HF >= 1.30 -> Transfer -> Sell on Base)
 	hasForeignFutures := params.ForeignSupportsFutures || foreignSpot.BidFutureUSD > 0 || foreignSpot.AskFutureUSD > 0
+	hasDeFiBorrow := params.SupportsDeFiBorrow
+	defiHourlyRate := params.DeFiBorrowRatePerHour
+	if !hasDeFiBorrow && baseSpot.Symbol != "" {
+		scanner := wallet.NewDeFiLendingScanner()
+		if pools, err := scanner.DiscoverPools(context.Background(), string(baseSpot.Symbol), math.Max(1000.0, params.InvestmentUsd)); err == nil && len(pools) > 0 {
+			hasDeFiBorrow = true
+			defiHourlyRate = pools[0].BorrowRatePerHour
+		}
+	}
+
 	hedgeMode := ""
 	if params.BaseSupportsMargin && !params.StageAssassination && !params.PreStageListing {
 		hedgeMode = "BASE_BORROW"
@@ -130,6 +141,8 @@ func (s *ForeignTransferStrategy) Evaluate(baseSpot, foreignSpot exchange.PriceU
 		hedgeMode = "FOREIGN_BORROW"
 	} else if hasForeignFutures {
 		hedgeMode = "FOREIGN_FUTURES_HEDGE"
+	} else if hasDeFiBorrow {
+		hedgeMode = "ONCHAIN_DEFI_BORROW"
 	} else if params.BaseSupportsMargin {
 		hedgeMode = "BASE_BORROW"
 	} else if params.ForeignSupportsMargin {
@@ -137,7 +150,7 @@ func (s *ForeignTransferStrategy) Evaluate(baseSpot, foreignSpot exchange.PriceU
 	} else {
 		s.lastEval = StrategyEvaluation{
 			Type:        s.ID(),
-			ErrorReason: "API does not support margin borrowing on base/foreign exchange and no foreign futures market available",
+			ErrorReason: "API does not support margin borrowing on base/foreign exchange, no foreign futures market, and no on-chain DeFi lending pool available",
 		}
 		return s.lastEval
 	}
@@ -200,6 +213,14 @@ func (s *ForeignTransferStrategy) Evaluate(baseSpot, foreignSpot exchange.PriceU
 	foreignBasisCost := 0.0
 	if hedgeMode == "FOREIGN_FUTURES_HEDGE" && foreignBasisRatio > 0 {
 		foreignBasisCost = foreignBasisRatio
+		// Hard guardrail from Part 02 [07강]: Never enter futures-hedged arbitrage if Spot-Futures backwardation basis exceeds 5.0%
+		if foreignBasisCost > MaxArbitrageBasisRatio {
+			s.lastEval = StrategyEvaluation{
+				Type:        s.ID(),
+				ErrorReason: fmt.Sprintf("foreign spot-futures basis exceeds 5.0%% arbitrage cap (%.2f%% > %.2f%%)", foreignBasisCost*100.0, MaxArbitrageBasisRatio*100.0),
+			}
+			return s.lastEval
+		}
 	}
 
 	// Guardrail for Assassination / Pre-Staging: reject if foreign backwardation basis is too expensive (> 0.35%)
@@ -250,6 +271,11 @@ func (s *ForeignTransferStrategy) Evaluate(baseSpot, foreignSpot exchange.PriceU
 	borrowInterest := baseSpot.BorrowRatePerHour * holdTimeHours
 	if hedgeMode == "FOREIGN_FUTURES_HEDGE" {
 		borrowInterest = 0.0
+	} else if hedgeMode == "ONCHAIN_DEFI_BORROW" {
+		if defiHourlyRate <= 0 {
+			defiHourlyRate = 0.05 / 8760.0
+		}
+		borrowInterest = defiHourlyRate * holdTimeHours
 	}
 
 	// Hedge Market Selection (SPOT vs FUTURE)

@@ -526,3 +526,60 @@ func TestUpbitVerifyTravelRuleDepositMockHTTP(t *testing.T) {
 	}
 }
 
+func TestFourStageHedgeFallback_DeFiBorrowAndBasisCaps(t *testing.T) {
+	strat := &ForeignTransferStrategy{}
+
+	// Neither Base nor Foreign supports CEX Margin, and Foreign has no Futures,
+	// but ARB is available in Aave V3 on-chain DeFi lending -> 4th-stage ONCHAIN_DEFI_BORROW!
+	baseSpot := exchange.PriceUpdate{
+		Symbol: "ARB-KRW",
+		BidUSD: 1.08,
+		AskUSD: 1.08,
+	}
+	foreignSpot := exchange.PriceUpdate{
+		Symbol: "ARB-USD",
+		BidUSD: 1.00,
+		AskUSD: 1.00,
+	}
+	params := PremiumEvalParams{
+		BaseSupportsMargin:     false,
+		ForeignSupportsMargin:  false,
+		ForeignSupportsFutures: false,
+		InvestmentUsd:          3000.0,
+		BaseBalanceUsd:         20000.0,
+		ForeignBalanceUsd:      20000.0,
+		EstTransferTime:        2 * time.Minute,
+	}
+
+	eval := strat.Evaluate(baseSpot, foreignSpot, params)
+	if eval.ErrorReason != "" {
+		t.Fatalf("expected 4th-stage ONCHAIN_DEFI_BORROW evaluation to succeed, got error: %s", eval.ErrorReason)
+	}
+	if eval.HedgeMode != "ONCHAIN_DEFI_BORROW" {
+		t.Fatalf("expected HedgeMode=ONCHAIN_DEFI_BORROW, got %s", eval.HedgeMode)
+	}
+
+	// Verify 5.0% Arbitrage Basis Cap blocks entry when Foreign Spot-Futures backwardation is 6.5%
+	foreignSpotHighBasis := exchange.PriceUpdate{
+		Symbol:       "ARB-USD",
+		BidUSD:       1.00,
+		AskUSD:       1.00,
+		BidFutureUSD: 0.935, // 6.5% backwardation (> 5.0% cap)
+	}
+	paramsHighBasis := params
+	paramsHighBasis.ForeignSupportsFutures = true
+	evalBlocked := strat.Evaluate(baseSpot, foreignSpotHighBasis, paramsHighBasis)
+	if evalBlocked.ErrorReason == "" {
+		t.Fatalf("expected ForeignTransferStrategy to reject entry when foreign basis (6.5%%) > 5.0%% cap")
+	}
+
+	// Verify -15% Negative Kimp Survival check
+	if !CheckNegativeKimpSurvival(0.03, 5000.0, 2500.0) {
+		t.Fatalf("expected 50%% margin buffer (2x leverage) to survive -15%% negative Kimp")
+	}
+	if CheckNegativeKimpSurvival(0.05, 10000.0, 1000.0) {
+		t.Fatalf("expected 10%% margin buffer (10x leverage) to fail -15%% negative Kimp survival check")
+	}
+}
+
+

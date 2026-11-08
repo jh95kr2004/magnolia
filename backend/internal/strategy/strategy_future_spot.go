@@ -47,6 +47,20 @@ func (s *FutureSpotStrategy) Evaluate(
 		expectedFunding = params.PredictedSellFundingRates[0] * 3.0 // roughly 24 hours (3 8h cycles)
 	}
 
+	// Part 02 [07~09강] Guardrail: If entering primarily to harvest funding rates (basisReturn <= 0.005 and expectedFunding > 0),
+	// enforce strict 2.0% Spot-Futures Basis cap so entry basis loss does not wipe out funding income.
+	spotFutureGap := 0.0
+	if baseSpot.AskUSD > 0 && baseFutureBid > 0 && baseSpot.AskUSD > baseFutureBid {
+		spotFutureGap = (baseSpot.AskUSD - baseFutureBid) / baseSpot.AskUSD
+	}
+	if expectedFunding > 0 && basisReturn < 0.005 && spotFutureGap > MaxFundingHarvestBasisRatio {
+		s.lastEval = StrategyEvaluation{
+			Type:        s.ID(),
+			ErrorReason: fmt.Sprintf("spot-futures basis (%.2f%%) exceeds 2.0%% funding harvest cap", spotFutureGap*100.0),
+		}
+		return s.lastEval
+	}
+
 	netROI := basisReturn - roundTripTradingFees - borrowInterest + expectedFunding
 
 	riskScore := computeLiquidationRisk(params.InvestmentUsd, params.BaseBalanceUsd)
