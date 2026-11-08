@@ -1040,6 +1040,63 @@ type AIPredictedOpportunity struct {
 	Timestamp           float64 `json:"timestamp"`
 }
 
+// computePairFeeRates dynamically fetches and computes effective trading and withdrawal fee rates
+// (combining both percentage and fixed fees for the given investmentUSD).
+func (e *Engine) computePairFeeRates(ctx context.Context, pair *CrossMarketPair, investmentUSD float64, needs2Hop bool) (baseOneWayFee, foreignOneWayFee, roundTripReversionFee, oneWayTransferFee, networkWithdrawFeeRate float64) {
+	if investmentUSD <= 0 {
+		investmentUSD = 10000.0
+	}
+	baseOneWayFee = 0.0005
+	foreignOneWayFee = 0.0020
+	if pair == nil {
+		return baseOneWayFee, foreignOneWayFee, 2.0 * (baseOneWayFee + foreignOneWayFee), baseOneWayFee + foreignOneWayFee, 0.0005
+	}
+
+	baseFX := e.getExchangeCurrencyFX(pair.BaseClient.GetName(), string(pair.BaseMarketInfo.Symbol))
+	foreignFX := e.getExchangeCurrencyFX(pair.ForeignClient.GetName(), string(pair.ForeignMarketInfo.Symbol))
+
+	if bf, err := pair.BaseClient.GetTradingFee(ctx, pair.BaseMarketInfo.Symbol); err == nil {
+		if eff := bf.EffectiveTakerFeeRate(investmentUSD * baseFX); eff > 0 {
+			baseOneWayFee = eff
+		}
+	}
+	if ff, err := pair.ForeignClient.GetTradingFee(ctx, pair.ForeignMarketInfo.Symbol); err == nil {
+		if eff := ff.EffectiveTakerFeeRate(investmentUSD * foreignFX); eff > 0 {
+			foreignOneWayFee = eff
+		}
+	}
+
+	roundTripReversionFee = 2.0 * (baseOneWayFee + foreignOneWayFee)
+	oneWayTransferFee = baseOneWayFee + foreignOneWayFee
+
+	var coinPriceUSD float64
+	if e.latestQuotes != nil {
+		if fq, ok := e.latestQuotes[string(pair.ForeignMarketInfo.Symbol)]; ok {
+			coinPriceUSD = fq.AskUSD
+			if coinPriceUSD <= 0 && fq.RawAsk > 0 && foreignFX > 0 {
+				coinPriceUSD = fq.RawAsk / foreignFX
+			}
+		}
+	}
+	if coinPriceUSD <= 0 {
+		if px, err := pair.ForeignClient.GetTicker(ctx, pair.ForeignMarketInfo.Symbol); err == nil && px > 0 && foreignFX > 0 {
+			coinPriceUSD = px / foreignFX
+		}
+	}
+
+	withdrawCoins := pair.ForeignNetwork.WithdrawFeeFixed
+	if withdrawCoins <= 0 {
+		withdrawCoins, _ = exchange.DefaultNetworkSpec(pair.ForeignClient.GetName(), pair.BaseCurrency)
+	}
+	withdrawFeeUSD := (withdrawCoins * coinPriceUSD) + (investmentUSD * pair.ForeignNetwork.WithdrawFeeRate)
+	if needs2Hop {
+		withdrawFeeUSD += 2.50
+	}
+	networkWithdrawFeeRate = withdrawFeeUSD / math.Max(investmentUSD, 100.0)
+	return
+}
+
+
 // ListenOpportunities subscribes to AI inferred opportunities and triggers Portfolio Rebalancing.
 func (e *Engine) ListenOpportunities(ctx context.Context) {
 	aiCh := make(chan []byte)
@@ -1338,7 +1395,6 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								var selectedStrategy StrategyType = StrategyMarginSpot
 								isBaseFuture := targetPair.BaseMarketInfo.MarketType == "FUTURE"
 								isForeignFuture := targetPair.ForeignMarketInfo.MarketType == "FUTURE"
-								reversionNetROI := (entrySpread - entryPredictedSpread) - 0.0013
 								isReverseDirection := opp.ActionScore > 5.0
 
 								// Check active announcement events for this coin
@@ -1364,10 +1420,11 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								}
 								vaspTier := GetVASPTier(targetPair.BaseClient.GetName(), targetPair.ForeignClient.GetName())
 								needs2Hop := vaspTier == exchange.VASPTier3RiskAssessed && e.walletProxy != nil
-								feeEstimate := 0.0022
-								if needs2Hop {
-									feeEstimate = 0.0032
-								}
+
+								_, _, roundTripReversionFee, oneWayTransferFee, networkWithdrawFeeRate := e.computePairFeeRates(ctx, targetPair, targetDollarVolume, needs2Hop)
+								reversionNetROI := (entrySpread - entryPredictedSpread) - roundTripReversionFee
+								feeEstimate := oneWayTransferFee + networkWithdrawFeeRate
+
 								transferNetROI := realEntrySpread - feeEstimate
 
 								stageAssassination := opp.ActionType == 3 ||
@@ -1381,7 +1438,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									selectedStrategy = StrategyFutureSpot
 								} else {
 									// Quantitative NetROI comparison: Strategy C wins if its NetROI (even after 2-hop fees) beats Strategy A/B, or if assassination staging is triggered
-									if !isReverseDirection && (preStageListing || (targetPair.IsValidForTransfer && (stageAssassination || (transferNetROI >= reversionNetROI && realEntrySpread > 0.0025)))) {
+									if !isReverseDirection && (preStageListing || (targetPair.IsValidForTransfer && (stageAssassination || (transferNetROI >= reversionNetROI && transferNetROI > 0.0005)))) {
 										selectedStrategy = StrategyForeignTransfer
 									} else if isForeignFuture {
 										selectedStrategy = StrategyMarginFuture
@@ -1407,6 +1464,8 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									eval.TetherRealPremiumPct = realEntrySpread
 									eval.BasisReturn = entrySpread - entryPredictedSpread
 									eval.InvestmentUSD = targetDollarVolume
+									eval.TradingFees = oneWayTransferFee
+									eval.TransferFees = networkWithdrawFeeRate
 									eval.HedgeMarket = "SPOT"
 									if isForeignFuture {
 										eval.HedgeMarket = "FUTURE"
@@ -1522,6 +1581,11 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 						meanPct = opp.PredictedPremiumPct * 100.0
 					}
 
+					investVolUSD := e.config.CapitalLimitUsd * opp.TargetWeight
+					vaspTierDTO := GetVASPTier(targetPair.BaseClient.GetName(), targetPair.ForeignClient.GetName())
+					needs2HopDTO := vaspTierDTO == exchange.VASPTier3RiskAssessed && e.walletProxy != nil
+					_, _, roundTripReversionFee, oneWayTransferFee, networkWithdrawFeeRate := e.computePairFeeRates(ctx, targetPair, investVolUSD, needs2HopDTO)
+
 					if isBaseFuture && isForeignFuture {
 						// Strategy E: Future-Future
 						dtoList = append(dtoList, FilteredOppDTO{
@@ -1532,7 +1596,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							Strategy:            "Future-Future (E)",
 							Direction:           direction,
 							ActionScore:         opp.ActionScore,
-							ExpectedRoi:         directionalSpreadMove - 0.0005, // minus estimated trading fee rate (0.05%)
+							ExpectedRoi:         directionalSpreadMove - roundTripReversionFee,
 							CurrentPremiumPct:   opp.PremiumPct * 100.0,
 							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
 							MeanPremiumPct:      meanPct,
@@ -1543,7 +1607,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							MinOffsetMin:        opp.MinOffsetMin,
 							TargetWeight:        opp.TargetWeight,
 							RiskScore:           15.0,
-							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+							InvestmentUsd:       investVolUSD,
 							IsValid:             true,
 						})
 					} else if isBaseFuture {
@@ -1556,7 +1620,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							Strategy:            "Future-Spot (D)",
 							Direction:           direction,
 							ActionScore:         opp.ActionScore,
-							ExpectedRoi:         directionalSpreadMove - 0.0006, // minus estimated fee rate (0.06%)
+							ExpectedRoi:         directionalSpreadMove - roundTripReversionFee,
 							CurrentPremiumPct:   opp.PremiumPct * 100.0,
 							PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
 							MeanPremiumPct:      meanPct,
@@ -1567,7 +1631,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							MinOffsetMin:        opp.MinOffsetMin,
 							TargetWeight:        opp.TargetWeight,
 							RiskScore:           18.0,
-							InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+							InvestmentUsd:       investVolUSD,
 							IsValid:             true,
 						})
 					} else {
@@ -1586,7 +1650,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								Strategy:            strategyHoldingName,
 								Direction:           direction,
 								ActionScore:         opp.ActionScore,
-								ExpectedRoi:         directionalSpreadMove - 0.0013, // accounting for spot trading fees + estimated borrow interest over hold (0.13%)
+								ExpectedRoi:         directionalSpreadMove - roundTripReversionFee,
 								CurrentPremiumPct:   opp.PremiumPct * 100.0,
 								PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
 								MeanPremiumPct:      meanPct,
@@ -1597,13 +1661,18 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								MinOffsetMin:        opp.MinOffsetMin,
 								TargetWeight:        opp.TargetWeight,
 								RiskScore:           18.0,
-								InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+								InvestmentUsd:       investVolUSD,
 								IsValid:             true,
 							})
 
 							// 2. Transfer Loop Strategy: Transfer Loop (C)
 							if targetPair.IsValidForTransfer {
+								fxKRW := GetFXRate("KRW")
+								tetherKRW := GetExchangeTetherRate(targetPair.BaseClient.GetName(), string(targetPair.BaseMarketInfo.QuoteCurrency))
 								roiTransfer := opp.PremiumPct
+								if fxKRW > 0 && tetherKRW > 0 {
+									roiTransfer = ((1.0 + opp.PremiumPct) * fxKRW / tetherKRW) - 1.0
+								}
 								
 								// Compute realistic risk based on block confirmation time and congestion
 								networkRisk := 20.0 // Default baseline for fast confirmation chains (ETH, etc.)
@@ -1630,7 +1699,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									Strategy:            "Transfer Loop (C)",
 									Direction:           "TRANSFER",
 									ActionScore:         opp.ActionScore,
-									ExpectedRoi:         roiTransfer - 0.0022, // accounting for trading fees + network gas/withdrawal fees (0.22%)
+									ExpectedRoi:         roiTransfer - (oneWayTransferFee + networkWithdrawFeeRate),
 									CurrentPremiumPct:   opp.PremiumPct * 100.0,
 									PredictedPremiumPct: opp.PredictedPremiumPct * 100.0,
 									MeanPremiumPct:      meanPct,
@@ -1641,7 +1710,7 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									MinOffsetMin:        opp.MinOffsetMin,
 									TargetWeight:        opp.TargetWeight,
 									RiskScore:           totalRisk,
-									InvestmentUsd:       e.config.CapitalLimitUsd * opp.TargetWeight,
+									InvestmentUsd:       investVolUSD,
 									IsValid:             true,
 								})
 							}
@@ -2011,6 +2080,7 @@ type AIAccountState struct {
 	FXRateKRW            float64                   `json:"fx_rate_krw"`
 	TetherRatesKRW       map[string]float64        `json:"tether_rates_krw"`
 	ExchangeBalances     []ExchangeBalanceSnapshot `json:"exchange_balances"`
+	ExchangeFees         map[string]float64        `json:"exchange_fees,omitempty"`
 	ForeignShare         float64                   `json:"foreign_share"`
 	RebalanceTriggerSkew float64                   `json:"rebalance_trigger_skew"`
 	RebalanceTargetSkew  float64                   `json:"rebalance_target_skew"`
@@ -2087,12 +2157,16 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 
 	var exSnapshots []ExchangeBalanceSnapshot
 	webSessions := make(map[string]bool)
+	exchangeFees := make(map[string]float64)
 	totalLiquidUSD := 0.0
 	totalPaperNetEquityUSD := 0.0
 	foreignUSD := 0.0
 
 	for _, client := range e.clients {
 		exName := client.GetName()
+		if feeInfo, err := client.GetTradingFee(ctx, ""); err == nil && feeInfo.TakerFeeRate > 0 {
+			exchangeFees[exName] = feeInfo.TakerFeeRate
+		}
 		lendingOK := client.SupportsMargin()
 		if e.isPaper {
 			lendingOK = true
@@ -2203,6 +2277,7 @@ func (e *Engine) publishAccountState(ctx context.Context) {
 		FXRateKRW:            fxKRW,
 		TetherRatesKRW:       GetAllExchangeTetherRatesSnapshot(),
 		ExchangeBalances:     exSnapshots,
+		ExchangeFees:         exchangeFees,
 		ForeignShare:         foreignShare,
 		RebalanceTriggerSkew: e.config.RebalanceTriggerSkew,
 		RebalanceTargetSkew:  e.config.RebalanceTargetSkew,
@@ -2269,6 +2344,10 @@ func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
 	}
 	baseFX := e.getExchangeCurrencyFX(pos.BaseExchange, pos.BaseSymbol)
 	foreignFX := e.getExchangeCurrencyFX(pos.ForeignExchange, pos.ForeignSymbol)
+	targetPair := e.findPair(pos.BaseExchange, pos.ForeignExchange, pos.BaseSymbol)
+	vaspTier := GetVASPTier(pos.BaseExchange, pos.ForeignExchange)
+	needs2Hop := vaspTier == exchange.VASPTier3RiskAssessed && e.walletProxy != nil
+	baseOneWayFee, foreignOneWayFee, roundTripReversionFee, oneWayTransferFee, networkWithdrawFeeRate := e.computePairFeeRates(context.Background(), targetPair, pos.InvestmentUSD, needs2Hop)
 
 	// 1. Strategy C (FOREIGN_TRANSFER): Borrow & Sell on Base, Buy on Foreign, Transfer & 1:1 Repay (or Staged Assassination exit)
 	if pos.Type == string(StrategyForeignTransfer) {
@@ -2285,11 +2364,12 @@ func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
 		if sellBasePrice > 0 && pos.EntryForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
 			baseSellUSD := (pos.BaseAmount * sellBasePrice) / baseFX
 			foreignBuyUSD := (pos.ForeignAmount * pos.EntryForeignPrice) / foreignFX
-			baseFeeUSD := baseSellUSD * 0.0005
-			foreignFeeUSD := foreignBuyUSD * 0.0020
-			return baseSellUSD - foreignBuyUSD - baseFeeUSD - foreignFeeUSD
+			baseFeeUSD := baseSellUSD * baseOneWayFee
+			foreignFeeUSD := foreignBuyUSD * foreignOneWayFee
+			withdrawFeeUSD := foreignBuyUSD * networkWithdrawFeeRate
+			return baseSellUSD - foreignBuyUSD - baseFeeUSD - foreignFeeUSD - withdrawFeeUSD
 		}
-		return pos.InvestmentUSD * (pos.EntryPremium - 0.0025)
+		return pos.InvestmentUSD * (pos.EntryPremium - (oneWayTransferFee + networkWithdrawFeeRate))
 	}
 
 	// 2. Strategies A, B, D, E (Convergence / Widening Delta-Neutral Hedging):
@@ -2316,8 +2396,9 @@ func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
 	if pos.EntryBasePrice > 0 && pos.EntryForeignPrice > 0 && exitBasePrice > 0 && exitForeignPrice > 0 && pos.BaseAmount > 0 && pos.ForeignAmount > 0 {
 		baseShortPnLUSD := (pos.BaseAmount * (pos.EntryBasePrice - exitBasePrice)) / baseFX
 		foreignLongPnLUSD := (pos.ForeignAmount * (exitForeignPrice - pos.EntryForeignPrice)) / foreignFX
-		entryNotionalUSD := ((pos.BaseAmount * pos.EntryBasePrice) / baseFX) + ((pos.ForeignAmount * pos.EntryForeignPrice) / foreignFX)
-		roundTripFeesUSD := entryNotionalUSD * 0.0015
+		baseNotionalUSD := (pos.BaseAmount * (pos.EntryBasePrice + exitBasePrice)) / baseFX
+		foreignNotionalUSD := (pos.ForeignAmount * (pos.EntryForeignPrice + exitForeignPrice)) / foreignFX
+		roundTripFeesUSD := (baseNotionalUSD * baseOneWayFee) + (foreignNotionalUSD * foreignOneWayFee)
 		return baseShortPnLUSD + foreignLongPnLUSD - roundTripFeesUSD
 	}
 
@@ -2328,7 +2409,7 @@ func (e *Engine) calculateRealizedPnLUSD(pos *postgres.ActivePosition) float64 {
 		}
 	}
 
-	return pos.InvestmentUSD * (-0.0030)
+	return pos.InvestmentUSD * (-roundTripReversionFee)
 }
 
 func (e *Engine) notifyPositionClosed(ctx context.Context, positionID string) {
