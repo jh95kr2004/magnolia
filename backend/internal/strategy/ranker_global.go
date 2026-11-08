@@ -55,6 +55,12 @@ type RawOpportunity struct {
 	BaseFundingRatePct    float64   `json:"base_funding_rate_pct"`
 	ForeignFundingRatePct float64   `json:"foreign_funding_rate_pct"`
 	BorrowRatePct         float64   `json:"borrow_rate_pct"`
+	BaseFeeRate           float64   `json:"base_fee_rate"`
+	BaseFeeFixedUSD       float64   `json:"base_fee_fixed_usd"`
+	ForeignFeeRate        float64   `json:"foreign_fee_rate"`
+	ForeignFeeFixedUSD    float64   `json:"foreign_fee_fixed_usd"`
+	WithdrawFeeFixedUSD   float64   `json:"withdraw_fee_fixed_usd"`
+	WithdrawFeeRate       float64   `json:"withdraw_fee_rate"`
 	ExpectedMargin        float64   `json:"expected_margin"` // PremiumPct + FundingRate - BorrowRatePct
 	Timestamp             time.Time `json:"timestamp"`
 }
@@ -329,6 +335,23 @@ func (r *GlobalRawRanker) EvaluateAllCache(ctx context.Context, pairs []CrossMar
 			}
 		}
 
+		baseFeeInfo, _ := p.BaseClient.GetTradingFee(ctx, p.BaseMarketInfo.Symbol)
+		foreignFeeInfo, _ := p.ForeignClient.GetTradingFee(ctx, p.ForeignMarketInfo.Symbol)
+		baseFeeFixedUSD := baseFeeInfo.TakerFeeFixed
+		if baseFX > 0 {
+			baseFeeFixedUSD = baseFeeInfo.TakerFeeFixed / baseFX
+		}
+		foreignFeeFixedUSD := foreignFeeInfo.TakerFeeFixed
+		if foreignFX > 0 {
+			foreignFeeFixedUSD = foreignFeeInfo.TakerFeeFixed / foreignFX
+		}
+		withdrawFeeFixedCoins := p.ForeignNetwork.WithdrawFeeFixed
+		if withdrawFeeFixedCoins <= 0 {
+			withdrawFeeFixedCoins, _ = exchange.DefaultNetworkSpec(p.ForeignClient.GetName(), p.BaseCurrency)
+		}
+		withdrawFeeFixedUSD := withdrawFeeFixedCoins * foreignUSD
+		withdrawFeeRate := p.ForeignNetwork.WithdrawFeeRate
+
 		raw := RawOpportunity{
 			BaseExchange:          p.BaseClient.GetName(),
 			ForeignExchange:       p.ForeignClient.GetName(),
@@ -355,6 +378,12 @@ func (r *GlobalRawRanker) EvaluateAllCache(ctx context.Context, pairs []CrossMar
 			BaseFundingRatePct:    baseFundingRatePct,
 			ForeignFundingRatePct: foreignFundingRatePct,
 			BorrowRatePct:         borrowRatePct,
+			BaseFeeRate:           baseFeeInfo.TakerFeeRate,
+			BaseFeeFixedUSD:       baseFeeFixedUSD,
+			ForeignFeeRate:        foreignFeeInfo.TakerFeeRate,
+			ForeignFeeFixedUSD:    foreignFeeFixedUSD,
+			WithdrawFeeFixedUSD:   withdrawFeeFixedUSD,
+			WithdrawFeeRate:       withdrawFeeRate,
 			ExpectedMargin:        margin,
 			Timestamp:             time.Now(),
 		}
