@@ -114,76 +114,45 @@ func main() {
 
 	ranker := strategy.NewGlobalRawRanker(redisClient)
 
-	// Build all combination pairs dynamically: N * (N-1)
-	var rankerPairs []strategy.CrossMarketPair
-	for i, base := range clients {
-		for j, forign := range clients {
-			if i != j {
-				// Initialize pairs utilizing global ranker instance
-				pairs, err := ranker.FindIntersections(ctx, base, forign)
-				if err == nil && len(pairs) > 0 {
-					rankerPairs = append(rankerPairs, pairs...)
-				}
-			}
-		}
-	}
-
-	// Filter rankerPairs if environment filters are defined
 	targetCoinsEnv := os.Getenv("TARGET_COINS")
 	upbitQuoteEnv := os.Getenv("UPBIT_QUOTE")
 	coinbaseQuoteEnv := os.Getenv("COINBASE_QUOTE")
+	maxUniverseCoins := strategy.ParseMaxUniverseCoins(os.Getenv("MAX_UNIVERSE_COINS"))
 
-	if targetCoinsEnv != "" || upbitQuoteEnv != "" || coinbaseQuoteEnv != "" {
-		var filteredPairs []strategy.CrossMarketPair
-		var targetCoins []string
-		if targetCoinsEnv != "" {
-			for _, tc := range strings.Split(targetCoinsEnv, ",") {
-				targetCoins = append(targetCoins, strings.TrimSpace(strings.ToUpper(tc)))
-			}
-		}
+	universeMgr := strategy.NewDynamicUniverseManager(
+		ranker,
+		redisClient,
+		clients,
+		targetCoinsEnv,
+		upbitQuoteEnv,
+		coinbaseQuoteEnv,
+		maxUniverseCoins,
+	)
+	rankerPairs, activeCoins := universeMgr.RefreshUniverse(ctx)
 
-		for _, pair := range rankerPairs {
-			coinMatch := true
-			if len(targetCoins) > 0 {
-				coinMatch = false
-				for _, tc := range targetCoins {
-					if string(pair.BaseCurrency) == tc {
-						coinMatch = true
-						break
+	log.Printf("[INIT] Pre-calculated %d overlapping market pairs (%d coins: %v) for global scanning.", len(rankerPairs), len(activeCoins), activeCoins)
+
+	// Hot-reload universe periodically and immediately upon NEW_KRW_LISTING / catalyst announcements
+	go func() {
+		annCh := make(chan exchange.AnnouncementEvent, 32)
+		go redisClient.SubscribeAnnouncementEvents(ctx, annCh)
+		refreshTicker := time.NewTicker(2 * time.Minute)
+		defer refreshTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt := <-annCh:
+				for _, sym := range evt.Symbols {
+					if pairs, isNew := universeMgr.InjectPreListingCoin(ctx, sym); isNew {
+						log.Printf("[UniverseHotReload] Dynamically injected coin %s from %s announcement (total pairs: %d)", sym, evt.EventType, len(pairs))
 					}
 				}
-			}
-
-			quoteMatch := true
-			if pair.BaseClient.GetName() == "UPBIT" && upbitQuoteEnv != "" {
-				if string(pair.BaseMarketInfo.QuoteCurrency) != strings.ToUpper(upbitQuoteEnv) {
-					quoteMatch = false
-				}
-			}
-			if pair.ForeignClient.GetName() == "UPBIT" && upbitQuoteEnv != "" {
-				if string(pair.ForeignMarketInfo.QuoteCurrency) != strings.ToUpper(upbitQuoteEnv) {
-					quoteMatch = false
-				}
-			}
-			if pair.BaseClient.GetName() == "COINBASE" && coinbaseQuoteEnv != "" {
-				if string(pair.BaseMarketInfo.QuoteCurrency) != strings.ToUpper(coinbaseQuoteEnv) {
-					quoteMatch = false
-				}
-			}
-			if pair.ForeignClient.GetName() == "COINBASE" && coinbaseQuoteEnv != "" {
-				if string(pair.ForeignMarketInfo.QuoteCurrency) != strings.ToUpper(coinbaseQuoteEnv) {
-					quoteMatch = false
-				}
-			}
-
-			if coinMatch && quoteMatch {
-				filteredPairs = append(filteredPairs, pair)
+			case <-refreshTicker.C:
+				universeMgr.RefreshUniverse(ctx)
 			}
 		}
-		rankerPairs = filteredPairs
-	}
-
-	log.Printf("[INIT] Pre-calculated %d overlapping market pairs for global scanning.", len(rankerPairs))
+	}()
 
 	// Determine unique symbols to monitor per exchange dynamically from ranker intersections
 	for _, client := range clients {
@@ -411,7 +380,7 @@ func main() {
 				return
 			case <-ticker.C:
 				// Execute EvaluateAllCache which uses O(1) Memory Reads and naturally outputs to Redis
-				_, err := ranker.EvaluateAllCache(ctx, rankerPairs, priceCache)
+				_, err := ranker.EvaluateAllCache(ctx, universeMgr.GetPairs(), priceCache)
 				if err != nil {
 					log.Printf("[GlobalRanker] Fetch/Ranking error: %v", err)
 				}

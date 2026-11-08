@@ -95,7 +95,8 @@ services:
       INFLUX_ORG: "magnolia"
       INFLUX_BUCKET: "market_data"
       ACTIVE_EXCHANGES: "upbit,coinbase"
-      TARGET_COINS: "BTC,ETH"
+      TARGET_COINS: "ALL"
+      MAX_UNIVERSE_COINS: "25"
     depends_on:
       redis:
         condition: service_healthy
@@ -116,7 +117,8 @@ services:
       POSTGRES_DSN: "host=postgres user=magnolia_user password=magnolia_password dbname=magnolia_db port=5432 sslmode=disable"
       REDIS_URL: "redis://redis:6379/0"
       CHROME_CDP_URL: "http://browser_session:9222"
-      TARGET_COINS: "BTC,ETH"
+      TARGET_COINS: "ALL"
+      MAX_UNIVERSE_COINS: "25"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

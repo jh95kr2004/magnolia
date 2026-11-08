@@ -125,15 +125,16 @@ func main() {
 	}
 
 	var symbolsToMonitor []exchange.Symbol
-	if targetCoinsEnv != "" {
+	if strategy.IsAllCoinsFilter(targetCoinsEnv) {
+		symbolsToMonitor = []exchange.Symbol{"*"}
+	} else {
 		for _, tc := range strings.Split(targetCoinsEnv, ",") {
 			tc = strings.TrimSpace(strings.ToUpper(tc))
-			symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+upbitQuoteEnv))
-			symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+coinbaseQuoteEnv))
+			if tc != "" {
+				symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+upbitQuoteEnv))
+				symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+coinbaseQuoteEnv))
+			}
 		}
-	} else {
-		// Default fallback
-		symbolsToMonitor = []exchange.Symbol{"BTC-KRW", "BTC-USD"}
 	}
 
 	priceCh := make(chan exchange.PriceUpdate, 1000)

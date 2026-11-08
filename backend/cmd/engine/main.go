@@ -320,15 +320,17 @@ func runUserEngine(
 	}
 
 	var symbolsToMonitor []exchange.Symbol
-	if targetCoinsEnv != "" {
+	if strategy.IsAllCoinsFilter(targetCoinsEnv) {
+		// Wildcard subscription ("*") receives ticks for all overlapping altcoins and runtime new listings
+		symbolsToMonitor = []exchange.Symbol{"*"}
+	} else {
 		for _, tc := range strings.Split(targetCoinsEnv, ",") {
 			tc = strings.TrimSpace(strings.ToUpper(tc))
-			symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+upbitQuote))
-			symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+coinbaseQuote))
+			if tc != "" {
+				symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+upbitQuote))
+				symbolsToMonitor = append(symbolsToMonitor, exchange.Symbol(tc+"-"+coinbaseQuote))
+			}
 		}
-	} else {
-		// Default fallback
-		symbolsToMonitor = []exchange.Symbol{"BTC-KRW", "BTC-USD", "ETH-KRW", "ETH-USD"}
 	}
 
 	rawPriceCh := make(chan exchange.PriceUpdate, 1000)
