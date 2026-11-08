@@ -169,7 +169,9 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 					SupportedNetworks []struct {
 						ID                    string  `json:"id"`
 						Status                string  `json:"status"`
+						ContractAddress       string  `json:"contract_address"`
 						ProcessingTimeSeconds int     `json:"processing_time_seconds"`
+						MinConfirmations      int     `json:"min_confirmations"`
 						MinWithdrawalAmount   float64 `json:"min_withdrawal_amount"`
 					} `json:"supported_networks"`
 				}
@@ -180,6 +182,9 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 						feeFixed, estSec := DefaultNetworkSpec("COINBASE", cur)
 						depOK := item.Status == "online"
 						wdOK := item.Status == "online"
+						contractAddr := ""
+						minConf := 0
+						netID := string(cur)
 						if len(item.SupportedNetworks) > 0 {
 							net := item.SupportedNetworks[0]
 							if net.Status != "" {
@@ -189,15 +194,27 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 							if net.ProcessingTimeSeconds > 0 {
 								estSec = net.ProcessingTimeSeconds
 							}
+							if net.ContractAddress != "" {
+								contractAddr = strings.ToLower(strings.TrimSpace(net.ContractAddress))
+							}
+							if net.MinConfirmations > 0 {
+								minConf = net.MinConfirmations
+							}
+							if net.ID != "" {
+								netID = strings.ToUpper(net.ID)
+							}
 						}
 						newMap[cur] = NetworkInfo{
 							Network:          Network(cur),
-							ExchangeNetID:    string(cur),
+							ExchangeNetID:    netID,
 							IsDepositEnable:  depOK,
 							IsWithdrawEnable: wdOK,
 							WithdrawFeeFixed: feeFixed,
 							WithdrawFeeRate:  0.0,
 							EstimatedTime:    estSec,
+							ContractAddress:  contractAddr,
+							RequiresMemo:     IsMemoRequiredNetwork(Network(cur)) || IsMemoRequiredNetwork(Network(netID)),
+							MinConfirmations: minConf,
 						}
 					}
 					c.cacheMu.Lock()

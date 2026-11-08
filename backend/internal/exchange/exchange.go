@@ -106,6 +106,24 @@ type NetworkInfo struct {
 	WithdrawFeeFixed float64 // Fixed transfer fee magnitude (in coin units)
 	WithdrawFeeRate  float64 // Percentage-based transfer fee (if applicable, e.g. 0.001 for 0.1%)
 	EstimatedTime    int     // Estimated transfer time in seconds
+	ContractAddress  string  // Token smart contract address (or native identifier) to prevent same-ticker collision
+	RequiresMemo     bool    // True if network requires Destination Tag / Memo (e.g. Cosmos SDK chains, XRP, XLM)
+	MinConfirmations int     // Required block confirmations before deposit is credited
+}
+
+// IsMemoRequiredNetwork returns true for Cosmos SDK chains and tag-based networks where depositing
+// from a personal wallet into a CEX without a Memo/Destination Tag causes permanent deposit lockup.
+func IsMemoRequiredNetwork(net Network) bool {
+	n := strings.ToUpper(strings.TrimSpace(string(net)))
+	switch n {
+	case "SEI", "TIA", "CELESTIA", "OSMO", "OSMOSIS", "ATOM", "COSMOS", "INJ", "INJECTIVE",
+		"KAVA", "AKT", "AKASH", "ARCH", "ARCHWAY", "AXL", "AXELAR", "BLD", "AGORIC",
+		"XRP", "RIPPLE", "XLM", "STELLAR", "EOS", "HBAR", "HEDERA", "IOST", "XEM", "STX", "STACKS",
+		"TON", "CRO", "CRONOS", "LUNA", "LUNC", "TERRA", "STEEM", "HIVE", "WAXP", "MED":
+		return true
+	default:
+		return false
+	}
 }
 
 // EffectiveWithdrawFeeCoins returns the total withdrawal fee in coin units (fixed coin fee + percentage of coin amount).

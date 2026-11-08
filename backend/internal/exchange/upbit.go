@@ -136,6 +136,7 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 					IsWithdrawEnable: true,
 					WithdrawFeeFixed: feeFixed,
 					EstimatedTime:    estSec,
+					RequiresMemo:     IsMemoRequiredNetwork(Network(cur)),
 				})
 			}
 			return list, nil
@@ -149,6 +150,7 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 				IsWithdrawEnable: true,
 				WithdrawFeeFixed: feeFixed,
 				EstimatedTime:    estSec,
+				RequiresMemo:     IsMemoRequiredNetwork(Network(currency)),
 			},
 		}, nil
 	}
@@ -217,6 +219,7 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 			IsWithdrawEnable: withdrawEnabled,
 			WithdrawFeeFixed: feeFixed,
 			EstimatedTime:    estSec,
+			RequiresMemo:     IsMemoRequiredNetwork(Network(netID)) || IsMemoRequiredNetwork(Network(unifiedCur)),
 		})
 	}
 
