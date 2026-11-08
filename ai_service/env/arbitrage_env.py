@@ -281,16 +281,53 @@ class ArbitrageEnv(gym.Env):
         self.rebalance_max_premium = 0.0005
 
         if self.randomize_fees:
-            # Dynamic asymmetric fee generation to simulate any combination of exchanges
-            self.current_base_fee_rate = np.random.uniform(0.0000, 0.015)
-            self.current_foreign_fee_rate = np.random.uniform(0.0000, 0.015)
-            self.current_slippage = np.random.uniform(0.0, 0.002)
+            # Dynamic asymmetric fee generation to simulate realistic exchange fee tiers & fixed+rate structures
+            self.current_base_fee_rate = float(np.random.uniform(0.0002, 0.0025))
+            self.current_foreign_fee_rate = float(np.random.uniform(0.0005, 0.0065))
+            self.current_slippage = float(np.random.uniform(0.0002, 0.0015))
         else:
             self.current_base_fee_rate = self.base_fee_rate_default
             self.current_foreign_fee_rate = self.foreign_fee_rate_default
             self.current_slippage = float(self._col_slippage[self.current_step])
 
         return self._get_obs(), {}
+
+    @staticmethod
+    def compute_dynamic_transfer_spread(
+        nominal_spread: float,
+        real_spread: float,
+        min_pred: float,
+        max_pred: float,
+        sma_24h: float,
+        round_trip_fee: float,
+        foreign_share: float = 0.50,
+    ) -> float:
+        """
+        3-Stage AI Dynamic Shadow-Cost of Capital Model for Transfer Arbitrage (Strategy C),
+        synchronized with Go backend (`engine.go`) and `PortfolioRLAgent` (`rl_agent.py`).
+        """
+        tether_kimp = max(0.0, float(nominal_spread) - float(real_spread))
+        if tether_kimp <= 1e-6:
+            return float(nominal_spread)
+        if foreign_share <= 0.22:
+            return float(real_spread)
+
+        expected_low = min(float(min_pred), float(sma_24h))
+        if expected_low <= 0.0:
+            alpha_rebalance = 0.15
+        else:
+            alpha_rebalance = float(np.clip(expected_low / max(tether_kimp, 0.005), 0.25, 1.0))
+
+        predicted_wave = max(float(max_pred) - float(nominal_spread), float(nominal_spread) - float(min_pred))
+        alpha_opp = 0.40 if predicted_wave <= float(round_trip_fee) * 1.30 else 0.85
+
+        if foreign_share >= 0.45:
+            alpha_skew = 0.45
+        else:
+            alpha_skew = 0.45 + 0.55 * ((0.45 - float(foreign_share)) / (0.45 - 0.22))
+
+        alpha = float(np.clip(alpha_skew * min(alpha_rebalance, alpha_opp), 0.15, 1.0))
+        return float(nominal_spread) - (alpha * tether_kimp)
 
     def _get_obs(self):
         idx = self.current_step
@@ -408,6 +445,15 @@ class ArbitrageEnv(gym.Env):
         # 4. State Machine Transition Logic
         target_exposure = self.exposure
         round_trip_breakeven = (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage
+        eff_transfer_spread = self.compute_dynamic_transfer_spread(
+            nominal_spread=current_spread,
+            real_spread=real_spread,
+            min_pred=float(self._col_pred_min[idx]),
+            max_pred=float(self._col_pred_max[idx]),
+            sma_24h=float(self._col_sma_24h[idx]),
+            round_trip_fee=2.0 * (self.current_base_fee_rate + self.current_foreign_fee_rate) + self.current_slippage,
+            foreign_share=self.foreign_usd_skew,
+        )
 
         # Hard Safety Guardrail: DELISTING announcement blocks new entries and forces immediate exit
         if ev_delisting:
@@ -502,11 +548,11 @@ class ArbitrageEnv(gym.Env):
                 self.balance -= gas_fee
                 step_fees_paid += gas_fee
                 self.foreign_usd_skew = max(0.05, self.foreign_usd_skew - abs(target_exposure) * 0.15)
-            elif action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, wallet not suspended, real_spread >= 0.5%, and Foreign USD Skew >= 15%)
+            elif action_type == 1:  # TRANSFER (Only valid when Short Base / Long Foreign, wallet not suspended, eff_transfer_spread >= 0.5%, and Foreign USD Skew >= 15%)
                 if (
                     self.exposure < 0
                     and not ev_suspension
-                    and real_spread >= 0.005
+                    and eff_transfer_spread >= 0.005
                     and self.foreign_usd_skew >= self.balance_skew_threshold
                 ):
                     self.state = self.STATE_TRANSFERRING
@@ -603,7 +649,7 @@ class ArbitrageEnv(gym.Env):
                     # only allow Short Base entry when Forecaster explicitly predicts a strong downward reversion wave
                     predicted_jump = first_wave_dn if float(self._col_fw_edge[idx]) < -0.005 else 0.0
                 else:
-                    transfer_spread = max(0.0, real_spread)
+                    transfer_spread = max(0.0, eff_transfer_spread)
                     predicted_jump = max(convergence_jump, first_wave_dn, mean_reversion_down * 0.6, transfer_spread)
 
             fee_percentage_wall = optimal_round_trip_fee
