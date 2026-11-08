@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -30,12 +31,25 @@ const (
 	upbitWSURL   = "wss://api.upbit.com/websocket/v1"
 )
 
+type cachedUpbitFee struct {
+	info      TradeFeeInfo
+	expiresAt time.Time
+}
+
+type cachedUpbitWithdrawFee struct {
+	feeFixed  float64
+	expiresAt time.Time
+}
+
 type UpbitClient struct {
-	accessKey      string
-	secretKey      string
-	httpClient     *http.Client
-	wsConn         *websocket.Conn
-	lendingManager *WebLendingManager
+	accessKey        string
+	secretKey        string
+	httpClient       *http.Client
+	wsConn           *websocket.Conn
+	lendingManager   *WebLendingManager
+	feeCacheMu       sync.RWMutex
+	feeCache         map[Symbol]cachedUpbitFee
+	withdrawFeeCache map[Currency]cachedUpbitWithdrawFee
 }
 
 func NewUpbitClient(accessKey, secretKey string) *UpbitClient {
@@ -49,7 +63,9 @@ func NewUpbitClient(accessKey, secretKey string) *UpbitClient {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		lendingManager: NewWebLendingManager(NewUpbitLendingDriver(), cdpURL, 30*time.Second),
+		lendingManager:   NewWebLendingManager(NewUpbitLendingDriver(), cdpURL, 30*time.Second),
+		feeCache:         make(map[Symbol]cachedUpbitFee),
+		withdrawFeeCache: make(map[Currency]cachedUpbitWithdrawFee),
 	}
 }
 
@@ -109,16 +125,30 @@ func (u *UpbitClient) signPayload(query string) (string, error) {
 
 func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currency) ([]NetworkInfo, error) {
 	if u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy" {
-		net := currency
-		if net == "" {
-			net = "BTC"
+		if currency == "" {
+			var list []NetworkInfo
+			for _, cur := range []Currency{"BTC", "ETH", "XRP", "SOL", "TRX", "USDT", "USDC", "DOGE"} {
+				feeFixed, estSec := DefaultNetworkSpec("UPBIT", cur)
+				list = append(list, NetworkInfo{
+					Network:          Network(cur),
+					ExchangeNetID:    string(cur),
+					IsDepositEnable:  true,
+					IsWithdrawEnable: true,
+					WithdrawFeeFixed: feeFixed,
+					EstimatedTime:    estSec,
+				})
+			}
+			return list, nil
 		}
+		feeFixed, estSec := DefaultNetworkSpec("UPBIT", currency)
 		return []NetworkInfo{
 			{
-				Network:          Network(net),
-				ExchangeNetID:    string(net),
+				Network:          Network(currency),
+				ExchangeNetID:    string(currency),
 				IsDepositEnable:  true,
 				IsWithdrawEnable: true,
+				WithdrawFeeFixed: feeFixed,
+				EstimatedTime:    estSec,
 			},
 		}, nil
 	}
@@ -143,6 +173,7 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 
 	var parsed []struct {
 		Currency    string `json:"currency"`
+		NetType     string `json:"net_type"`
 		WalletState string `json:"wallet_state"` // working, withdraw_only, deposit_only, paused, unsupported
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
@@ -155,14 +186,37 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 		if currency != "" && p.Currency != toUpbitCurrency(currency) {
 			continue
 		}
+		unifiedCur := toUnifiedCurrencyFromUpbit(p.Currency)
 		depositEnabled := p.WalletState == "working" || p.WalletState == "deposit_only"
 		withdrawEnabled := p.WalletState == "working" || p.WalletState == "withdraw_only"
 
+		feeFixed, estSec := DefaultNetworkSpec("UPBIT", unifiedCur)
+		u.feeCacheMu.RLock()
+		cachedWF, hasWF := u.withdrawFeeCache[unifiedCur]
+		u.feeCacheMu.RUnlock()
+		if hasWF && time.Now().Before(cachedWF.expiresAt) {
+			feeFixed = cachedWF.feeFixed
+		} else if currency != "" && withdrawEnabled {
+			netID := p.NetType
+			if netID == "" {
+				netID = p.Currency
+			}
+			if lim, err := u.GetWithdrawalLimit(ctx, unifiedCur, Network(netID)); err == nil && lim.WithdrawFeeFixed > 0 {
+				feeFixed = lim.WithdrawFeeFixed
+			}
+		}
+
+		netID := p.NetType
+		if netID == "" {
+			netID = p.Currency
+		}
 		networks = append(networks, NetworkInfo{
-			Network:          Network(toUnifiedCurrencyFromUpbit(p.Currency)), // Upbit mainly uses standard DB naming mostly aligned to Currency
-			ExchangeNetID:    p.Currency,
+			Network:          Network(unifiedCur),
+			ExchangeNetID:    netID,
 			IsDepositEnable:  depositEnabled,
 			IsWithdrawEnable: withdrawEnabled,
+			WithdrawFeeFixed: feeFixed,
+			EstimatedTime:    estSec,
 		})
 	}
 
@@ -274,11 +328,88 @@ func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 }
 
 func (u *UpbitClient) GetTradingFee(ctx context.Context, symbol Symbol) (TradeFeeInfo, error) {
-	// Default Upbit KRW market fee is traditionally 0.05%
-	return TradeFeeInfo{
-		MakerFeeRate: 0.0005,
-		TakerFeeRate: 0.0005,
-	}, nil
+	defaultFee := TradeFeeInfo{
+		MakerFeeRate:  0.0005,
+		TakerFeeRate:  0.0005,
+		MakerFeeFixed: 0.0,
+		TakerFeeFixed: 0.0,
+	}
+	if symbol == "" {
+		symbol = "BTC-KRW"
+	}
+
+	u.feeCacheMu.RLock()
+	if cached, ok := u.feeCache[symbol]; ok && time.Now().Before(cached.expiresAt) {
+		u.feeCacheMu.RUnlock()
+		return cached.info, nil
+	}
+	u.feeCacheMu.RUnlock()
+
+	if u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy" {
+		return defaultFee, nil
+	}
+
+	upbitSym := toUpbitSymbol(symbol)
+	query := "market=" + upbitSym
+	token, err := u.signPayload(query)
+	if err != nil {
+		return defaultFee, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", upbitRESTURL+"/orders/chance?"+query, nil)
+	if err != nil {
+		return defaultFee, nil
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+
+	resp, err := u.httpClient.Do(req)
+	if err != nil {
+		return defaultFee, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		u.feeCacheMu.Lock()
+		u.feeCache[symbol] = cachedUpbitFee{info: defaultFee, expiresAt: time.Now().Add(1 * time.Minute)}
+		u.feeCacheMu.Unlock()
+		return defaultFee, nil
+	}
+
+	var parsed struct {
+		BidFee      string `json:"bid_fee"`
+		AskFee      string `json:"ask_fee"`
+		MakerBidFee string `json:"maker_bid_fee"`
+		MakerAskFee string `json:"maker_ask_fee"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return defaultFee, nil
+	}
+
+	takerFee, _ := strconv.ParseFloat(parsed.BidFee, 64)
+	if askF, err := strconv.ParseFloat(parsed.AskFee, 64); err == nil && askF > takerFee {
+		takerFee = askF
+	}
+	if takerFee <= 0 {
+		takerFee = 0.0005
+	}
+	makerFee, _ := strconv.ParseFloat(parsed.MakerBidFee, 64)
+	if makerAskF, err := strconv.ParseFloat(parsed.MakerAskFee, 64); err == nil && makerAskF > makerFee {
+		makerFee = makerAskF
+	}
+	if makerFee <= 0 {
+		makerFee = takerFee
+	}
+
+	res := TradeFeeInfo{
+		MakerFeeRate:  makerFee,
+		TakerFeeRate:  takerFee,
+		MakerFeeFixed: 0.0,
+		TakerFeeFixed: 0.0,
+	}
+	u.feeCacheMu.Lock()
+	u.feeCache[symbol] = cachedUpbitFee{info: res, expiresAt: time.Now().Add(10 * time.Minute)}
+	u.feeCacheMu.Unlock()
+	return res, nil
 }
 
 func (u *UpbitClient) GetTicker(ctx context.Context, symbol Symbol) (float64, error) {
@@ -709,7 +840,8 @@ func (u *UpbitClient) GetWithdrawalLimit(ctx context.Context, currency Currency,
 			SecurityLevel int `json:"security_level"`
 		} `json:"member_level"`
 		Currency struct {
-			Code string `json:"code"`
+			Code        string  `json:"code"`
+			WithdrawFee *string `json:"withdraw_fee"`
 		} `json:"currency"`
 		Account struct {
 			Currency string `json:"currency"`
@@ -737,13 +869,25 @@ func (u *UpbitClient) GetWithdrawalLimit(ctx context.Context, currency Currency,
 		return f
 	}
 
+	withdrawFeeFixed := parseF(parsed.Currency.WithdrawFee)
+	if withdrawFeeFixed > 0 {
+		u.feeCacheMu.Lock()
+		u.withdrawFeeCache[currency] = cachedUpbitWithdrawFee{
+			feeFixed:  withdrawFeeFixed,
+			expiresAt: time.Now().Add(10 * time.Minute),
+		}
+		u.feeCacheMu.Unlock()
+	}
+
 	return WithdrawalLimit{
-		Currency:       currency,
-		Network:        network,
-		MinWithdrawal:  parseF(parsed.WithdrawLimit.Minimum),
-		DailyLimit:     parseF(parsed.WithdrawLimit.Daily),
-		DailyRemaining: parseF(parsed.WithdrawLimit.Remaining),
-		MaxPerTx:       parseF(parsed.WithdrawLimit.Onetime),
+		Currency:         currency,
+		Network:          network,
+		MinWithdrawal:    parseF(parsed.WithdrawLimit.Minimum),
+		DailyLimit:       parseF(parsed.WithdrawLimit.Daily),
+		DailyRemaining:   parseF(parsed.WithdrawLimit.Remaining),
+		MaxPerTx:         parseF(parsed.WithdrawLimit.Onetime),
+		WithdrawFeeFixed: withdrawFeeFixed,
+		WithdrawFeeRate:  0.0,
 	}, nil
 }
 
