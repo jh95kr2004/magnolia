@@ -1096,6 +1096,83 @@ func (e *Engine) computePairFeeRates(ctx context.Context, pair *CrossMarketPair,
 	return
 }
 
+// getLiquidBalanceSkew returns the user's current total liquid USD, foreign exchange USD, and foreign USD share (0.0 ~ 1.0).
+func (e *Engine) getLiquidBalanceSkew(ctx context.Context) (totalLiquidUSD, foreignUSD, foreignShare float64) {
+	foreignShare = 0.50
+	for _, client := range e.clients {
+		exName := strings.ToUpper(client.GetName())
+		quoteCur := "USD"
+		if exName == "UPBIT" || exName == "BITHUMB" {
+			quoteCur = "KRW"
+		}
+		balances, err := client.GetBalances(ctx)
+		if err != nil {
+			continue
+		}
+		var availNative float64
+		for _, b := range balances {
+			if strings.EqualFold(string(b.Currency), quoteCur) {
+				availNative = b.Available
+				break
+			}
+		}
+		availUSD := availNative
+		if quoteCur == "KRW" {
+			fx := GetFXRate("KRW")
+			if fx > 0 {
+				availUSD = availNative / fx
+			}
+		}
+		totalLiquidUSD += availUSD
+		if quoteCur == "USD" {
+			foreignUSD += availUSD
+		}
+	}
+	if totalLiquidUSD > 0 {
+		foreignShare = foreignUSD / totalLiquidUSD
+	}
+	return
+}
+
+// computeEffectiveTransferSpread implements the 3-Stage AI Dynamic Shadow-Cost of Capital Model for Strategy C:
+// Instead of rigidly deducting 100% of the Tether Kimp (`tetherKimp`) in all market regimes, it dynamically discounts
+// the Tether Kimp penalty based on:
+//  1. Expected future low / reverse premium horizon (`alphaRebalance`)
+//  2. Opportunity cost vs two-sided Strategy A/B (`alphaOpp`)
+//  3. Current Foreign USD balance share (`alphaSkew`)
+func computeEffectiveTransferSpread(
+	nominalSpread, realSpread, minPredSpread, maxPredSpread, meanSpread, roundTripFee, foreignShare float64,
+) float64 {
+	tetherKimp := math.Max(0.0, nominalSpread-realSpread)
+	if tetherKimp <= 1e-6 {
+		return nominalSpread
+	}
+	if foreignShare <= 0.22 {
+		return realSpread
+	}
+
+	expectedLow := math.Min(minPredSpread, meanSpread)
+	var alphaRebalance float64
+	if expectedLow <= 0.0 {
+		alphaRebalance = 0.15
+	} else {
+		alphaRebalance = math.Max(0.25, math.Min(1.0, expectedLow/math.Max(tetherKimp, 0.005)))
+	}
+
+	predictedWave := math.Max(maxPredSpread-nominalSpread, nominalSpread-minPredSpread)
+	alphaOpp := 0.85
+	if predictedWave <= roundTripFee*1.30 {
+		alphaOpp = 0.40
+	}
+
+	alphaSkew := 0.45
+	if foreignShare < 0.45 {
+		alphaSkew = 0.45 + 0.55*((0.45-foreignShare)/(0.45-0.22))
+	}
+
+	alpha := math.Max(0.15, math.Min(1.0, alphaSkew*math.Min(alphaRebalance, alphaOpp)))
+	return nominalSpread - (alpha * tetherKimp)
+}
 
 // ListenOpportunities subscribes to AI inferred opportunities and triggers Portfolio Rebalancing.
 func (e *Engine) ListenOpportunities(ctx context.Context) {
@@ -1425,7 +1502,17 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								reversionNetROI := (entrySpread - entryPredictedSpread) - roundTripReversionFee
 								feeEstimate := oneWayTransferFee + networkWithdrawFeeRate
 
-								transferNetROI := realEntrySpread - feeEstimate
+								totalLiquidUSD, foreignUSD, foreignShare := e.getLiquidBalanceSkew(ctx)
+								effectiveTransferSpread := computeEffectiveTransferSpread(
+									entrySpread,
+									realEntrySpread,
+									opp.MinPremiumPct,
+									opp.MaxPremiumPct,
+									opp.MeanPremiumPct,
+									roundTripReversionFee,
+									foreignShare,
+								)
+								transferNetROI := effectiveTransferSpread - feeEstimate
 
 								stageAssassination := opp.ActionType == 3 ||
 									((activeEvType == "INVESTMENT_WARNING" || activeEvType == "WALLET_SUSPENSION" || activeEvType == "NEW_KRW_LISTING") &&
@@ -1450,6 +1537,18 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 								expectedBestNetROI := reversionNetROI
 								if selectedStrategy == StrategyForeignTransfer {
 									expectedBestNetROI = transferNetROI
+									// When executing a shadow-cost transfer (where pure Tether-adjusted real spread does not beat fees),
+									// cap order volume so Foreign USD share never drops below the 22% reserve floor.
+									if !stageAssassination && !preStageListing && (realEntrySpread-feeEstimate) <= 0.0005 && totalLiquidUSD > 0 {
+										reserveFloorShare := math.Max(0.22, e.config.RebalanceTriggerSkew+0.02)
+										maxExcessUSD := foreignUSD - (reserveFloorShare * totalLiquidUSD)
+										if maxExcessUSD < toleranceAmount {
+											continue
+										}
+										if targetDollarVolume > maxExcessUSD {
+											targetDollarVolume = maxExcessUSD
+										}
+									}
 								}
 								if !stageAssassination && !preStageListing && expectedBestNetROI <= 0.0005 {
 									// Strictly block opening a position (Strategy A/B/C/D/E) when expected return after real exchange fees is negative or sub-threshold
@@ -1669,10 +1768,20 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 							if targetPair.IsValidForTransfer {
 								fxKRW := GetFXRate("KRW")
 								tetherKRW := GetExchangeTetherRate(targetPair.BaseClient.GetName(), string(targetPair.BaseMarketInfo.QuoteCurrency))
-								roiTransfer := opp.PremiumPct
+								realTransfer := opp.PremiumPct
 								if fxKRW > 0 && tetherKRW > 0 {
-									roiTransfer = ((1.0 + opp.PremiumPct) * fxKRW / tetherKRW) - 1.0
+									realTransfer = ((1.0 + opp.PremiumPct) * fxKRW / tetherKRW) - 1.0
 								}
+								_, _, curForeignShare := e.getLiquidBalanceSkew(ctx)
+								roiTransfer := computeEffectiveTransferSpread(
+									opp.PremiumPct,
+									realTransfer,
+									opp.MinPremiumPct,
+									opp.MaxPremiumPct,
+									opp.MeanPremiumPct,
+									roundTripReversionFee,
+									curForeignShare,
+								)
 								
 								// Compute realistic risk based on block confirmation time and congestion
 								networkRisk := 20.0 // Default baseline for fast confirmation chains (ETH, etc.)
