@@ -205,8 +205,46 @@ func (p *PersonalFilter) EvaluateAndFilter(
 		vaspTier := GetVASPTier(p.baseExchange.GetName(), p.foreignExchange.GetName())
 		needsWalletProxy := (vaspTier == exchange.VASPTier3RiskAssessed) && (investmentUsd*liveFX >= 1000000.0)
 
+		baseFeeInfo, _ := p.baseExchange.GetTradingFee(ctx, pair.BaseMarketInfo.Symbol)
+		foreignFeeInfo, _ := p.foreignExchange.GetTradingFee(ctx, pair.ForeignMarketInfo.Symbol)
+		baseOrderQuote := investmentUsd
+		if baseQuote == "KRW" {
+			baseOrderQuote = investmentUsd * liveFX
+		}
+		foreignOrderQuote := investmentUsd
+		if foreignQuote == "KRW" {
+			foreignOrderQuote = investmentUsd * liveFX
+		}
+		effBaseFee := baseFeeInfo.EffectiveTakerFeeRate(baseOrderQuote)
+		effForeignFee := foreignFeeInfo.EffectiveTakerFeeRate(foreignOrderQuote)
+
+		transferFeeFixedUSD := raw.WithdrawFeeFixedUSD
+		if transferFeeFixedUSD <= 0 {
+			withdrawCoins := pair.ForeignNetwork.WithdrawFeeFixed
+			if withdrawCoins <= 0 {
+				withdrawCoins, _ = exchange.DefaultNetworkSpec(p.foreignExchange.GetName(), pair.BaseCurrency)
+			}
+			transferFeeFixedUSD = withdrawCoins * raw.ForeignPriceUSD
+		}
+		transferFeeRate := raw.WithdrawFeeRate
+		if transferFeeRate <= 0 {
+			transferFeeRate = pair.ForeignNetwork.WithdrawFeeRate
+		}
+		estTransferDur := 5 * time.Minute
+		if pair.ForeignNetwork.EstimatedTime > 0 {
+			estTransferDur = time.Duration(pair.ForeignNetwork.EstimatedTime) * time.Second
+		}
+
 		// Evaluation Parameters
 		params := PremiumEvalParams{
+			BaseSpotBuyFeeRate:         effBaseFee,
+			BaseSpotSellFeeRate:        effBaseFee,
+			BaseFutureBuyFeeRate:       effBaseFee,
+			BaseFutureSellFeeRate:      effBaseFee,
+			ForeignSpotBuyFeeRate:      effForeignFee,
+			ForeignSpotSellFeeRate:     effForeignFee,
+			ForeignFutureBuyFeeRate:    effForeignFee,
+			ForeignFutureSellFeeRate:   effForeignFee,
 			InvestmentUsd:              investmentUsd,
 			BaseBalanceUsd:             baseBalanceUsd,
 			ForeignBalanceUsd:          foreignBalanceUsd,
@@ -215,8 +253,9 @@ func (p *PersonalFilter) EvaluateAndFilter(
 			PredictionConfidence:       0.8,
 			AISignal:                   aiSignal,
 			AIWeight:                   aiWeight,
-			TransferFeeFixedUsd:        5.0,
-			EstTransferTime:            5 * time.Minute,
+			TransferFeeFixedUsd:        transferFeeFixedUSD,
+			TransferFeeRate:            transferFeeRate,
+			EstTransferTime:            estTransferDur,
 			NeedsWalletProxy:           needsWalletProxy,
 			WalletTransferFeeFixedUsd:  2.5,
 			WalletEstTransferTime:      3 * time.Minute,
