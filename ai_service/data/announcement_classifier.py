@@ -33,6 +33,7 @@ VALID_EVENT_TYPES = {
     "DELISTING",
     "WALLET_SUSPENSION",
     "VOLUME_SURGE",
+    "POSITIVE_NEWS_CATALYST",
     "NONE",
 }
 
@@ -313,6 +314,37 @@ class AnnouncementClassifier:
                 event_type = "WALLET_SUSPENSION"
                 confidence = 0.96
 
+        # --- Guardrail 5: POSITIVE_NEWS_CATALYST (Part 02 [09강] 호재 뉴스: 대규모 투자 유치, 바이백/소각, 메인넷/스테이블코인 런칭) ---
+        elif any(
+            kw in full_text
+            for kw in (
+                "투자 유치",
+                "시리즈 A",
+                "시리즈 B",
+                "전략적 투자",
+                "바이백",
+                "토큰 소각",
+                "대규모 소각",
+                "스테이블코인 출시",
+                "메인넷 출시",
+                "메인넷 런칭",
+                "스냅샷 안내",
+                "에어드랍 지원 안내",
+                "Raises $",
+                "Strategic Investment",
+                "Funding Round",
+                "Token Buyback",
+                "Token Burn",
+                "Mainnet Launch",
+                "Stablecoin Launch",
+            )
+        ) and not any(
+            ex_kw in title_clean
+            for ex_kw in ("당첨자 안내", "지급 완료", "종료 안내")
+        ):
+            event_type = "POSITIVE_NEWS_CATALYST"
+            confidence = 0.94
+
         scheduled_dt = self.extract_scheduled_time(full_text, announced_at, event_type)
         scheduled_iso = scheduled_dt.isoformat() if scheduled_dt else None
         scheduled_offset_min = (
@@ -321,7 +353,13 @@ class AnnouncementClassifier:
             else 0
         )
 
-        is_catalyst = event_type in ("NEW_KRW_LISTING", "INVESTMENT_WARNING", "WALLET_SUSPENSION", "VOLUME_SURGE")
+        is_catalyst = event_type in (
+            "NEW_KRW_LISTING",
+            "INVESTMENT_WARNING",
+            "WALLET_SUSPENSION",
+            "VOLUME_SURGE",
+            "POSITIVE_NEWS_CATALYST",
+        )
         sym_label = ", ".join(symbols) if symbols else "UNKNOWN"
 
         if event_type == "NEW_KRW_LISTING":
@@ -336,6 +374,9 @@ class AnnouncementClassifier:
         elif event_type == "WALLET_SUSPENSION":
             summary_ko = f"🔒 [{exchange} 입출금 중단 예고] {sym_label} 지갑 일시 중단(가두리) 예정 (+{scheduled_offset_min}분 뒤)"
             summary_en = f"🔒 [{exchange} Wallet Suspension] {sym_label} deposit/withdrawal pause in +{scheduled_offset_min}m"
+        elif event_type == "POSITIVE_NEWS_CATALYST":
+            summary_ko = f"🔥 [{exchange} 핵심 호재 포착] {sym_label} 펀더멘털 호재(투자유치/바이백/메인넷) — 펀딩비 및 프리미엄 하방 경직성 강화"
+            summary_en = f"🔥 [{exchange} Positive Catalyst] {sym_label} fundamental catalyst (Funding/Buyback/Mainnet) — Downside protection active"
         else:
             summary_ko = f"ℹ️ [{exchange} 일반 공지] {title_clean}"
             summary_en = f"ℹ️ [{exchange} General Notice] {title_clean}"

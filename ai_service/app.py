@@ -15,6 +15,7 @@ from model.predictor import predict_reversion, extract_trajectory_metrics
 from model.rl_agent import PortfolioRLAgent
 from data.influx_client import MarketDataFetcher
 from data.announcement_classifier import classify_announcement
+from data.news_ingestor import NewsIngestorDaemon
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AI_Daemon")
@@ -743,6 +744,8 @@ def run_daemon():
     ann_cache = AnnouncementCache(r)
     ann_cache.start_subscriber()
     start_announcement_http_server(ann_cache=ann_cache, port=int(os.getenv("AI_HTTP_PORT", "8000")))
+    news_ingestor = NewsIngestorDaemon(redis_client=r, on_event_callback=ann_cache.add_event)
+    news_ingestor.start()
     
     rl_agent = PortfolioRLAgent(model_path="model/weights/ppo_arbitrage_final.zip", device="cpu", n_stack=15)
     
@@ -909,6 +912,8 @@ def run_daemon():
                             ev_warn_sig = max(ev_warn_sig, float(np.exp(-age_m / 1440.0)))
                         elif etype == "DELISTING":
                             ev_delist_sig = max(ev_delist_sig, float(np.exp(-age_m / 2880.0)))
+                        elif etype == "POSITIVE_NEWS_CATALYST":
+                            ev_peer_sig = max(ev_peer_sig, float(np.exp(-age_m / 720.0)))
                     else:
                         decay_p = float(np.exp(-age_m / 1440.0))
                         ev_peer_sig = -max(abs(ev_peer_sig), decay_p) if etype == "DELISTING" else max(ev_peer_sig, decay_p)

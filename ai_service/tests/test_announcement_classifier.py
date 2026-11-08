@@ -138,6 +138,19 @@ GOLDEN_ANNOUNCEMENTS = [
         ["BTC"],
         False,
     ),
+    # 9. POSITIVE_NEWS_CATALYST (Part 02 [09강]: 투자 유치, 바이백/소각, 메인넷/스테이블코인 런칭)
+    (
+        "[뉴스] 레이어제로(ZRO) 5,000만 달러 시리즈 B 투자 유치 및 대규모 바이백 발표",
+        "POSITIVE_NEWS_CATALYST",
+        ["ZRO"],
+        True,
+    ),
+    (
+        "Ondo Finance (ONDO) Announces Strategic Investment and Mainnet Launch",
+        "POSITIVE_NEWS_CATALYST",
+        ["ONDO"],
+        True,
+    ),
 ]
 
 
