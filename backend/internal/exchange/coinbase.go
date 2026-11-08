@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -36,6 +37,11 @@ type CoinbaseClient struct {
 	httpClient           *http.Client
 	wsConn               *websocket.Conn
 	defaultWithdrawLimit float64 // Fallback withdrawal limit loaded from User DB Settings
+	cacheMu              sync.RWMutex
+	cachedFee            TradeFeeInfo
+	feeExpiresAt         time.Time
+	cachedNetworks       map[Currency]NetworkInfo
+	networksExpiresAt    time.Time
 }
 
 func NewCoinbaseClient(apiKeyName, privateKeyStr string, defaultWithdrawLimit float64) (*CoinbaseClient, error) {
@@ -67,6 +73,7 @@ func NewCoinbaseClient(apiKeyName, privateKeyStr string, defaultWithdrawLimit fl
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		cachedNetworks: make(map[Currency]NetworkInfo),
 	}, nil
 }
 
@@ -130,22 +137,114 @@ func (c *CoinbaseClient) generateJWT(requestMethod, requestHost, requestPath str
 }
 
 func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Currency) ([]NetworkInfo, error) {
-	// Coinbase Advanced Trade API v3 does not have a direct unauthenticated endpoint that clearly
-	// exposes network-by-network deposit/withdrawal pausing status like Upbit does.
-	// As a fallback safety measure for testing, we will assume standard networks are working.
-	// Production implementations could parse `/api/v3/brokerage/accounts` balances or hook into Coinbase Retail API.
-
-	// Create a mock active response for the requested currency to unblock the strategy engine
-	net := currency
-	if net == "" {
-		net = "BTC" // default fallback
+	c.cacheMu.RLock()
+	hasCache := len(c.cachedNetworks) > 0 && time.Now().Before(c.networksExpiresAt)
+	if hasCache {
+		if currency != "" {
+			if info, ok := c.cachedNetworks[currency]; ok {
+				c.cacheMu.RUnlock()
+				return []NetworkInfo{info}, nil
+			}
+		} else {
+			out := make([]NetworkInfo, 0, len(c.cachedNetworks))
+			for _, v := range c.cachedNetworks {
+				out = append(out, v)
+			}
+			c.cacheMu.RUnlock()
+			return out, nil
+		}
 	}
+	c.cacheMu.RUnlock()
+
+	// Query Coinbase Exchange public /currencies endpoint for live network status, processing time & withdrawal constraints
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.exchange.coinbase.com/currencies", nil)
+	if err == nil {
+		req.Header.Add("User-Agent", "magnolia-feed")
+		if resp, doErr := c.httpClient.Do(req); doErr == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				var cbCurrencies []struct {
+					ID                string `json:"id"`
+					Status            string `json:"status"`
+					SupportedNetworks []struct {
+						ID                    string  `json:"id"`
+						Status                string  `json:"status"`
+						ProcessingTimeSeconds int     `json:"processing_time_seconds"`
+						MinWithdrawalAmount   float64 `json:"min_withdrawal_amount"`
+					} `json:"supported_networks"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&cbCurrencies) == nil && len(cbCurrencies) > 0 {
+					newMap := make(map[Currency]NetworkInfo, len(cbCurrencies))
+					for _, item := range cbCurrencies {
+						cur := toUnifiedCurrencyFromCoinbase(item.ID)
+						feeFixed, estSec := DefaultNetworkSpec("COINBASE", cur)
+						depOK := item.Status == "online"
+						wdOK := item.Status == "online"
+						if len(item.SupportedNetworks) > 0 {
+							net := item.SupportedNetworks[0]
+							if net.Status != "" {
+								depOK = net.Status == "online"
+								wdOK = net.Status == "online"
+							}
+							if net.ProcessingTimeSeconds > 0 {
+								estSec = net.ProcessingTimeSeconds
+							}
+						}
+						newMap[cur] = NetworkInfo{
+							Network:          Network(cur),
+							ExchangeNetID:    string(cur),
+							IsDepositEnable:  depOK,
+							IsWithdrawEnable: wdOK,
+							WithdrawFeeFixed: feeFixed,
+							WithdrawFeeRate:  0.0,
+							EstimatedTime:    estSec,
+						}
+					}
+					c.cacheMu.Lock()
+					c.cachedNetworks = newMap
+					c.networksExpiresAt = time.Now().Add(10 * time.Minute)
+					c.cacheMu.Unlock()
+
+					if currency != "" {
+						if info, ok := newMap[currency]; ok {
+							return []NetworkInfo{info}, nil
+						}
+					} else {
+						out := make([]NetworkInfo, 0, len(newMap))
+						for _, v := range newMap {
+							out = append(out, v)
+						}
+						return out, nil
+					}
+				}
+			}
+		}
+	}
+
+	if currency == "" {
+		var list []NetworkInfo
+		for _, cur := range []Currency{"BTC", "ETH", "XRP", "SOL", "TRX", "USDT", "USDC", "DOGE"} {
+			feeFixed, estSec := DefaultNetworkSpec("COINBASE", cur)
+			list = append(list, NetworkInfo{
+				Network:          Network(cur),
+				ExchangeNetID:    string(cur),
+				IsDepositEnable:  true,
+				IsWithdrawEnable: true,
+				WithdrawFeeFixed: feeFixed,
+				EstimatedTime:    estSec,
+			})
+		}
+		return list, nil
+	}
+	feeFixed, estSec := DefaultNetworkSpec("COINBASE", currency)
 	return []NetworkInfo{
 		{
-			Network:          Network(net),
-			ExchangeNetID:    string(net),
+			Network:          Network(currency),
+			ExchangeNetID:    string(currency),
 			IsDepositEnable:  true,
 			IsWithdrawEnable: true,
+			WithdrawFeeFixed: feeFixed,
+			EstimatedTime:    estSec,
 		},
 	}, nil
 }
@@ -296,11 +395,82 @@ func (c *CoinbaseClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 }
 
 func (c *CoinbaseClient) GetTradingFee(ctx context.Context, symbol Symbol) (TradeFeeInfo, error) {
-	// Base Coinbase advanced trade fee
-	return TradeFeeInfo{
-		MakerFeeRate: 0.0040,
-		TakerFeeRate: 0.0060,
-	}, nil
+	defaultFee := TradeFeeInfo{
+		MakerFeeRate:  0.0040,
+		TakerFeeRate:  0.0060,
+		MakerFeeFixed: 0.0,
+		TakerFeeFixed: 0.0,
+	}
+
+	c.cacheMu.RLock()
+	if time.Now().Before(c.feeExpiresAt) && (c.cachedFee.TakerFeeRate > 0 || c.cachedFee.MakerFeeRate > 0) {
+		fee := c.cachedFee
+		c.cacheMu.RUnlock()
+		return fee, nil
+	}
+	c.cacheMu.RUnlock()
+
+	if c.apiName == "" || c.apiName == "public" || c.apiName == "dummy" {
+		return defaultFee, nil
+	}
+
+	reqPath := "/api/v3/brokerage/transaction_summary"
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.coinbase.com"+reqPath, nil)
+	if err != nil {
+		return defaultFee, nil
+	}
+	token, err := c.generateJWT("GET", "api.coinbase.com", reqPath)
+	if err != nil {
+		return defaultFee, nil
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return defaultFee, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		c.cacheMu.Lock()
+		c.cachedFee = defaultFee
+		c.feeExpiresAt = time.Now().Add(1 * time.Minute)
+		c.cacheMu.Unlock()
+		return defaultFee, nil
+	}
+
+	var parsed struct {
+		FeeTier struct {
+			PricingTier  string `json:"pricing_tier"`
+			MakerFeeRate string `json:"maker_fee_rate"`
+			TakerFeeRate string `json:"taker_fee_rate"`
+		} `json:"fee_tier"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return defaultFee, nil
+	}
+
+	makerRate, _ := strconv.ParseFloat(parsed.FeeTier.MakerFeeRate, 64)
+	takerRate, _ := strconv.ParseFloat(parsed.FeeTier.TakerFeeRate, 64)
+	if takerRate <= 0 {
+		takerRate = defaultFee.TakerFeeRate
+	}
+	if makerRate <= 0 {
+		makerRate = defaultFee.MakerFeeRate
+	}
+
+	res := TradeFeeInfo{
+		MakerFeeRate:  makerRate,
+		TakerFeeRate:  takerRate,
+		MakerFeeFixed: 0.0,
+		TakerFeeFixed: 0.0,
+	}
+	c.cacheMu.Lock()
+	c.cachedFee = res
+	c.feeExpiresAt = time.Now().Add(10 * time.Minute)
+	c.cacheMu.Unlock()
+	return res, nil
 }
 
 func (c *CoinbaseClient) GetTicker(ctx context.Context, symbol Symbol) (float64, error) {
