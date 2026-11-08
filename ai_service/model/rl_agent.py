@@ -211,7 +211,64 @@ class PortfolioRLAgent:
 
         return upgraded.reshape(arr.shape[0], expected_len)
 
-    def predict(self, stacked_obs: np.ndarray, use_forecaster: bool = True) -> tuple:
+    @staticmethod
+    def compute_dynamic_transfer_spread(
+        nominal_spread: float,
+        real_spread: float,
+        min_pred: float,
+        max_pred: float,
+        sma_24h: float,
+        round_trip_fee: float,
+        foreign_share: float = 0.50,
+    ) -> float:
+        """
+        3-Stage AI Dynamic Shadow-Cost of Capital Model for Transfer Arbitrage (Strategy C):
+        Computes effective transfer spread by discounting the Tether Kimp penalty (`tether_kimp`)
+        based on:
+          1. Expected future low / reverse premium horizon (`alpha_rebalance`)
+          2. Opportunity cost vs two-sided Strategy A/B (`alpha_opp`)
+          3. Current Foreign USD balance share (`alpha_skew`)
+        """
+        tether_kimp = max(0.0, float(nominal_spread) - float(real_spread))
+        if tether_kimp <= 1e-6:
+            return float(nominal_spread)
+
+        # If Foreign USD share is at or below the 22% reserve floor, require full Tether-adjusted real spread
+        if foreign_share <= 0.22:
+            return float(real_spread)
+
+        # 1. Rebalance Horizon Factor: will Kimp drop toward 0% (or below current Tether Kimp) later?
+        expected_low = min(float(min_pred), float(sma_24h))
+        if expected_low <= 0.0:
+            alpha_rebalance = 0.15
+        else:
+            alpha_rebalance = float(np.clip(expected_low / max(tether_kimp, 0.005), 0.25, 1.0))
+
+        # 2. Alternative Strategy (A/B) Opportunity Cost Factor:
+        # If predicted wave is smaller than round-trip fees, Strategy A/B would sit idle anyway.
+        predicted_wave = max(float(max_pred) - float(nominal_spread), float(nominal_spread) - float(min_pred))
+        if predicted_wave <= float(round_trip_fee) * 1.30:
+            alpha_opp = 0.40
+        else:
+            alpha_opp = 0.85
+
+        # 3. Foreign USD Capital Skew Factor:
+        if foreign_share >= 0.45:
+            alpha_skew = 0.45
+        else:
+            alpha_skew = 0.45 + 0.55 * ((0.45 - float(foreign_share)) / (0.45 - 0.22))
+
+        alpha = float(np.clip(alpha_skew * min(alpha_rebalance, alpha_opp), 0.15, 1.0))
+        return float(nominal_spread) - (alpha * tether_kimp)
+
+    def predict(
+        self,
+        stacked_obs: np.ndarray,
+        use_forecaster: bool = True,
+        real_spread: float = None,
+        withdraw_fee_rate: float = 0.0,
+        foreign_share: float = 0.50,
+    ) -> tuple:
         """
         Takes the stacked environment observation `(1, 506 * n_stack)` and returns:
             action_score (float): 0.0 ~ 10.0 (<5.0 = Base Short / Foreign Long [Narrowing/Transfer],
@@ -255,7 +312,23 @@ class PortfolioRLAgent:
             mean_pred - spread,
             max(0.0, first_wave_edge),
         )
-        transfer_edge = spread if spread >= 0.0060 else 0.0
+        eff_real_spread = float(real_spread) if real_spread is not None else spread
+        round_trip_fee = 2.0 * (base_fee + foreign_fee) + eff_slippage
+        eff_transfer_spread = self.compute_dynamic_transfer_spread(
+            nominal_spread=spread,
+            real_spread=eff_real_spread,
+            min_pred=min_pred,
+            max_pred=max_pred,
+            sma_24h=sma_24h,
+            round_trip_fee=round_trip_fee,
+            foreign_share=foreign_share,
+        )
+        transfer_cost = base_fee + foreign_fee + float(withdraw_fee_rate) + eff_slippage
+        transfer_edge = (
+            eff_transfer_spread
+            if eff_transfer_spread >= max(0.0060, transfer_cost * 1.30)
+            else 0.0
+        )
         narrow_edge = max(
             spread - min_pred,
             spread - mean_pred,
