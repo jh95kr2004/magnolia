@@ -19,10 +19,18 @@ export const Settings = () => {
   const [activeTab, setActiveTab] = useState(initialTab);
   const [saving, setSaving] = useState(false);
 
-  // 1. Exchange Keys & noVNC
+  // 1. Exchange Keys & noVNC & On-Chain Personal Wallet
   const [registeredKeys, setRegisteredKeys] = useState([]);
   const [supportedExchanges, setSupportedExchanges] = useState(['UPBIT', 'COINBASE']);
   const [apiKeys, setApiKeys] = useState({ exchange: 'UPBIT', access_key: '', secret_key: '' });
+  const [onchainWallet, setOnchainWallet] = useState({
+    evmAddress: '',
+    evmPrivateKey: '',
+    solanaAddress: '',
+    solanaPrivateKey: '',
+    hasEvmPrivateKey: false,
+    hasSolanaPrivateKey: false
+  });
   const [showNoVNCModal, setShowNoVNCModal] = useState(searchParams.get('openNoVNC') === '1');
   const [noVNCUrl, setNoVNCUrl] = useState(() => {
     if (
@@ -71,16 +79,26 @@ export const Settings = () => {
 
   const loadSettingsData = async () => {
     try {
-      const [keysRes, paramsRes, profileRes, exRes] = await Promise.all([
+      const [keysRes, paramsRes, profileRes, exRes, walletRes] = await Promise.all([
         apiClient.get('/settings/exchange').catch(() => ({ data: [] })),
         apiClient.get('/settings/parameters').catch(() => ({ data: null })),
         apiClient.get('/settings/profile').catch(() => ({ data: null })),
-        apiClient.get('/settings/supported_exchanges').catch(() => ({ data: ['UPBIT', 'COINBASE'] }))
+        apiClient.get('/settings/supported_exchanges').catch(() => ({ data: ['UPBIT', 'COINBASE'] })),
+        apiClient.get('/settings/wallet').catch(() => ({ data: null }))
       ]);
 
       if (Array.isArray(keysRes.data)) setRegisteredKeys(keysRes.data);
       if (Array.isArray(exRes.data) && exRes.data.length > 0) {
         setSupportedExchanges(exRes.data);
+      }
+      if (walletRes.data) {
+        setOnchainWallet((prev) => ({
+          ...prev,
+          evmAddress: walletRes.data.evm_wallet_address || '',
+          solanaAddress: walletRes.data.solana_wallet_address || '',
+          hasEvmPrivateKey: Boolean(walletRes.data.has_evm_private_key),
+          hasSolanaPrivateKey: Boolean(walletRes.data.has_solana_private_key)
+        }));
       }
       if (paramsRes.data) {
         const d = paramsRes.data;
@@ -207,6 +225,68 @@ export const Settings = () => {
         }
       }
     });
+  };
+
+  const handleGenerateOnchainWallet = async () => {
+    setSaving(true);
+    try {
+      const res = await apiClient.post('/settings/wallet', { action: 'GENERATE' });
+      if (res.data) {
+        setOnchainWallet({
+          evmAddress: res.data.evm_wallet_address || '',
+          evmPrivateKey: '',
+          solanaAddress: res.data.solana_wallet_address || '',
+          solanaPrivateKey: '',
+          hasEvmPrivateKey: Boolean(res.data.has_evm_private_key),
+          hasSolanaPrivateKey: Boolean(res.data.has_solana_private_key)
+        });
+      }
+      showToast(
+        lang === 'ko'
+          ? '온체인 개인지갑(EVM & Solana)이 자동 생성 및 AES-GCM 암호화 저장되었습니다.'
+          : 'On-chain personal wallet generated and encrypted.',
+        'success'
+      );
+    } catch (err) {
+      showToast(err.response?.data?.error || err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSaveOnchainWallet = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      const res = await apiClient.post('/settings/wallet', {
+        action: 'IMPORT',
+        evm_address: onchainWallet.evmAddress,
+        evm_private_key: onchainWallet.evmPrivateKey,
+        solana_address: onchainWallet.solanaAddress,
+        solana_private_key: onchainWallet.solanaPrivateKey
+      });
+      if (res.data) {
+        setOnchainWallet((prev) => ({
+          ...prev,
+          evmAddress: res.data.evm_wallet_address || prev.evmAddress,
+          evmPrivateKey: '',
+          solanaAddress: res.data.solana_wallet_address || prev.solanaAddress,
+          solanaPrivateKey: '',
+          hasEvmPrivateKey: Boolean(res.data.has_evm_private_key),
+          hasSolanaPrivateKey: Boolean(res.data.has_solana_private_key)
+        }));
+      }
+      showToast(
+        lang === 'ko'
+          ? '온체인 개인지갑 정보가 저장되었습니다.'
+          : 'On-chain personal wallet saved.',
+        'success'
+      );
+    } catch (err) {
+      showToast(err.response?.data?.error || err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleSaveParams = async (e) => {
@@ -527,6 +607,100 @@ export const Settings = () => {
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button type="submit" disabled={saving} className="btn btn-primary">
                 {t.settings.saveKeyBtn}
+              </button>
+            </div>
+          </form>
+
+          {/* On-Chain Personal Wallet (Travel Rule 2-Hop Relay & Permissionless DeFi Lending) */}
+          <form className="form-panel" onSubmit={handleSaveOnchainWallet}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px' }}>
+              <div>
+                <h3 className="section-title">
+                  {lang === 'ko'
+                    ? '온체인 개인지갑 (트래블룰 2-Hop 경유 & DeFi 무가입 자동 대여)'
+                    : 'On-Chain Personal Wallet (Travel Rule 2-Hop & DeFi Lending)'}
+                </h3>
+                <p className="section-desc" style={{ marginTop: '4px' }}>
+                  {lang === 'ko'
+                    ? '업비트 트래블룰 미연동 거래소(코인베이스 등) 2-Hop 경유 및 Aave V3 / Venus / Morpho / Kamino 온체인 코인 대여에 사용됩니다. (모의매매 모드는 입력 없이 가상 지갑이 자동 작동합니다)'
+                    : 'Used for 2-Hop Travel Rule relay and permissionless DeFi lending (Aave V3, Venus, Morpho, Kamino) without any DEX sign-up. (Paper mode uses a virtual wallet automatically)'}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={saving}
+                className="btn btn-sm btn-ghost"
+                onClick={handleGenerateOnchainWallet}
+              >
+                {lang === 'ko' ? '⚡ 원클릭 새 온체인 지갑 자동 생성' : '⚡ 1-Click Generate New Wallet'}
+              </button>
+            </div>
+
+            <div className="form-grid-2">
+              <div className="field-group">
+                <label className="field-label">
+                  {lang === 'ko'
+                    ? 'EVM 통합 지갑 주소 (Ethereum / Arbitrum / Base / BSC / Polygon 공통)'
+                    : 'EVM Wallet Address (ETH / ARB / BASE / BSC / POLYGON)'}
+                </label>
+                <input
+                  type="text"
+                  value={onchainWallet.evmAddress}
+                  onChange={(e) => setOnchainWallet({ ...onchainWallet, evmAddress: e.target.value })}
+                  placeholder="0x..."
+                  className="input mono"
+                />
+              </div>
+
+              <div className="field-group">
+                <label className="field-label">
+                  {lang === 'ko'
+                    ? `EVM 서명용 개인키 (선택 · AES-GCM 암호화 보관${onchainWallet.hasEvmPrivateKey ? ' · 등록됨' : ''})`
+                    : `EVM Private Key (Optional · Encrypted${onchainWallet.hasEvmPrivateKey ? ' · Saved' : ''})`}
+                </label>
+                <input
+                  type="password"
+                  value={onchainWallet.evmPrivateKey}
+                  onChange={(e) => setOnchainWallet({ ...onchainWallet, evmPrivateKey: e.target.value })}
+                  placeholder={onchainWallet.hasEvmPrivateKey ? '••••••••••••••••••••••••••••••••' : '0x... (DeFi 대여/출금 자동 서명용)'}
+                  className="input mono"
+                />
+              </div>
+
+              <div className="field-group">
+                <label className="field-label">
+                  {lang === 'ko'
+                    ? 'Solana 지갑 주소 (SPL 전송 & Kamino DeFi 대여용)'
+                    : 'Solana Wallet Address (SPL & Kamino DeFi)'}
+                </label>
+                <input
+                  type="text"
+                  value={onchainWallet.solanaAddress}
+                  onChange={(e) => setOnchainWallet({ ...onchainWallet, solanaAddress: e.target.value })}
+                  placeholder="Solana Base58 Address"
+                  className="input mono"
+                />
+              </div>
+
+              <div className="field-group">
+                <label className="field-label">
+                  {lang === 'ko'
+                    ? `Solana 서명용 개인키 (선택 · AES-GCM 암호화 보관${onchainWallet.hasSolanaPrivateKey ? ' · 등록됨' : ''})`
+                    : `Solana Private Key (Optional · Encrypted${onchainWallet.hasSolanaPrivateKey ? ' · Saved' : ''})`}
+                </label>
+                <input
+                  type="password"
+                  value={onchainWallet.solanaPrivateKey}
+                  onChange={(e) => setOnchainWallet({ ...onchainWallet, solanaPrivateKey: e.target.value })}
+                  placeholder={onchainWallet.hasSolanaPrivateKey ? '••••••••••••••••••••••••••••••••' : 'Solana Private Key'}
+                  className="input mono"
+                />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button type="submit" disabled={saving} className="btn btn-primary">
+                {lang === 'ko' ? '온체인 개인지갑 저장' : 'Save On-Chain Wallet'}
               </button>
             </div>
           </form>

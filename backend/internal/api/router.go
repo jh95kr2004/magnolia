@@ -45,6 +45,7 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/settings/sim_offset", s.AuthMiddleware(s.handleSimOffset))                  // POST, GET
 	mux.HandleFunc("/api/settings/sim_event", s.AuthMiddleware(s.handleSimEvent))                    // POST, GET
 	mux.HandleFunc("/api/settings/paper_reset", s.AuthMiddleware(s.handlePaperReset))                // POST
+	mux.HandleFunc("/api/settings/wallet", s.AuthMiddleware(s.handleOnchainWallet))                  // POST, GET
 
 	// 3. Trading, Positions & Portfolio Routes (Protected)
 	mux.HandleFunc("/api/positions/active", s.AuthMiddleware(s.handleActivePositions))        // GET

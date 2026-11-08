@@ -11,6 +11,7 @@ import (
 	"github.com/magnolia/backend/internal/db/postgres"
 	"github.com/magnolia/backend/internal/exchange"
 	"github.com/magnolia/backend/internal/strategy"
+	"github.com/magnolia/backend/internal/wallet"
 )
 
 // handleExchangeKeySubmit validates and saves the user API keys
@@ -247,6 +248,14 @@ func (s *Server) handleSettingsProfile(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.PaperBalancesJSON == "" {
 				req.PaperBalancesJSON = existing.PaperBalancesJSON
+			}
+			if req.EVMWalletAddress == "" {
+				req.EVMWalletAddress = existing.EVMWalletAddress
+				req.EVMPrivateKeyEnc = existing.EVMPrivateKeyEnc
+			}
+			if req.SolanaWalletAddress == "" {
+				req.SolanaWalletAddress = existing.SolanaWalletAddress
+				req.SolanaPrivateKeyEnc = existing.SolanaPrivateKeyEnc
 			}
 			if req.SimExchange == "" {
 				req.SimExchange = existing.SimExchange
@@ -928,5 +937,131 @@ func (s *Server) handleSimEvent(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"message": "Simulated announcement event dispatched",
 		"event":   annEvent,
+	})
+}
+
+// handleOnchainWallet manages the user's personal on-chain wallet (EVM 0x... and Solana) used for:
+// 1. Travel Rule 2-Hop Relay (e.g. Coinbase -> Personal Wallet -> Upbit)
+// 2. Permissionless On-Chain DeFi Lending (Aave V3, Venus, Morpho, Kamino) & Bridges without any DEX account sign-up.
+func (s *Server) handleOnchainWallet(w http.ResponseWriter, r *http.Request) {
+	userID := getUserIDFromContext(r)
+	settings, _ := s.DB.GetUserSettings(userID)
+	if settings == nil {
+		settings = &postgres.UserSettings{
+			UserID:           userID,
+			ActiveViewMode:   "PAPER",
+			PaperBotStatus:   "RUNNING",
+			LiveBotStatus:    "STOPPED",
+			PaperUpbitKRW:    50000000.0,
+			PaperCoinbaseUSD: 35000.0,
+		}
+	}
+
+	if r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"evm_wallet_address":      settings.EVMWalletAddress,
+			"solana_wallet_address":   settings.SolanaWalletAddress,
+			"has_evm_private_key":     len(settings.EVMPrivateKeyEnc) > 0,
+			"has_solana_private_key":  len(settings.SolanaPrivateKeyEnc) > 0,
+			"paper_virtual_wallet_ok": true,
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Action           string `json:"action"` // "GENERATE" or "IMPORT"
+		EVMAddress       string `json:"evm_address"`
+		EVMPrivateKey    string `json:"evm_private_key"`
+		SolanaAddress    string `json:"solana_address"`
+		SolanaPrivateKey string `json:"solana_private_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	action := strings.ToUpper(strings.TrimSpace(req.Action))
+	if action == "GENERATE" {
+		gen, err := wallet.GenerateOnchainWalletKeypair()
+		if err != nil {
+			http.Error(w, `{"error": "Failed to generate on-chain wallet keypair"}`, http.StatusInternalServerError)
+			return
+		}
+		evmEnc, err := postgres.Encrypt([]byte(gen.EVMPrivateKeyHex))
+		if err != nil {
+			http.Error(w, `{"error": "Failed to encrypt EVM private key"}`, http.StatusInternalServerError)
+			return
+		}
+		solEnc, err := postgres.Encrypt([]byte(gen.SolanaPrivKeyHex))
+		if err != nil {
+			http.Error(w, `{"error": "Failed to encrypt Solana private key"}`, http.StatusInternalServerError)
+			return
+		}
+
+		settings.EVMWalletAddress = gen.EVMAddress
+		settings.EVMPrivateKeyEnc = string(evmEnc)
+		settings.SolanaWalletAddress = gen.SolanaAddress
+		settings.SolanaPrivateKeyEnc = string(solEnc)
+		_ = s.DB.SaveUserSettings(settings)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"message":                "On-chain personal wallet generated and encrypted",
+			"evm_wallet_address":     settings.EVMWalletAddress,
+			"solana_wallet_address":  settings.SolanaWalletAddress,
+			"has_evm_private_key":    true,
+			"has_solana_private_key": true,
+		})
+		return
+	}
+
+	// Default: IMPORT existing personal wallet
+	evmAddr := strings.TrimSpace(req.EVMAddress)
+	solAddr := strings.TrimSpace(req.SolanaAddress)
+	if evmAddr == "" && solAddr == "" {
+		http.Error(w, `{"error": "At least one wallet address (EVM or Solana) is required"}`, http.StatusBadRequest)
+		return
+	}
+	if evmAddr != "" && !wallet.ValidateOnchainAddress("EVM", evmAddr) {
+		http.Error(w, `{"error": "Invalid EVM wallet address format (must be 0x followed by 40 hex chars)"}`, http.StatusBadRequest)
+		return
+	}
+	if solAddr != "" && !wallet.ValidateOnchainAddress("SOLANA", solAddr) {
+		http.Error(w, `{"error": "Invalid Solana wallet address format"}`, http.StatusBadRequest)
+		return
+	}
+
+	if evmAddr != "" {
+		settings.EVMWalletAddress = evmAddr
+	}
+	if strings.TrimSpace(req.EVMPrivateKey) != "" {
+		if enc, err := postgres.Encrypt([]byte(strings.TrimSpace(req.EVMPrivateKey))); err == nil {
+			settings.EVMPrivateKeyEnc = string(enc)
+		}
+	}
+	if solAddr != "" {
+		settings.SolanaWalletAddress = solAddr
+	}
+	if strings.TrimSpace(req.SolanaPrivateKey) != "" {
+		if enc, err := postgres.Encrypt([]byte(strings.TrimSpace(req.SolanaPrivateKey))); err == nil {
+			settings.SolanaPrivateKeyEnc = string(enc)
+		}
+	}
+
+	_ = s.DB.SaveUserSettings(settings)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":                "On-chain personal wallet saved",
+		"evm_wallet_address":     settings.EVMWalletAddress,
+		"solana_wallet_address":  settings.SolanaWalletAddress,
+		"has_evm_private_key":    len(settings.EVMPrivateKeyEnc) > 0,
+		"has_solana_private_key": len(settings.SolanaPrivateKeyEnc) > 0,
 	})
 }

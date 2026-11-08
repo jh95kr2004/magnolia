@@ -61,6 +61,10 @@ type UserSettings struct {
 	SimTargetOffsetPct        float64   `gorm:"default:0"`            // Target offset (%) to reach after SimRampMinutes
 	SimRampMinutes            float64   `gorm:"default:0"`            // Duration in minutes to ramp from start to target offset
 	SimStartedAt              int64     `gorm:"default:0"`            // Unix timestamp (seconds) when ramp was started
+	EVMWalletAddress          string    `json:"evm_wallet_address"`   // Personal EVM wallet (0x... for ETH/ARB/BASE/BSC/POLYGON Travel Rule & DeFi)
+	EVMPrivateKeyEnc          string    `gorm:"type:bytea" json:"-"`  // Encrypted AES-GCM EVM private key
+	SolanaWalletAddress       string    `json:"solana_wallet_address"`// Personal Solana wallet for SPL Travel Rule & Kamino DeFi
+	SolanaPrivateKeyEnc       string    `gorm:"type:bytea" json:"-"`  // Encrypted AES-GCM Solana private key
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
 }
