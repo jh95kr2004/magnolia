@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,14 +85,24 @@ func GetAllExchangeTetherRatesSnapshot() map[string]float64 {
 }
 
 // GetVASPTier returns the Korean Travel Rule VASP classification for transfers between baseExchange and foreignExchange.
+// Upbit vs Bithumb asymmetry (Part 02 [14강]):
+// - Upbit classifies Coinbase/Kraken as Tier 3 ("위험평가 통과 해외 VASP"), blocking direct deposits >= 1M KRW and requiring a 2-hop personal wallet relay.
+// - Bithumb supports direct 1-hop Travel Rule interoperability (Tier 2) with Coinbase and Kraken once the user's exchange address is whitelisted.
 func GetVASPTier(baseExchange, foreignExchange string) exchange.VASPTier {
-	switch foreignExchange {
+	baseEx := strings.ToUpper(strings.TrimSpace(baseExchange))
+	forEx := strings.ToUpper(strings.TrimSpace(foreignExchange))
+
+	switch forEx {
 	case "BITHUMB", "COINONE", "KORBIT", "GOPAX", "UPBIT":
 		return exchange.VASPTier1Solution
-	case "BINANCE", "BYBIT", "OKX", "GATEIO", "BITGET", "HTX":
+	case "BINANCE", "BYBIT", "OKX", "GATEIO", "BITGET", "HTX", "MEXC", "KUCOIN", "BINGX":
 		return exchange.VASPTier2OwnerLinked
+	case "COINBASE", "KRAKEN", "BITSTAMP":
+		if baseEx == "BITHUMB" {
+			return exchange.VASPTier2OwnerLinked
+		}
+		return exchange.VASPTier3RiskAssessed
 	default:
-		// COINBASE, KRAKEN, etc. are classified as "위험평가 통과 해외 VASP" on Upbit
 		return exchange.VASPTier3RiskAssessed
 	}
 }
