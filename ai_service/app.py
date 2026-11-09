@@ -42,6 +42,14 @@ class FXCache:
         self.fx_rates = {"KRW": 1400.0}
         self.tether_rates = {"UPBIT:KRW": 1400.0, "BITHUMB:KRW": 1400.0}
         self.lock = threading.Lock()
+        try:
+            cached_fx = self.r.get("fx:USD-KRW:latest")
+            if cached_fx:
+                val = float(cached_fx)
+                if 500.0 < val < 3000.0:
+                    self.fx_rates["KRW"] = val
+        except Exception:
+            pass
         
     def start_subscriber(self):
         def _listen():
@@ -51,15 +59,23 @@ class FXCache:
                 if msg["type"] == "pmessage":
                     try:
                         channel = msg["channel"]
-                        rate = float(msg["data"])
+                        raw_val = msg["data"]
+                        ex_from_json = None
+                        if isinstance(raw_val, str) and raw_val.strip().startswith("{"):
+                            parsed = json.loads(raw_val)
+                            rate = float(parsed.get("rate", 0.0))
+                            ex_from_json = parsed.get("exchange")
+                        else:
+                            rate = float(raw_val)
+                        if rate <= 0:
+                            continue
                         with self.lock:
                             if ":USDT-KRW" in channel:
                                 parts = channel.split(":")
-                                if len(parts) >= 2:
-                                    ex_name = parts[1].upper()
-                                    self.tether_rates[f"{ex_name}:KRW"] = rate
+                                ex_name = (ex_from_json or (parts[1] if len(parts) >= 2 else "UPBIT")).upper()
+                                self.tether_rates[f"{ex_name}:KRW"] = rate
                             else:
-                                quote = channel.split("-")[-1]
+                                quote = channel.split("-")[-1].split(":")[0]
                                 self.fx_rates[quote] = rate
                     except Exception as e:
                         logger.warning(f"Failed to parse FX rate: {e}")
@@ -791,6 +807,15 @@ def run_daemon():
             for opp in raw_data:
                 pair_key = (opp["base_exchange"], opp["base_symbol"], opp["foreign_exchange"], opp["foreign_symbol"])
                 quote = opp.get("base_quote_currency", "USD")
+                if quote.upper() == "KRW":
+                    opp_fx = float(opp.get("fx_rate_krw", 0.0) or 0.0)
+                    if 500.0 < opp_fx < 3000.0:
+                        with fx_cache.lock:
+                            fx_cache.fx_rates["KRW"] = opp_fx
+                    opp_usdt = float(opp.get("tether_krw", 0.0) or 0.0)
+                    if 500.0 < opp_usdt < 3000.0:
+                        with fx_cache.lock:
+                            fx_cache.tether_rates[f"{str(opp['base_exchange']).upper()}:KRW"] = opp_usdt
                 fx_rate = fx_cache.get_rate(quote)
                 
                 # Lazy warm up cache from InfluxDB if it's the first time we see this pair
