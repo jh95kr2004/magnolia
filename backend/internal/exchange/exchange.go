@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -111,10 +112,39 @@ type NetworkInfo struct {
 	MinConfirmations int     // Required block confirmations before deposit is credited
 }
 
-// IsMemoRequiredNetwork returns true for Cosmos SDK chains and tag-based networks where depositing
-// from a personal wallet into a CEX without a Memo/Destination Tag causes permanent deposit lockup.
+var (
+	dynamicMemoNetworksMu sync.RWMutex
+	dynamicMemoNetworks   = make(map[string]bool)
+)
+
+// RegisterMemoRequiredNetwork dynamically registers a coin symbol or network identifier that requires
+// a Destination Tag / Memo (discovered at runtime from exchange `/currencies` `destination_tag_regex`
+// or `/v1/coin_address` `secondary_address` responses).
+func RegisterMemoRequiredNetwork(nets ...Network) {
+	dynamicMemoNetworksMu.Lock()
+	defer dynamicMemoNetworksMu.Unlock()
+	for _, net := range nets {
+		n := strings.ToUpper(strings.TrimSpace(string(net)))
+		if n != "" {
+			dynamicMemoNetworks[n] = true
+		}
+	}
+}
+
+// IsMemoRequiredNetwork returns true for networks that require a Memo/Destination Tag when depositing into a CEX.
+// It checks the live dynamic runtime registry (populated from exchange API metadata such as `destination_tag_regex`
+// and `secondary_address`) first, and falls back to the baseline Cosmos SDK / tag-based seed list when offline.
 func IsMemoRequiredNetwork(net Network) bool {
 	n := strings.ToUpper(strings.TrimSpace(string(net)))
+	if n == "" {
+		return false
+	}
+	dynamicMemoNetworksMu.RLock()
+	isDyn := dynamicMemoNetworks[n]
+	dynamicMemoNetworksMu.RUnlock()
+	if isDyn {
+		return true
+	}
 	switch n {
 	case "SEI", "TIA", "CELESTIA", "OSMO", "OSMOSIS", "ATOM", "COSMOS", "INJ", "INJECTIVE",
 		"KAVA", "AKT", "AKASH", "ARCH", "ARCHWAY", "AXL", "AXELAR", "BLD", "AGORIC",

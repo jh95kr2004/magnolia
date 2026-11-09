@@ -168,11 +168,13 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 					Status            string `json:"status"`
 					SupportedNetworks []struct {
 						ID                    string  `json:"id"`
+						Name                  string  `json:"name"`
 						Status                string  `json:"status"`
 						ContractAddress       string  `json:"contract_address"`
 						ProcessingTimeSeconds int     `json:"processing_time_seconds"`
 						MinConfirmations      int     `json:"min_confirmations"`
 						MinWithdrawalAmount   float64 `json:"min_withdrawal_amount"`
+						DestinationTagRegex   string  `json:"destination_tag_regex"`
 					} `json:"supported_networks"`
 				}
 				if json.NewDecoder(resp.Body).Decode(&cbCurrencies) == nil && len(cbCurrencies) > 0 {
@@ -185,8 +187,20 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 						contractAddr := ""
 						minConf := 0
 						netID := string(cur)
+						apiRequiresMemo := false
 						if len(item.SupportedNetworks) > 0 {
-							net := item.SupportedNetworks[0]
+							// Select primary network (prefer native network matching currency ID/name or having destination_tag_regex)
+							selectedIdx := 0
+							for idx, sn := range item.SupportedNetworks {
+								if strings.TrimSpace(sn.DestinationTagRegex) != "" {
+									apiRequiresMemo = true
+									RegisterMemoRequiredNetwork(Network(cur), Network(sn.ID))
+								}
+								if strings.EqualFold(sn.ID, string(cur)) || strings.EqualFold(sn.Name, string(cur)) || strings.TrimSpace(sn.DestinationTagRegex) != "" {
+									selectedIdx = idx
+								}
+							}
+							net := item.SupportedNetworks[selectedIdx]
 							if net.Status != "" {
 								depOK = net.Status == "online"
 								wdOK = net.Status == "online"
@@ -213,7 +227,7 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 							WithdrawFeeRate:  0.0,
 							EstimatedTime:    estSec,
 							ContractAddress:  contractAddr,
-							RequiresMemo:     IsMemoRequiredNetwork(Network(cur)) || IsMemoRequiredNetwork(Network(netID)),
+							RequiresMemo:     apiRequiresMemo || IsMemoRequiredNetwork(Network(cur)) || IsMemoRequiredNetwork(Network(netID)),
 							MinConfirmations: minConf,
 						}
 					}

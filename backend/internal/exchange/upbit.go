@@ -812,6 +812,10 @@ func (u *UpbitClient) GetDepositAddress(ctx context.Context, currency Currency, 
 		return DepositAddress{}, err
 	}
 
+	if strings.TrimSpace(parsed.SecondaryAddress) != "" {
+		RegisterMemoRequiredNetwork(Network(currency), network)
+	}
+
 	return DepositAddress{
 		Address: parsed.DepositAddress,
 		Tag:     parsed.SecondaryAddress,
