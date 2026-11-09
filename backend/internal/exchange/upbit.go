@@ -124,7 +124,56 @@ func (u *UpbitClient) signPayload(query string) (string, error) {
 }
 
 func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currency) ([]NetworkInfo, error) {
+	EnsureGlobalCoinMetadataLoaded(ctx)
+
 	if u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy" {
+		if pubWallets := FetchUpbitPublicWalletStatuses(ctx); len(pubWallets) > 0 {
+			var list []NetworkInfo
+			for cur, st := range pubWallets {
+				if currency != "" && cur != currency {
+					continue
+				}
+				netID := strings.ToUpper(strings.TrimSpace(st.NetType))
+				if netID == "" {
+					netID = string(cur)
+				}
+				depOK := st.WalletState == "working" || st.WalletState == "deposit_only"
+				wdOK := st.WalletState == "working" || st.WalletState == "withdraw_only"
+				feeFixed, estSec := DefaultNetworkSpec("UPBIT", cur)
+				var contractAddr string
+				var minConf int
+				requiresMemo := IsMemoRequiredNetwork(Network(netID)) || IsMemoRequiredNetwork(Network(cur))
+				if gSpec, ok := LookupGlobalChainSpec(cur, netID); ok {
+					if gSpec.ContractAddress != "" {
+						contractAddr = gSpec.ContractAddress
+					}
+					if gSpec.MinConfirmations > 0 {
+						minConf = gSpec.MinConfirmations
+					}
+					if gSpec.RequiresMemo {
+						requiresMemo = true
+					}
+					if feeFixed <= 0 && gSpec.WithdrawFeeFixed > 0 {
+						feeFixed = gSpec.WithdrawFeeFixed
+					}
+				}
+				list = append(list, NetworkInfo{
+					Network:          Network(cur),
+					ExchangeNetID:    netID,
+					IsDepositEnable:  depOK,
+					IsWithdrawEnable: wdOK,
+					WithdrawFeeFixed: feeFixed,
+					EstimatedTime:    estSec,
+					ContractAddress:  contractAddr,
+					RequiresMemo:     requiresMemo,
+					MinConfirmations: minConf,
+				})
+			}
+			if len(list) > 0 {
+				return list, nil
+			}
+		}
+
 		if currency == "" {
 			var list []NetworkInfo
 			for _, cur := range []Currency{"BTC", "ETH", "XRP", "SOL", "TRX", "USDT", "USDC", "DOGE"} {
@@ -142,15 +191,31 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 			return list, nil
 		}
 		feeFixed, estSec := DefaultNetworkSpec("UPBIT", currency)
+		netID := string(currency)
+		var contractAddr string
+		var minConf int
+		requiresMemo := IsMemoRequiredNetwork(Network(currency))
+		if gSpec, ok := LookupGlobalChainSpec(currency, netID); ok {
+			if gSpec.ChainName != "" {
+				netID = gSpec.ChainName
+			}
+			contractAddr = gSpec.ContractAddress
+			minConf = gSpec.MinConfirmations
+			if gSpec.RequiresMemo {
+				requiresMemo = true
+			}
+		}
 		return []NetworkInfo{
 			{
 				Network:          Network(currency),
-				ExchangeNetID:    string(currency),
+				ExchangeNetID:    netID,
 				IsDepositEnable:  true,
 				IsWithdrawEnable: true,
 				WithdrawFeeFixed: feeFixed,
 				EstimatedTime:    estSec,
-				RequiresMemo:     IsMemoRequiredNetwork(Network(currency)),
+				ContractAddress:  contractAddr,
+				RequiresMemo:     requiresMemo,
+				MinConfirmations: minConf,
 			},
 		}, nil
 	}
@@ -212,6 +277,16 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 		if netID == "" {
 			netID = p.Currency
 		}
+		var contractAddr string
+		var minConf int
+		requiresMemo := IsMemoRequiredNetwork(Network(netID)) || IsMemoRequiredNetwork(Network(unifiedCur))
+		if gSpec, ok := LookupGlobalChainSpec(unifiedCur, netID); ok {
+			contractAddr = gSpec.ContractAddress
+			minConf = gSpec.MinConfirmations
+			if gSpec.RequiresMemo {
+				requiresMemo = true
+			}
+		}
 		networks = append(networks, NetworkInfo{
 			Network:          Network(unifiedCur),
 			ExchangeNetID:    netID,
@@ -219,7 +294,9 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 			IsWithdrawEnable: withdrawEnabled,
 			WithdrawFeeFixed: feeFixed,
 			EstimatedTime:    estSec,
-			RequiresMemo:     IsMemoRequiredNetwork(Network(netID)) || IsMemoRequiredNetwork(Network(unifiedCur)),
+			ContractAddress:  contractAddr,
+			RequiresMemo:     requiresMemo,
+			MinConfirmations: minConf,
 		})
 	}
 
@@ -227,17 +304,15 @@ func (u *UpbitClient) GetSupportedNetworks(ctx context.Context, currency Currenc
 }
 
 func (u *UpbitClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
-	// Fetch wallet statuses if authenticated; otherwise fall back to public market list
+	// Fetch wallet statuses (authenticated or via public CCX wallet network endpoint)
 	walletMap := make(map[Network]NetworkInfo)
-	isPublicFallback := u.accessKey == "" || u.accessKey == "public" || u.accessKey == "dummy"
-	if !isPublicFallback {
-		if networks, err := u.GetSupportedNetworks(ctx, ""); err == nil {
-			for _, net := range networks {
-				walletMap[net.Network] = net
-			}
-		} else {
-			isPublicFallback = true
+	isPublicFallback := false
+	if networks, err := u.GetSupportedNetworks(ctx, ""); err == nil && len(networks) > 0 {
+		for _, net := range networks {
+			walletMap[net.Network] = net
 		}
+	} else {
+		isPublicFallback = true
 	}
 
 	// Fetch market states (public endpoint, no API key required)

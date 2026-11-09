@@ -137,6 +137,8 @@ func (c *CoinbaseClient) generateJWT(requestMethod, requestHost, requestPath str
 }
 
 func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Currency) ([]NetworkInfo, error) {
+	EnsureGlobalCoinMetadataLoaded(ctx)
+
 	c.cacheMu.RLock()
 	hasCache := len(c.cachedNetworks) > 0 && time.Now().Before(c.networksExpiresAt)
 	if hasCache {
@@ -216,6 +218,17 @@ func (c *CoinbaseClient) GetSupportedNetworks(ctx context.Context, currency Curr
 							}
 							if net.ID != "" {
 								netID = strings.ToUpper(net.ID)
+							}
+						}
+						if gSpec, ok := LookupGlobalChainSpec(cur, netID); ok {
+							if contractAddr == "" && gSpec.ContractAddress != "" {
+								contractAddr = gSpec.ContractAddress
+							}
+							if minConf == 0 && gSpec.MinConfirmations > 0 {
+								minConf = gSpec.MinConfirmations
+							}
+							if gSpec.RequiresMemo {
+								apiRequiresMemo = true
 							}
 						}
 						newMap[cur] = NetworkInfo{
