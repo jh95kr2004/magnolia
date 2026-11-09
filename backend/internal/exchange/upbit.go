@@ -686,7 +686,6 @@ func (u *UpbitClient) ConnectWS(ctx context.Context, symbols []Symbol, priceUpda
 				}
 
 				if err := json.Unmarshal(message, &ubUpdate); err == nil && len(ubUpdate.OrderbookUnits) > 0 {
-					fxRate := 1385.0
 					bestAsk := ubUpdate.OrderbookUnits[0].AskPrice
 					bestBid := ubUpdate.OrderbookUnits[0].BidPrice
 					unifiedSym := toUnifiedSymbolFromUpbit(ubUpdate.Code)
@@ -698,9 +697,7 @@ func (u *UpbitClient) ConnectWS(ctx context.Context, symbols []Symbol, priceUpda
 						QuoteCurrency:  quoteCur,
 						RawBid:         bestBid,
 						RawAsk:         bestAsk,
-						BidUSD:         bestBid / fxRate,
-						AskUSD:         bestAsk / fxRate,
-						FXRate:         fxRate,
+						FXRate:         0,
 						FXCurrencyPair: "USD/KRW",
 					}
 				}

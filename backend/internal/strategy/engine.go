@@ -90,6 +90,9 @@ type Engine struct {
 	lastSnapshotTime     time.Time
 	forceNextSnapshot    bool
 	resetSnapshotPending bool
+
+	// Per-coin cooldown for background Paper Mode on-chain transfers (prevents unrealistic 0-second infinite loop)
+	lastPaperTransferAt map[string]time.Time
 }
 
 func (e *Engine) StartDraining() {
@@ -244,10 +247,11 @@ func NewEngine(
 		simStartedAt:       simStartedAt,
 		isDraining:         botStatus != "RUNNING",
 		walletProxy:        walletProxy,
-		liveUnrealizedPnLs: make(map[string]float64),
-		rawQuotes:          make(map[string]exchange.PriceUpdate),
-		latestQuotes:       make(map[string]exchange.PriceUpdate),
-		lastErrorLogTime:   make(map[string]time.Time),
+		liveUnrealizedPnLs:  make(map[string]float64),
+		rawQuotes:           make(map[string]exchange.PriceUpdate),
+		latestQuotes:        make(map[string]exchange.PriceUpdate),
+		lastErrorLogTime:    make(map[string]time.Time),
+		lastPaperTransferAt: make(map[string]time.Time),
 	}
 	e.strategies = strats
 
@@ -282,6 +286,21 @@ func (e *Engine) ModeString() string {
 	return "LIVE"
 }
 
+func (e *Engine) syncPaperClientSimOffsets(simEx string, currPct float64) {
+	if !e.isPaper {
+		return
+	}
+	for _, c := range e.clients {
+		if pc, ok := c.(*exchange.PaperClient); ok {
+			if strings.EqualFold(pc.GetName(), simEx) {
+				pc.SetSimOffsetPct(currPct)
+			} else {
+				pc.SetSimOffsetPct(0.0)
+			}
+		}
+	}
+}
+
 // GetSimStatus computes the current S-curve interpolated price offset (%) for Paper Mode scenario simulation.
 func (e *Engine) GetSimStatus() (exchangeName string, currentOffsetPct, targetOffsetPct, rampMinutes, progressPct float64, remainingSec int64) {
 	ex := e.simExchange
@@ -289,14 +308,17 @@ func (e *Engine) GetSimStatus() (exchangeName string, currentOffsetPct, targetOf
 		ex = "UPBIT"
 	}
 	if !e.isPaper || e.simStartedAt <= 0 {
+		e.syncPaperClientSimOffsets(ex, e.simTargetOffsetPct)
 		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, e.simRampMinutes, 100.0, 0
 	}
 	if e.simRampMinutes <= 0 {
+		e.syncPaperClientSimOffsets(ex, e.simTargetOffsetPct)
 		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, 0, 100.0, 0
 	}
 	totalSec := e.simRampMinutes * 60.0
 	elapsed := float64(time.Now().Unix() - e.simStartedAt)
 	if elapsed >= totalSec {
+		e.syncPaperClientSimOffsets(ex, e.simTargetOffsetPct)
 		return ex, e.simTargetOffsetPct, e.simTargetOffsetPct, e.simRampMinutes, 100.0, 0
 	}
 	alpha := math.Max(0.0, math.Min(1.0, elapsed/totalSec))
@@ -304,6 +326,7 @@ func (e *Engine) GetSimStatus() (exchangeName string, currentOffsetPct, targetOf
 	weight := (1.0 - math.Cos(math.Pi*alpha)) / 2.0
 	curr := e.simStartOffsetPct + (e.simTargetOffsetPct-e.simStartOffsetPct)*weight
 	rem := int64(math.Ceil(totalSec - elapsed))
+	e.syncPaperClientSimOffsets(ex, curr)
 	return ex, curr, e.simTargetOffsetPct, e.simRampMinutes, alpha * 100.0, rem
 }
 
@@ -312,6 +335,26 @@ func (e *Engine) applySimOffsetToQuote(q exchange.PriceUpdate) exchange.PriceUpd
 		return q
 	}
 	simEx, currPct, _, _, _, _ := e.GetSimStatus()
+
+	// Store un-offset raw price in PaperClient first; PaperClient applies simOffsetPct dynamically on read
+	for _, c := range e.clients {
+		if pc, ok := c.(*exchange.PaperClient); ok && strings.EqualFold(pc.GetName(), q.Exchange) {
+			rawSpot := q.RawAsk
+			if rawSpot <= 0 {
+				if q.QuoteCurrency == "KRW" || strings.HasSuffix(string(q.Symbol), "-KRW") {
+					rawSpot = q.AskUSD * GetFXRate("KRW")
+				} else {
+					rawSpot = q.AskUSD
+				}
+			}
+			rawFut := q.RawFutureAsk
+			if rawFut <= 0 {
+				rawFut = rawSpot
+			}
+			pc.SetPriceHint(q.Symbol, rawSpot, rawFut)
+		}
+	}
+
 	if strings.EqualFold(q.Exchange, simEx) && math.Abs(currPct) > 1e-6 {
 		mult := 1.0 + (currPct / 100.0)
 		q.RawBid *= mult
@@ -322,25 +365,6 @@ func (e *Engine) applySimOffsetToQuote(q exchange.PriceUpdate) exchange.PriceUpd
 		q.RawFutureAsk *= mult
 		q.BidFutureUSD *= mult
 		q.AskFutureUSD *= mult
-	}
-
-	// Inject the latest price into the corresponding PaperClient so virtual market orders fill accurately
-	for _, c := range e.clients {
-		if pc, ok := c.(*exchange.PaperClient); ok && strings.EqualFold(pc.GetName(), q.Exchange) {
-			spotPrice := q.RawAsk
-			if spotPrice <= 0 {
-				if q.QuoteCurrency == "KRW" || strings.HasSuffix(string(q.Symbol), "-KRW") {
-					spotPrice = q.AskUSD * GetFXRate("KRW")
-				} else {
-					spotPrice = q.AskUSD
-				}
-			}
-			futPrice := q.RawFutureAsk
-			if futPrice <= 0 {
-				futPrice = spotPrice
-			}
-			pc.SetPriceHint(q.Symbol, spotPrice, futPrice)
-		}
 	}
 	return q
 }
@@ -586,6 +610,17 @@ func (e *Engine) RunPositionMonitor(ctx context.Context, priceCh <-chan exchange
 		case quote := <-priceCh:
 			if quote.FXRate > 0 && quote.QuoteCurrency != "" {
 				SetFXRate(string(quote.QuoteCurrency), quote.FXRate)
+			} else if quote.QuoteCurrency == "KRW" || strings.HasSuffix(string(quote.Symbol), "-KRW") {
+				krwRate := GetFXRate("KRW")
+				if krwRate > 500 {
+					quote.FXRate = krwRate
+					if quote.RawBid > 0 {
+						quote.BidUSD = quote.RawBid / krwRate
+					}
+					if quote.RawAsk > 0 {
+						quote.AskUSD = quote.RawAsk / krwRate
+					}
+				}
 			}
 			if strings.EqualFold(string(quote.Symbol), "USDT-KRW") && quote.RawAsk > 0 {
 				mid := quote.RawAsk
@@ -1554,6 +1589,15 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 									// Strictly block opening a position (Strategy A/B/C/D/E) when expected return after real exchange fees is negative or sub-threshold
 									continue
 								}
+								if e.isPaper && selectedStrategy == StrategyForeignTransfer {
+									_, currSimPct, _, _, _, _ := e.GetSimStatus()
+									if math.Abs(currSimPct) <= 1e-6 && e.lastPaperTransferAt != nil {
+										if lastAt, ok := e.lastPaperTransferAt[entryBaseSym]; ok && time.Since(lastAt) < 90*time.Second {
+											// Enforce realistic on-chain confirmation cooldown per coin in background Paper Mode
+											continue
+										}
+									}
+								}
 
 								targetStrategy := e.findStrategy(selectedStrategy)
 								if targetStrategy != nil {
@@ -1597,6 +1641,9 @@ func (e *Engine) ListenOpportunities(ctx context.Context) {
 											log.Printf("❌ [AI ENTRY FAILED] (%s) User %d %s via %s: %v", e.ModeString(), e.userID, entryBaseSym, selectedStrategy, err)
 										}
 									} else {
+										if e.isPaper && selectedStrategy == StrategyForeignTransfer && e.lastPaperTransferAt != nil {
+											e.lastPaperTransferAt[entryBaseSym] = time.Now()
+										}
 										log.Printf("🚀 [AI ENTRY TRIGGERED] (%s) User %d %s via %s, Target Vol: $%.2f", e.ModeString(), e.userID, entryBaseSym, selectedStrategy, targetDollarVolume)
 									}
 								}

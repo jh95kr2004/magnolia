@@ -45,14 +45,15 @@ type PaperClientSnapshot struct {
 // PaperClient wraps any real exchange.Client to provide virtual balance and order simulation,
 // completely bypassing real order placements to the actual exchange.
 type PaperClient struct {
-	userID     uint
-	realClient Client
-	balances   map[string]float64
-	borrowed   map[string]float64
-	futures    map[Symbol]*PaperFuturePosition
-	priceHints map[Symbol]PaperPriceHint
-	mu         sync.Mutex
-	orderIDSeq int
+	userID       uint
+	realClient   Client
+	balances     map[string]float64
+	borrowed     map[string]float64
+	futures      map[Symbol]*PaperFuturePosition
+	priceHints   map[Symbol]PaperPriceHint
+	simOffsetPct float64
+	mu           sync.Mutex
+	orderIDSeq   int
 }
 
 func paperRegistryKey(userID uint, exchangeName string) string {
@@ -97,7 +98,24 @@ func (p *PaperClient) GetName() string {
 	return p.realClient.GetName()
 }
 
-// SetPriceHint injects the latest real-time (and optionally offset-adjusted) quote price for a symbol.
+// SetSimOffsetPct updates the current scenario simulation price offset (%) for this PaperClient.
+func (p *PaperClient) SetSimOffsetPct(pct float64) {
+	p.mu.Lock()
+	p.simOffsetPct = pct
+	p.mu.Unlock()
+}
+
+func (p *PaperClient) applySimMultUnlocked(rawPrice float64) float64 {
+	if rawPrice <= 0 {
+		return rawPrice
+	}
+	if math.Abs(p.simOffsetPct) > 1e-6 {
+		return rawPrice * (1.0 + (p.simOffsetPct / 100.0))
+	}
+	return rawPrice
+}
+
+// SetPriceHint injects the latest real-time un-offset quote price for a symbol.
 func (p *PaperClient) SetPriceHint(symbol Symbol, spotPrice, futurePrice float64) {
 	if spotPrice <= 0 && futurePrice <= 0 {
 		return
@@ -248,23 +266,36 @@ func (p *PaperClient) GetMarkets(ctx context.Context) ([]MarketInfo, error) {
 func (p *PaperClient) GetTicker(ctx context.Context, symbol Symbol) (float64, error) {
 	p.mu.Lock()
 	hint, ok := p.priceHints[symbol]
+	simPrice := p.applySimMultUnlocked(hint.SpotPrice)
 	p.mu.Unlock()
-	if ok && hint.SpotPrice > 0 && time.Since(hint.UpdatedAt) < 5*time.Minute {
-		return hint.SpotPrice, nil
+	if ok && simPrice > 0 && time.Since(hint.UpdatedAt) < 5*time.Minute {
+		return simPrice, nil
 	}
-	return p.realClient.GetTicker(ctx, symbol)
+	raw, err := p.realClient.GetTicker(ctx, symbol)
+	if err != nil || raw <= 0 {
+		return raw, err
+	}
+	p.SetPriceHint(symbol, raw, raw)
+	p.mu.Lock()
+	out := p.applySimMultUnlocked(raw)
+	p.mu.Unlock()
+	return out, nil
 }
 
 func (p *PaperClient) GetFutureTicker(ctx context.Context, symbol Symbol) (float64, error) {
 	p.mu.Lock()
 	hint, ok := p.priceHints[symbol]
+	simPrice := p.applySimMultUnlocked(hint.FuturePrice)
 	p.mu.Unlock()
-	if ok && hint.FuturePrice > 0 && time.Since(hint.UpdatedAt) < 5*time.Minute {
-		return hint.FuturePrice, nil
+	if ok && simPrice > 0 && time.Since(hint.UpdatedAt) < 5*time.Minute {
+		return simPrice, nil
 	}
 	fPrice, err := p.realClient.GetFutureTicker(ctx, symbol)
 	if err == nil && fPrice > 0 {
-		return fPrice, nil
+		p.mu.Lock()
+		out := p.applySimMultUnlocked(fPrice)
+		p.mu.Unlock()
+		return out, nil
 	}
 	return p.GetTicker(ctx, symbol)
 }
@@ -286,13 +317,13 @@ func (p *PaperClient) lookupMarkPriceUnlocked(baseCur, quoteCur string) (spotPri
 	}
 	for _, sym := range candidates {
 		if hint, ok := p.priceHints[sym]; ok && (hint.SpotPrice > 0 || hint.FuturePrice > 0) {
-			return hint.SpotPrice, hint.FuturePrice
+			return p.applySimMultUnlocked(hint.SpotPrice), p.applySimMultUnlocked(hint.FuturePrice)
 		}
 	}
 	for sym, hint := range p.priceHints {
 		b, q := ParseSymbol(sym)
 		if strings.EqualFold(string(b), baseUpper) && strings.EqualFold(string(q), quoteUpper) {
-			return hint.SpotPrice, hint.FuturePrice
+			return p.applySimMultUnlocked(hint.SpotPrice), p.applySimMultUnlocked(hint.FuturePrice)
 		}
 	}
 	return 0, 0
@@ -353,9 +384,9 @@ func (p *PaperClient) GetAccountValuation(ctx context.Context) (quoteCur string,
 		}
 		futPrice := fPos.EntryPrice
 		if hint, ok := p.priceHints[sym]; ok && hint.FuturePrice > 0 {
-			futPrice = hint.FuturePrice
+			futPrice = p.applySimMultUnlocked(hint.FuturePrice)
 		} else if ok && hint.SpotPrice > 0 {
-			futPrice = hint.SpotPrice
+			futPrice = p.applySimMultUnlocked(hint.SpotPrice)
 		}
 		var uPnL float64
 		if fPos.Side == BuyOrder {
@@ -376,8 +407,10 @@ func (p *PaperClient) GetAccountValuation(ctx context.Context) (quoteCur string,
 				sym = Symbol(e.cur + "/" + quoteCur)
 			}
 			if fetched, err := p.realClient.GetTicker(ctx, sym); err == nil && fetched > 0 {
-				price = fetched
 				p.SetPriceHint(sym, fetched, fetched)
+				p.mu.Lock()
+				price = p.applySimMultUnlocked(fetched)
+				p.mu.Unlock()
 			}
 		}
 		if price > 0 {
