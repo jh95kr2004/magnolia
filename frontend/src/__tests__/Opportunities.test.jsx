@@ -101,6 +101,11 @@ describe('Opportunities SSE raw_opportunities & filtered_opportunities rendering
     expect(screen.getByText('ETH')).toBeInTheDocument();
     expect(screen.getByText('+2.78%')).toBeInTheDocument();
     expect(screen.getByText(/1시간 뒤 최저 \+0\.95%/)).toBeInTheDocument();
+    expect(screen.queryByTestId('premium-trajectory-chart')).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('BTC'));
+    });
     expect(screen.getByTestId('premium-trajectory-chart')).toBeInTheDocument();
   });
 
