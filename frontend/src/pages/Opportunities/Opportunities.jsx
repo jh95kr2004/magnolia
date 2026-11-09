@@ -32,7 +32,7 @@ export const Opportunities = () => {
   const { showToast, requestConfirm } = useToast();
 
   const [opportunities, setOpportunities] = useState([]);
-  const [expandedCoin, setExpandedCoin] = useState('BTC');
+  const [expandedCoin, setExpandedCoin] = useState(null);
   const rawMapRef = useRef({});
   const aiMapRef = useRef({});
   const [simStatus, setSimStatus] = useState({

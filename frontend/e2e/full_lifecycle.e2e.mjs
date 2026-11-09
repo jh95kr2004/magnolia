@@ -364,16 +364,25 @@ async function runFullLifecycleE2E() {
     await browser.waitForText('마켓 & 시뮬레이터');
     console.log('  ✅ [Chromium DOM] Header KO <-> EN language toggle verified!');
 
-    // 7c. Navigate to /opportunities and verify real-time opportunity rows & Phase 14 Trajectory Chart in the DOM
+    // 7c. Navigate to /opportunities and verify all rows are collapsed by default, then expand BTC row
     await browser.navigate(`${BASE_URL}/opportunities`);
     await browser.waitForText('거래소 간 실시간 프리미엄 목록');
     await browser.waitForText('BTC');
+    const initiallyExpanded = await browser.execute(
+      `return Boolean(document.querySelector('[data-testid="premium-trajectory-chart"]'));`
+    );
+    assert(!initiallyExpanded, 'Expected all coin rows to be collapsed by default in /opportunities');
+    await browser.execute(
+      `const rows = Array.from(document.querySelectorAll('div, tr, button, span'));
+       const btcBadge = rows.find(el => el.textContent && el.textContent.trim() === 'BTC');
+       if (btcBadge) btcBadge.click();`
+    );
     await browser.waitForText('UPBIT (BTC-KRW) → COINBASE (BTC-USD)');
     const hasTrajectoryChart = await browser.execute(
       `return Boolean(document.querySelector('[data-testid="premium-trajectory-chart"]'));`
     );
-    assert(hasTrajectoryChart, 'Expected [data-testid="premium-trajectory-chart"] in /opportunities DOM');
-    console.log('  ✅ [Chromium DOM] /opportunities rendered live BTC row + expandable Historical/8H AI Trajectory Chart!');
+    assert(hasTrajectoryChart, 'Expected [data-testid="premium-trajectory-chart"] in /opportunities DOM after clicking BTC');
+    console.log('  ✅ [Chromium DOM] /opportunities verified collapsed-by-default + expandable Historical/8H AI Trajectory Chart!');
 
     // 7d. Navigate to /settings?tab=params and verify non-zero risk parameter inputs in the DOM
     await browser.navigate(`${BASE_URL}/settings?tab=params`);
